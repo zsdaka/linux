@@ -281,8 +281,8 @@ def fig_lookup():
 def fig_geometry():
     fig, ax = new_ax(12.8, 6.8)
     ax.set_title("num_log = 24 时主表为什么是 2^24 行", fontsize=16, color=NAVY, pad=8)
-    box(ax, 4, 28, 42, 52, "驱动实际几何\n\n行数 2^24\n每行 4 个 STE\nSTE 总数 2^26\n\n2^24 条 key 时\n平均每行 1 条\n主表槽位利用率 25%", "#D6E4F0", fs=12)
-    box(ax, 54, 28, 42, 52, "槽位刚好等于 key 的排法\n\n行数 2^22\n每行 4 个 STE\nSTE 总数 2^24\n\n平均每行 4 条\n哈希一偏，整行溢出\n这是实验 D-tight", "#F8D7D2", fs=12)
+    box(ax, 4, 28, 42, 52, "驱动几何\nnum_log = 24 的实际配法\n\n行数 2^24\n每行 4 个 STE\nSTE 总数 2^26\n\n2^24 条 key 时\n平均每行 1 条\n主表槽位利用率约 25%", "#D6E4F0", fs=12)
+    box(ax, 54, 28, 42, 52, "紧凑几何\n对照实验，驱动不会这样配\n\n行数 2^22\n每行 4 个 STE\nSTE 总数 2^24\n\n同样 2^24 条 key\n平均每行 4 条\n哈希一偏，整行溢出", "#F8D7D2", fs=12)
     ax.text(50, 14, "深度加在行数之外：STE 区间 = 2^(sz_row_log + sz_col_log)。碰撞表只从自己的行对数里减 5。",
             ha="center", fontsize=10, color=INK)
     save(fig, "07_geometry.png")
@@ -313,48 +313,57 @@ def fig_results(summary, hist):
     ]
     labels, over, theory, fail, tfail = [], [], [], [], []
     by = {(r["exp"], r["data"]): r for r in summary}
+    tick = {
+        "A 均匀": "1000万条\n2^24 行",
+        "B 配满": "1677万条\n2^24 行",
+        "C 超出": "2000万条\n2^24 行",
+        "A 真实采样": "CTU 采样\n1000万条",
+        "D 紧凑": "1677万条\n2^22 行",
+    }
     for key in want:
         r = by[(key[0], key[1])]
-        labels.append(key[2])
+        labels.append(tick[key[2]])
         over.append(float(r["over_frac"]) * 100)
         theory.append(float(r["theory_over"]) * 100)
         fail.append(float(r["fail_frac"]) * 100)
         tfail.append(float(r["theory_fail"]) * 100)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.2, 4.8), dpi=140)
+    fig, axes = plt.subplots(1, 2, figsize=(13.6, 5.8), dpi=140)
     x = list(range(len(labels) - 1))
     w = 0.36
     axes[0].bar([i - w / 2 for i in x], over[:-1], width=w, color=TEAL, label="仿真溢出")
     axes[0].bar([i + w / 2 for i in x], theory[:-1], width=w, color=ORANGE, label="Poisson 公式")
-    axes[0].set_xticks(x, labels[:-1], fontsize=9)
-    axes[0].set_ylabel("占插入条数的百分比")
+    axes[0].set_xticks(x, labels[:-1], fontsize=8.5)
+    axes[0].set_ylabel("占该档插入条数的百分比")
     axes[0].set_ylim(0, 1.05)
-    axes[0].set_title("主表溢出，驱动几何（D 紧凑是 19.53%）")
+    axes[0].set_xlabel("每一档的上行是插入条数，下行是主表行数\n这四档都是 2^24 行 × 4 个槽", fontsize=8.5)
+    axes[0].set_title("主表溢出。2^22 行的 19.53% 放在右图")
     axes[0].legend(frameon=False, loc="upper left")
     for i, (a, b) in enumerate(zip(over[:-1], theory[:-1])):
         axes[0].text(i, max(a, b) + 0.04, f"{a:.3f}", ha="center", fontsize=8, color=NAVY)
     axes[1].bar([i - w / 2 for i in range(len(labels))], fail, width=w, color=CORAL, label="仿真失败")
     axes[1].bar([i + w / 2 for i in range(len(labels))], tfail, width=w, color=NAVY, label="Poisson 公式")
-    axes[1].set_xticks(list(range(len(labels))), labels, fontsize=9)
-    axes[1].set_ylabel("占插入条数的百分比")
-    axes[1].set_title("两级都满才失败；驱动几何上失败数为 0")
-    axes[1].legend(frameon=False)
+    axes[1].set_xticks(list(range(len(labels))), labels, fontsize=8)
+    axes[1].set_ylabel("占该档插入条数的百分比")
+    axes[1].set_xlabel("前四档主表是 2^24 行\n最后一档：同样 1677 万条，主表收成 2^22 行", fontsize=8.5)
+    axes[1].set_title("插入失败率。前四档是 0，最后一档约 7.07%")
+    axes[1].legend(frameon=False, loc="upper left")
     fig.tight_layout()
     save(fig, "08_overflow_fail.png")
 
-    fig, ax = plt.subplots(figsize=(11.5, 4.6), dpi=140)
+    fig, ax = plt.subplots(figsize=(13.4, 5.6), dpi=140)
     names, s1, s2, fl = [], [], [], []
     order = [
-        ("A", "uniform", "A 均匀"),
-        ("B", "uniform", "B 配满"),
-        ("C", "uniform", "C 超出"),
-        ("A", "uniform_alt", "A 另一哈希"),
-        ("A", "zipf_mixed", "A 重尾但全字段哈希"),
-        ("A", "ctu_resample", "A CTU 采样"),
-        ("TraceFull", "ctu", "CTU 全量"),
-        ("Ablation", "uniform", "消融 无副表"),
-        ("Dtight", "uniform", "D 紧凑"),
-        ("A", "zipf_coarse", "A 粗哈希"),
+        ("A", "uniform", "1000万\n均匀"),
+        ("B", "uniform", "1677万\n2^24行"),
+        ("C", "uniform", "2000万\n2^24行"),
+        ("A", "uniform_alt", "1000万\n另一哈希"),
+        ("A", "zipf_mixed", "1000万\n重尾全字段"),
+        ("A", "ctu_resample", "1000万\nCTU采样"),
+        ("TraceFull", "ctu", "160万\nCTU全量"),
+        ("Ablation", "uniform", "1000万\n无副表"),
+        ("Dtight", "uniform", "1677万\n2^22行"),
+        ("A", "zipf_coarse", "1000万\n粗哈希"),
     ]
     for exp, data, name in order:
         r = by[(exp, data)]
@@ -369,15 +378,18 @@ def fig_results(summary, hist):
     ax.bar(idx, s2, bottom=s1, color=ORANGE, label="2 次 WQE")
     bottom2 = [a + b for a, b in zip(s1, s2)]
     ax.bar(idx, fl, bottom=bottom2, color=CORAL, label="失败")
-    ax.set_xticks(idx, names, rotation=25, ha="right", fontsize=8)
-    ax.set_ylabel("占插入条数的百分比")
-    ax.set_ylim(0, 100)
-    ax.set_title("成功插入只有 1 步或 2 步")
-    ax.legend(frameon=False, ncol=3)
+    ax.set_xticks(idx, names, fontsize=8)
+    ax.set_xlabel("每一档是一次插入。上行是条数，下行是数据集或表的排法\n只有“2^22行”的主表是 2^22 行；“无副表”去掉了碰撞表。其余主表都是 2^24 行 × 4 槽，并且带碰撞表", fontsize=8.5, labelpad=10)
+    ax.set_ylabel("占该档插入条数的百分比")
+    ax.set_ylim(0, 112)
+    ax.set_title("一次插入用了几次 WQE")
+    ax.legend(frameon=False, loc="center left", bbox_to_anchor=(1.01, 0.55))
+    for i, text in ((7, "失败 0.072%"), (8, "失败 7.07%"), (9, "失败 14.1%")):
+        ax.text(i, 103, text, ha="center", va="bottom", fontsize=7.5, color=CORAL)
     fig.tight_layout()
     save(fig, "09_steps.png")
 
-    fig, ax = plt.subplots(figsize=(8.2, 4.6), dpi=140)
+    fig, ax = plt.subplots(figsize=(9.0, 5.2), dpi=140)
     for exp, data, style, label in (
         ("A", "uniform", "-o", "均匀 A 仿真"),
         ("B", "uniform", "-s", "配满 B 仿真"),
@@ -395,14 +407,14 @@ def fig_results(summary, hist):
         ax.plot(ks, cs, style, color=TEAL if exp == "A" else NAVY, label=label)
         ax.plot(ks, ex, "--", color=ORANGE if exp == "A" else CORAL,
                 label=("Poisson λ=0.596" if exp == "A" else "Poisson λ=1"))
-    ax.set_xlabel("一行上的到达条数（含溢出，不截断在 4）")
-    ax.set_ylabel("行的比例")
-    ax.set_title("均匀哈希下的行占用与 Poisson")
+    ax.set_xlabel("k = 落到同一主表行的 key 条数\nk=0 是空行。k>4 时只有 4 条留在主表，多出的进冲突表。图上画到 k=12", fontsize=8.5)
+    ax.set_ylabel("这样的行占主表 2^24 行的比例")
+    ax.set_title("均匀哈希：1000 万条（λ=0.596）和配满 1677 万条（λ=1）")
     ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     save(fig, "10_hist_uniform.png")
 
-    fig, ax = plt.subplots(figsize=(8.2, 4.6), dpi=140)
+    fig, ax = plt.subplots(figsize=(9.0, 5.2), dpi=140)
     rows = hist[("A", "zipf_coarse")]
     ks = [int(r["k"]) for r in rows if int(r["k"]) <= 20]
     cs = []
@@ -412,13 +424,14 @@ def fig_results(summary, hist):
         if int(r["k"]) <= 20:
             cs.append(int(r["count"]) / total)
     ax.bar(ks, cs, color=TEAL)
-    ax.set_xlabel("一行上的到达条数（47 表示 47 及以上）" if False else "一行上的到达条数，最后一个桶是截断")
-    ax.set_ylabel("行的比例")
-    ax.set_title("粗哈希重尾：大量行是空的，少数行极深")
+    ax.set_yscale("log")
+    ax.set_xlabel("k = 落到同一主表行的 key 条数，只画 0 到 20\nk≥47 的行另有 6986 行，没有画在这张图上", fontsize=8.5)
+    ax.set_ylabel("这样的行占主表 2^24 行的比例（对数）")
+    ax.set_title("粗哈希、1000 万条：绝大多数行是空的")
     fig.tight_layout()
     save(fig, "11_hist_zipf.png")
 
-    fig, ax = plt.subplots(figsize=(8.4, 4.8), dpi=140)
+    fig, ax = plt.subplots(figsize=(9.2, 5.4), dpi=140)
     metrics = ["主表利用率 %", "溢出 %", "2 步 WQE %", "失败 %"]
     b = by[("B", "uniform")]
     d = by[("Dtight", "uniform")]
@@ -432,15 +445,17 @@ def fig_results(summary, hist):
         ]
     import numpy as np
     idx = np.arange(len(metrics))
-    ax.bar(idx - 0.18, vals(b), width=0.36, color=TEAL, label="D-mlx  2^24 行")
-    ax.bar(idx + 0.18, vals(d), width=0.36, color=CORAL, label="D-tight  2^22 行")
+    ax.bar(idx - 0.18, vals(b), width=0.36, color=TEAL, label="驱动几何  2^24 行")
+    ax.bar(idx + 0.18, vals(d), width=0.36, color=CORAL, label="紧凑几何  2^22 行")
     ax.set_xticks(idx, metrics)
-    ax.set_title("同一 2^24 条均匀 key：多留的行换来少溢出")
+    ax.set_ylabel("百分比")
+    ax.set_xlabel("左柱是驱动几何（2^24 行），右柱是紧凑几何（2^22 行）\n利用率的分母是槽位数；溢出、2 步 WQE、失败的分母是 16,777,216 条 key", fontsize=8.5, labelpad=16)
+    ax.set_title("同一批 1677 万条均匀 key，两种行数")
     ax.legend(frameon=False)
     fig.tight_layout()
     save(fig, "12_d_compare.png")
 
-    fig, ax = plt.subplots(figsize=(8.2, 4.6), dpi=140)
+    fig, ax = plt.subplots(figsize=(9.2, 5.4), dpi=140)
     xs, us, fs = [], [], []
     for exp, data in (("A", "uniform"), ("B", "uniform"), ("C", "uniform"), ("Dtight", "uniform")):
         r = by[(exp, data)]
@@ -451,9 +466,9 @@ def fig_results(summary, hist):
     ax.plot(xs[:3], fs[:3], "-o", color=GREEN, label="驱动几何 失败率")
     ax.scatter([xs[3]], [us[3]], s=60, color=CORAL, label="紧凑几何 利用率")
     ax.scatter([xs[3]], [fs[3]], s=60, color=ORANGE, label="紧凑几何 失败率")
-    ax.set_xlabel("λ = 插入条数 / 主表行数")
+    ax.set_xlabel("λ = 插入条数 / 主表行数\n0.596 = 1000万 / 2^24 行，1 = 配满，1.19 = 2000万 / 2^24 行，4 = 1677万 / 2^22 行", fontsize=8.5)
     ax.set_ylabel("百分比")
-    ax.set_title("空槽是行内容量，紧凑几何把失败率拉到约 7%")
+    ax.set_title("λ 变大时，主表利用率和插入失败率")
     ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     save(fig, "13_capacity.png")
@@ -485,24 +500,26 @@ def fig_loads(summary, depth):
         fail.append(float(r["fail_frac"]) * 100)
         tfail.append(float(r["theory_fail"]) * 100)
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.6), dpi=140)
+    load_ticks = ["25%\n419万条", "50%\n839万条", "70%\n1174万条",
+                  "90%\n1510万条", "100%\n1678万条"]
+    fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.6), dpi=140)
     x = np.arange(len(labels))
     w = 0.36
     axes[0].bar(x - w / 2, over, width=w, color=TEAL, label="仿真")
     axes[0].bar(x + w / 2, theory, width=w, color=ORANGE, label="Poisson 公式")
-    axes[0].set_xticks(x, labels)
-    axes[0].set_xlabel("主表负载  n / 2^24")
-    axes[0].set_ylabel("占插入条数的百分比")
+    axes[0].set_xticks(x, load_ticks, fontsize=8)
+    axes[0].set_xlabel("上行是负载 = 插入条数 / 2^24，下行是这一档的条数\n主表始终是 2^24 行 × 4 槽。这不是槽位被填满的比例", fontsize=8.5)
+    axes[0].set_ylabel("占该档插入条数的百分比")
     axes[0].set_title("主表溢出率")
     axes[0].legend(frameon=False)
     for i, v in enumerate(over):
         axes[0].text(i, v + max(over) * 0.03, f"{v:.4f}", ha="center", fontsize=7, color=NAVY)
-    axes[0].set_ylim(0, max(over + theory) * 1.35)
+    axes[0].set_ylim(0, max(over + theory) * 1.45)
     axes[1].bar(x - w / 2, fail, width=w, color=CORAL, label="仿真，即插入失败率")
     axes[1].bar(x + w / 2, tfail, width=w, color=NAVY, label="Poisson 公式")
-    axes[1].set_xticks(x, labels)
-    axes[1].set_xlabel("主表负载  n / 2^24")
-    axes[1].set_ylabel("占插入条数的百分比")
+    axes[1].set_xticks(x, load_ticks, fontsize=8)
+    axes[1].set_xlabel("刻度与左图相同\n100% 时平均每行 1 条，槽位大约只满 25%", fontsize=8.5)
+    axes[1].set_ylabel("占该档插入条数的百分比")
     axes[1].set_ylim(0, 1)
     axes[1].set_title("冲突表溢出率，五档都是 0")
     for i, v in enumerate(fail):
@@ -512,7 +529,7 @@ def fig_loads(summary, depth):
     save(fig, "14_load_overflow.png")
 
     colors = ["#8FB8C9", "#1F7A8C", "#E09F3E", "#C4493A", "#1B3A4B"]
-    fig, ax = plt.subplots(figsize=(8.6, 4.8), dpi=140)
+    fig, ax = plt.subplots(figsize=(9.2, 5.4), dpi=140)
     depths = np.arange(0, 5)
     width = 0.15
     for i, ((exp, lab), color) in enumerate(zip(order, colors)):
@@ -521,14 +538,14 @@ def fig_loads(summary, depth):
         vals = [rows.get(d, 0.0) * 100 for d in depths]
         ax.bar(depths + (i - 2) * width, vals, width=width, color=color, label=lab)
     ax.set_xticks(depths, [str(d) for d in depths])
-    ax.set_xlabel("主表一行里已占用的 STE 数")
-    ax.set_ylabel("行的百分比")
-    ax.set_title("主表每行深度")
-    ax.legend(frameon=False, ncol=5, fontsize=8, title="负载")
+    ax.set_xlabel("横轴：这一行已经写下的 STE 个数\n0 = 空行，4 = 四个槽都满。同一数字上从左到右五根柱是 25% 到 100%", fontsize=8.5, labelpad=16)
+    ax.set_ylabel("占主表 2^24 行的百分比")
+    ax.set_title("驱动几何：主表每行深度")
+    ax.legend(frameon=False, ncol=5, fontsize=8, title="插入条数 / 2^24")
     fig.tight_layout()
     save(fig, "15_main_row_depth.png")
 
-    fig, ax = plt.subplots(figsize=(9.2, 4.8), dpi=140)
+    fig, ax = plt.subplots(figsize=(10.2, 5.4), dpi=140)
     for (exp, lab), color in zip(order, colors):
         rows = sorted(depth[(exp, "uniform", "collision")], key=lambda r: int(r["depth"]))
         xs, ys = [], []
@@ -540,11 +557,11 @@ def fig_loads(summary, depth):
             ys.append(frac * 100)
         ax.plot(xs, ys, "-o", color=color, label=lab, markersize=3.5)
     ax.set_yscale("log")
-    ax.set_xlabel("冲突表一行里已占用的 STE 数")
-    ax.set_ylabel("行的百分比（对数）")
-    ax.set_title("冲突表每行深度")
+    ax.set_xlabel("横轴：冲突表这一行写下的 STE 个数，范围 0 到 16\n五条线仍是插入条数 / 2^24 的五档。纵轴是行数占比，用对数", fontsize=8.5, labelpad=16)
+    ax.set_ylabel("占冲突表 2^19 行的百分比（对数）")
+    ax.set_title("驱动几何：冲突表每行深度")
     ax.set_xticks(range(0, 17))
-    ax.legend(frameon=False, ncol=5, fontsize=8, title="负载")
+    ax.legend(frameon=False, ncol=5, fontsize=8, title="插入条数 / 2^24")
     fig.tight_layout()
     save(fig, "16_col_row_depth.png")
     _ = math
@@ -567,14 +584,16 @@ def fig_tight(summary, depth):
         fail.append(float(r["fail_frac"]) * 100)
         tfail.append(float(r["theory_fail"]) * 100)
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.6), dpi=140)
+    load_ticks = ["25%\n419万条", "50%\n839万条", "70%\n1174万条",
+                  "90%\n1510万条", "100%\n1678万条"]
+    fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.6), dpi=140)
     x = np.arange(len(labels))
     w = 0.36
     axes[0].bar(x - w / 2, over, width=w, color=CORAL, label="仿真")
     axes[0].bar(x + w / 2, theory, width=w, color=ORANGE, label="Poisson 公式")
-    axes[0].set_xticks(x, labels)
-    axes[0].set_xlabel("同样的 key 条数，按 n / 2^24 计")
-    axes[0].set_ylabel("占插入条数的百分比")
+    axes[0].set_xticks(x, load_ticks, fontsize=8)
+    axes[0].set_xlabel("上行仍是插入条数 / 2^24，下行是条数。表已收成 2^22 行\n所以 100% 时平均每行 4 条，不是 1 条", fontsize=8.5)
+    axes[0].set_ylabel("占该档插入条数的百分比")
     axes[0].set_title("2^22 行主表溢出率")
     axes[0].legend(frameon=False, loc="upper left")
     ymax = max(over + theory)
@@ -591,8 +610,8 @@ def fig_tight(summary, depth):
     axes[0].set_ylim(0, ymax * 1.28)
     axes[1].bar(x - w / 2, fail, width=w, color=CORAL, label="仿真，即插入失败率")
     axes[1].bar(x + w / 2, tfail, width=w, color=NAVY, label="Poisson 公式")
-    axes[1].set_xticks(x, labels)
-    axes[1].set_xlabel("同样的 key 条数，按 n / 2^24 计")
+    axes[1].set_xticks(x, load_ticks, fontsize=8)
+    axes[1].set_xlabel("刻度与左图相同\n纵轴是冲突表也放不下的 key，占该档插入条数的百分比", fontsize=8.5)
     axes[1].set_ylabel("占插入条数的百分比")
     axes[1].set_title("2^22 行时的冲突表溢出率")
     fmax = max(fail + tfail + [1.0])
@@ -603,7 +622,7 @@ def fig_tight(summary, depth):
     fig.tight_layout()
     save(fig, "17_tight_overflow.png")
 
-    fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.6), dpi=140)
+    fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.4), dpi=140)
     wover, wfail = [], []
     for exp, _lab in wide:
         r = by[(exp, "uniform")]
@@ -611,16 +630,16 @@ def fig_tight(summary, depth):
         wfail.append(float(r["fail_frac"]) * 100)
     axes[0].plot(x, wover, "-o", color=TEAL, label="2^24 行")
     axes[0].plot(x, over, "-o", color=CORAL, label="2^22 行")
-    axes[0].set_xticks(x, labels)
+    axes[0].set_xticks(x, load_ticks, fontsize=8)
     axes[0].set_yscale("log")
-    axes[0].set_xlabel("负载  n / 2^24")
+    axes[0].set_xlabel("上行 = 插入条数 / 2^24，下行是条数\n青线和红线用的是同一批 key", fontsize=8.5, labelpad=12)
     axes[0].set_ylabel("主表溢出率（%）")
     axes[0].set_title("同一批 key 的主表溢出")
     axes[0].legend(frameon=False)
     axes[1].plot(x, wfail, "-o", color=TEAL, label="2^24 行")
     axes[1].plot(x, fail, "-o", color=CORAL, label="2^22 行")
-    axes[1].set_xticks(x, labels)
-    axes[1].set_xlabel("负载  n / 2^24")
+    axes[1].set_xticks(x, load_ticks, fontsize=8)
+    axes[1].set_xlabel("刻度与左图相同\n纵轴是插入失败率，等于该几何下冲突表的溢出率", fontsize=8.5, labelpad=12)
     axes[1].set_ylabel("冲突表溢出率，即失败率（%）")
     axes[1].set_title("同一批 key 的插入失败率")
     axes[1].legend(frameon=False)
@@ -628,7 +647,7 @@ def fig_tight(summary, depth):
     save(fig, "18_geometry_compare.png")
 
     colors = ["#8FB8C9", "#1F7A8C", "#E09F3E", "#C4493A", "#1B3A4B"]
-    fig, ax = plt.subplots(figsize=(8.6, 4.8), dpi=140)
+    fig, ax = plt.subplots(figsize=(9.2, 5.4), dpi=140)
     depths = np.arange(0, 5)
     width = 0.15
     for i, ((exp, lab), color) in enumerate(zip(order, colors)):
@@ -637,14 +656,14 @@ def fig_tight(summary, depth):
         vals = [rows.get(d, 0.0) * 100 for d in depths]
         ax.bar(depths + (i - 2) * width, vals, width=width, color=color, label=lab)
     ax.set_xticks(depths, [str(d) for d in depths])
-    ax.set_xlabel("主表一行里已占用的 STE 数")
-    ax.set_ylabel("行的百分比")
+    ax.set_xlabel("横轴：2^22 行主表里，这一行写下的 STE 个数\n0 = 空行，4 = 行满。同一数字上从左到右五根柱是 25% 到 100%", fontsize=8.5, labelpad=16)
+    ax.set_ylabel("占主表 2^22 行的百分比")
     ax.set_title("2^22 行主表的每行深度")
-    ax.legend(frameon=False, ncol=5, fontsize=8, title="负载 n/2^24")
+    ax.legend(frameon=False, ncol=5, fontsize=8, title="插入条数 / 2^24")
     fig.tight_layout()
     save(fig, "19_tight_main_depth.png")
 
-    fig, ax = plt.subplots(figsize=(9.2, 4.8), dpi=140)
+    fig, ax = plt.subplots(figsize=(10.2, 5.4), dpi=140)
     for (exp, lab), color in zip(order, colors):
         rows = sorted(depth[(exp, "uniform", "collision")], key=lambda r: int(r["depth"]))
         xs, ys = [], []
@@ -656,11 +675,11 @@ def fig_tight(summary, depth):
             ys.append(frac * 100)
         ax.plot(xs, ys, "-o", color=color, label=lab, markersize=3.5)
     ax.set_yscale("log")
-    ax.set_xlabel("冲突表一行里已占用的 STE 数")
-    ax.set_ylabel("行的百分比（对数）")
+    ax.set_xlabel("横轴：2^17 行冲突表里，这一行写下的 STE 个数，0 到 16\n深度 16 表示 16 个槽都满，再来的 key 就是插入失败", fontsize=8.5, labelpad=16)
+    ax.set_ylabel("占冲突表 2^17 行的百分比（对数）")
     ax.set_title("2^22 行方案的冲突表每行深度")
     ax.set_xticks(range(0, 17))
-    ax.legend(frameon=False, ncol=5, fontsize=8, title="负载 n/2^24")
+    ax.legend(frameon=False, ncol=5, fontsize=8, title="插入条数 / 2^24")
     fig.tight_layout()
     save(fig, "20_tight_col_depth.png")
 
