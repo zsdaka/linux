@@ -2,7 +2,7 @@
 
 日期：2026-10-28（Asia/Shanghai）
 
-状态：计划。确认后才开始源码精读、仿真和 Word 报告。本文件不改驱动。
+状态：分析已经完成。报告在 `mlx5-hws-analysis/mlx5-hws-model.docx`，仿真在 `mlx5-hws-analysis/sim/`。本目录不改驱动。
 
 ## 本版变更
 
