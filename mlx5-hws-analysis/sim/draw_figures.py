@@ -472,6 +472,121 @@ def fig_loads(summary, depth):
     _ = math
 
 
+def fig_tight(summary, depth):
+    import numpy as np
+
+    order = [("D25", "25%"), ("D50", "50%"), ("D70", "70%"),
+             ("D90", "90%"), ("D100", "100%")]
+    by = {(r["exp"], r["data"]): r for r in summary}
+    wide = [("L25", "25%"), ("L50", "50%"), ("L70", "70%"),
+            ("L90", "90%"), ("L100", "100%")]
+    labels = [lab for _, lab in order]
+    over, theory, fail, tfail = [], [], [], []
+    for exp, _lab in order:
+        r = by[(exp, "uniform")]
+        over.append(float(r["over_frac"]) * 100)
+        theory.append(float(r["theory_over"]) * 100)
+        fail.append(float(r["fail_frac"]) * 100)
+        tfail.append(float(r["theory_fail"]) * 100)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.6), dpi=140)
+    x = np.arange(len(labels))
+    w = 0.36
+    axes[0].bar(x - w / 2, over, width=w, color=CORAL, label="仿真")
+    axes[0].bar(x + w / 2, theory, width=w, color=ORANGE, label="Poisson 公式")
+    axes[0].set_xticks(x, labels)
+    axes[0].set_xlabel("同样的 key 条数，按 n / 2^24 计")
+    axes[0].set_ylabel("占插入条数的百分比")
+    axes[0].set_title("2^22 行主表溢出率")
+    axes[0].legend(frameon=False, loc="upper left")
+    ymax = max(over + theory)
+
+    def bar_label(v):
+        if v == 0:
+            return "0"
+        if v < 0.1:
+            return f"{v:.3f}"
+        return f"{v:.2f}"
+
+    for i, v in enumerate(over):
+        axes[0].text(i, v + ymax * 0.03, bar_label(v), ha="center", fontsize=7, color=NAVY)
+    axes[0].set_ylim(0, ymax * 1.28)
+    axes[1].bar(x - w / 2, fail, width=w, color=CORAL, label="仿真，即插入失败率")
+    axes[1].bar(x + w / 2, tfail, width=w, color=NAVY, label="Poisson 公式")
+    axes[1].set_xticks(x, labels)
+    axes[1].set_xlabel("同样的 key 条数，按 n / 2^24 计")
+    axes[1].set_ylabel("占插入条数的百分比")
+    axes[1].set_title("2^22 行时的冲突表溢出率")
+    fmax = max(fail + tfail + [1.0])
+    for i, v in enumerate(fail):
+        axes[1].text(i, v + fmax * 0.03, bar_label(v), ha="center", fontsize=7, color=NAVY)
+    axes[1].set_ylim(0, fmax * 1.28)
+    axes[1].legend(frameon=False, fontsize=8, loc="upper left")
+    fig.tight_layout()
+    save(fig, "17_tight_overflow.png")
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.6), dpi=140)
+    wover, wfail = [], []
+    for exp, _lab in wide:
+        r = by[(exp, "uniform")]
+        wover.append(float(r["over_frac"]) * 100)
+        wfail.append(float(r["fail_frac"]) * 100)
+    axes[0].plot(x, wover, "-o", color=TEAL, label="2^24 行")
+    axes[0].plot(x, over, "-o", color=CORAL, label="2^22 行")
+    axes[0].set_xticks(x, labels)
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("负载  n / 2^24")
+    axes[0].set_ylabel("主表溢出率（%）")
+    axes[0].set_title("同一批 key 的主表溢出")
+    axes[0].legend(frameon=False)
+    axes[1].plot(x, wfail, "-o", color=TEAL, label="2^24 行")
+    axes[1].plot(x, fail, "-o", color=CORAL, label="2^22 行")
+    axes[1].set_xticks(x, labels)
+    axes[1].set_xlabel("负载  n / 2^24")
+    axes[1].set_ylabel("冲突表溢出率，即失败率（%）")
+    axes[1].set_title("同一批 key 的插入失败率")
+    axes[1].legend(frameon=False)
+    fig.tight_layout()
+    save(fig, "18_geometry_compare.png")
+
+    colors = ["#8FB8C9", "#1F7A8C", "#E09F3E", "#C4493A", "#1B3A4B"]
+    fig, ax = plt.subplots(figsize=(8.6, 4.8), dpi=140)
+    depths = np.arange(0, 5)
+    width = 0.15
+    for i, ((exp, lab), color) in enumerate(zip(order, colors)):
+        rows = {int(r["depth"]): float(r["fraction"])
+                for r in depth[(exp, "uniform", "main")]}
+        vals = [rows.get(d, 0.0) * 100 for d in depths]
+        ax.bar(depths + (i - 2) * width, vals, width=width, color=color, label=lab)
+    ax.set_xticks(depths, [str(d) for d in depths])
+    ax.set_xlabel("主表一行里已占用的 STE 数")
+    ax.set_ylabel("行的百分比")
+    ax.set_title("2^22 行主表的每行深度")
+    ax.legend(frameon=False, ncol=5, fontsize=8, title="负载 n/2^24")
+    fig.tight_layout()
+    save(fig, "19_tight_main_depth.png")
+
+    fig, ax = plt.subplots(figsize=(9.2, 4.8), dpi=140)
+    for (exp, lab), color in zip(order, colors):
+        rows = sorted(depth[(exp, "uniform", "collision")], key=lambda r: int(r["depth"]))
+        xs, ys = [], []
+        for r in rows:
+            frac = float(r["fraction"])
+            if frac <= 0:
+                continue
+            xs.append(int(r["depth"]))
+            ys.append(frac * 100)
+        ax.plot(xs, ys, "-o", color=color, label=lab, markersize=3.5)
+    ax.set_yscale("log")
+    ax.set_xlabel("冲突表一行里已占用的 STE 数")
+    ax.set_ylabel("行的百分比（对数）")
+    ax.set_title("2^22 行方案的冲突表每行深度")
+    ax.set_xticks(range(0, 17))
+    ax.legend(frameon=False, ncol=5, fontsize=8, title="负载 n/2^24")
+    fig.tight_layout()
+    save(fig, "20_tight_col_depth.png")
+
+
 def main():
     summary = load_summary()
     hist = load_hist()
@@ -485,6 +600,7 @@ def main():
     fig_geometry()
     fig_results(summary, hist)
     fig_loads(summary, depth)
+    fig_tight(summary, depth)
 
 
 if __name__ == "__main__":
