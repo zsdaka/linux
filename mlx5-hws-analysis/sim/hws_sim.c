@@ -661,6 +661,12 @@ int main(int argc, char **argv)
 	ADD("L70", "uniform", DATA_UNIFORM, (1ULL << 24) * 70 / 100, 24, 1);
 	ADD("L90", "uniform", DATA_UNIFORM, (1ULL << 24) * 90 / 100, 24, 1);
 	ADD("L100", "uniform", DATA_UNIFORM, (1ULL << 24), 24, 1);
+	/* Same key counts, main table shrunk to 2^22 rows (collision 2^17 x 16). */
+	ADD("D25", "uniform", DATA_UNIFORM, (1ULL << 24) * 25 / 100, 22, 1);
+	ADD("D50", "uniform", DATA_UNIFORM, (1ULL << 24) * 50 / 100, 22, 1);
+	ADD("D70", "uniform", DATA_UNIFORM, (1ULL << 24) * 70 / 100, 22, 1);
+	ADD("D90", "uniform", DATA_UNIFORM, (1ULL << 24) * 90 / 100, 22, 1);
+	ADD("D100", "uniform", DATA_UNIFORM, (1ULL << 24), 22, 1);
 	}
 	if (trace.n) {
 		ADD("TraceFull", "ctu", DATA_TRACE, trace.n, 24, 1);
