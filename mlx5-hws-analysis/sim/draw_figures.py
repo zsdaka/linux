@@ -92,22 +92,51 @@ def fig_objects():
     save(fig, "01_objects.png")
 
 
+def fig_domains():
+    fig, ax = new_ax(14.4, 8.4)
+    ax.set_title("三个以太网域并列。HWS 在本树里只打开 FDB", fontsize=16, color=NAVY, pad=8)
+    cols = [
+        (3, "#D6E4F0", "NIC_RX",
+         "FS_FT_NIC_RX = 0\n根：steering->root_ns\n本树命令：固件 DMFS",
+         "namespace\nBYPASS、RX MACSEC\nLAG、OFFLOADS\nETHTOOL、KERNEL\nLEFTOVERS、ANCHOR",
+         "只建 RX 半边\n终结可以是 TIR\nTIR 再选 RQ"),
+        (35, "#F6E7C1", "NIC_TX",
+         "FS_FT_NIC_TX = 1\n根：egress_root_ns\n本树命令：固件 DMFS",
+         "namespace\nEGRESS\nEGRESS_IPSEC\nEGRESS_MACSEC",
+         "只建 TX 半边\n封装方向是 L2→隧道\n根由 SET_FLOW_TABLE_ROOT\ntable_type = NIC_TX 挂上"),
+        (67, "#D9EDE8", "FDB",
+         "FS_FT_FDB = 4\n根：fdb_root_ns\n本树可切 dmfs / smfs / hmfs",
+         "namespace\nFDB 根、FDB_BYPASS\n以及运行时的 TC chain",
+         "RX、TX 两套 STE\nHWS 时是 rtc_0 / rtc_1\n动作是 vport、丢弃、跳表"),
+    ]
+    for x, color, title, head, mid, tail in cols:
+        box(ax, x, 18, 30, 70, "", color, ec=NAVY, lw=1.4)
+        ax.text(x + 15, 82, title, ha="center", fontsize=13, color=NAVY, fontweight="bold")
+        ax.text(x + 15, 68, head, ha="center", va="center", fontsize=8.5, color=INK)
+        ax.text(x + 15, 48, mid, ha="center", va="center", fontsize=8.5, color=INK)
+        ax.text(x + 15, 28, tail, ha="center", va="center", fontsize=8.5, color=INK)
+    ax.text(50, 8,
+            "smfs / hmfs 的模式切换只接受 FS_FT_FDB。NIC_RX 与 NIC_TX 的根留在固件流表上。",
+            ha="center", fontsize=10, color=TEAL)
+    save(fig, "21_domains.png")
+
+
 def fig_rx():
     fig, ax = new_ax(13.4, 7.2)
-    ax.set_title("RX 数据面：流表在 TIR / RQ 之前", fontsize=16, color=NAVY, pad=8)
+    ax.set_title("RX：先过 FDB 域，再进该 function 的 NIC_RX 域，然后才到 TIR", fontsize=15, color=NAVY, pad=8)
     stages = [
         (2, "线侧 / 上行口", SAND),
-        (18, "FDB 根表\nnamespace FDB", MIST),
-        (34, "matcher 链\nRTC RX 哈希选行", "#D6E4F0"),
-        (50, "STC 动作\nvport / 丢弃 / 跳表", "#E7F6D9"),
-        (66, "代表口进入\nNIC RX 域", SAND),
-        (82, "TIR → RQ\nCQ → EQ", "#F8D7D2"),
+        (18, "FDB 域\n可切到 HWS\n走 RTC RX", MIST),
+        (34, "目的 vport", "#D6E4F0"),
+        (50, "NIC_RX 域\n固件 DMFS", SAND),
+        (66, "TIR", "#E7F6D9"),
+        (82, "RQ → CQ → EQ", "#F8D7D2"),
     ]
     for x, t, c in stages:
         box(ax, x, 62, 14, 22, t, c, fs=9)
     for x in (16, 32, 48, 64, 80):
         arrow(ax, x, 73, x + 2, 73)
-    ax.text(50, 54, "本仓库 HWS 只创建 FS_FT_FDB。TIR 属于 NIC RX 的终结对象，不在 HWS 动作枚举里。",
+    ax.text(50, 54, "没有 FDB offload 时，线侧直接进入 NIC_RX 域。TIR 是 NIC_RX 的终结对象。",
             ha="center", fontsize=9, color=INK)
     box(ax, 6, 18, 88, 28, "", "#F8FBFC", ec=TEAL)
     ax.text(10, 40, "规则下发走另一套队列，不经过数据包 RQ", fontsize=11, color=TEAL, fontweight="bold")
@@ -121,21 +150,21 @@ def fig_rx():
 
 def fig_tx():
     fig, ax = new_ax(13.4, 6.6)
-    ax.set_title("TX 数据面：SQ / TIS 在流表之前，FDB 用 TX RTC", fontsize=16, color=NAVY, pad=8)
+    ax.set_title("TX：SQ / TIS 之后先过 NIC_TX 域，再进 FDB 域的 TX 侧", fontsize=15, color=NAVY, pad=8)
     stages = [
         (2, "主机数据包\nSQ 门铃", SAND),
         (18, "TIS\n发送侧传输接口", "#F8D7D2"),
-        (34, "vport 进入 FDB\nflow source = VPORT", MIST),
-        (50, "RTC TX\n哈希选行，比 tag", "#D6E4F0"),
+        (34, "NIC_TX 域\n固件 DMFS\nIPsec / MACsec", SAND),
+        (50, "FDB 域 TX\n可切到 HWS\nRTC TX", MIST),
         (66, "STC\n改头 / 封装 / 计数", "#E7F6D9"),
-        (82, "上行口发出\n或丢弃", SAND),
+        (82, "上行口发出\n或丢弃", "#D6E4F0"),
     ]
     for x, t, c in stages:
-        box(ax, x, 48, 14, 28, t, c, fs=9)
+        box(ax, x, 48, 14, 28, t, c, fs=8.5)
     for x in (16, 32, 48, 64, 80):
         arrow(ax, x, 62, x + 2, 62)
     ax.text(50, 30,
-            "optimize_flow_src = WIRE 时跳过 TX RTC；= VPORT 时跳过 RX RTC。默认 ANY，一条规则写两套 STE。",
+            "没有 FDB offload 时，NIC_TX 之后直接出端口。FDB 规则默认写 RX、TX 两套 STE。",
             ha="center", fontsize=9, color=INK)
     ax.text(50, 16, "数据包 SQ 与 HWS 规则 SQ 是两套队列。前者搬报文，后者搬 STE。",
             ha="center", fontsize=11, color=TEAL)
@@ -592,6 +621,7 @@ def main():
     hist = load_hist()
     depth = load_depth()
     fig_objects()
+    fig_domains()
     fig_rx()
     fig_tx()
     fig_fdb()

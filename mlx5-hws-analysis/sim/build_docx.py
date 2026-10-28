@@ -122,7 +122,8 @@ def main():
     add_p(doc, "本文对照的是驱动里的表几何和一份按该几何写成的用户态模型。环境里没有 ConnectX，文中的秒数是模型程序自己的运行时间，不是网卡插入速率。")
 
     add_h(doc, "1  结论", 1)
-    add_p(doc, "HWS 把一张逻辑流表拆成按优先级串起来的 matcher。每个 matcher 有一套匹配模板（key）和若干动作模板（action）。FDB 表会为同一条规则建两套 RTC：RX 服务线侧进入的包，TX 服务 vport 发出的包。大表在主 RTC 后面再挂一张碰撞 RTC，优先级与主 matcher 相同。")
+    add_p(doc, "以太网方向上有三个并列的域：NIC_RX、NIC_TX、FDB。fs_core 为它们各建一个根 namespace。NIC_RX 和 NIC_TX 的命令留在固件流表。FDB 根可以切到 smfs 或 hmfs。后面关于 RTC、STE 和插入上界的部分，写的是切到 hmfs 之后的 FDB 域。FDB 内部的 RX、TX 两套 RTC 是这一个域的两个方向。")
+    add_p(doc, "HWS 把一张 FDB 流表拆成按优先级串起来的 matcher。每个 matcher 有一套匹配模板（key）和若干动作模板（action）。同一条规则建两套 RTC：RX 服务线侧进入的包，TX 服务 vport 发出的包。大表在主 RTC 后面再挂一张碰撞 RTC，优先级与主 matcher 相同。")
     add_p(doc, "存储单位是 STE。RESOURCE_MODE_RULE 下，调用者给出的 num_log 是哈希行数的对数。num_log = 24 时主表是 2^24 行、每行 4 个 STE，一共 2^26 个槽。碰撞表是 2^19 行、每行 16 个槽。2^24 条 key 均匀放入时，主表大约四分之三的槽是空的。这些空槽用来吸收同一行上的哈希起伏，使溢出比例停在千分之几。")
     add_p(doc, "插入由专用发送队列上的 GTA WQE 完成，opcode 为 0x2c。硬件只在哈希选中的那一行里找空 STE。行满时软件再向碰撞 RTC 发一条 WQE。成功路径的 WQE 数只有 1 或 2，与表中已有规则数无关。千万条每秒这个量级要靠设备把这种定长 WQE 在多条队列上打满；规则变多不会把单次插入变成随表长增长的搜索。")
     a = by[("A", "uniform")]
@@ -147,11 +148,29 @@ def main():
               ])
 
     add_h(doc, "3  域、namespace、表、key 与 action", 1)
-    add_h(doc, "3.1  域", 2)
-    add_p(doc, "本树公开的 HWS 表类型只有 MLX5HWS_TABLE_TYPE_FDB。创建表时若 type 大于 FDB 会直接拒绝。FDB 在固件侧仍拆成两个资源类型：FS_FT_FDB_RX 与 FS_FT_FDB_TX。hws_matcher_create_rtc() 在表类型为 FDB 时创建第二套 RTC，STE 区间分别记在 ste_0_base 与 ste_1_base。")
-    add_p(doc, "context 初始化还要求 eswitch manager、WQE 更新、8DW STE、按哈希和按偏移两种 RTC 更新模式，以及 SELECT definer。不满足这些能力时，上下文不会置上 HWS_SUPPORT。")
+    add_h(doc, "3.1  三个域", 2)
+    add_p(doc, "NIC_RX、NIC_TX、FDB 是三套并列的以太网流表域。驱动里有两层同名枚举。固件侧是 fs_flow_table_type：FS_FT_NIC_RX = 0，FS_FT_NIC_TX = 1，FS_FT_FDB = 4。软件转向侧是 steering/sws/mlx5dr.h 里的 mlx5dr_domain_type，三个取值也是 NIC_RX、NIC_TX、FDB。fs_core 初始化时各建一个根：init_root_ns() 得到 steering->root_ns，表类型 NIC_RX；init_egress_root_ns() 得到 egress_root_ns，表类型 NIC_TX；设备是 eswitch manager 且 FDB 能力打开时，init_fdb_root_ns() 得到 fdb_root_ns。SET_FLOW_TABLE_ROOT 按 table_type 分别挂根，NIC_TX 的入口在 mlx5_fs_cmd_set_tx_flow_table_root()。")
+    add_fig(doc, "21_domains.png", "图 21  NIC_RX、NIC_TX、FDB 三个域。前两个在本树走固件流表，FDB 可以切到 HWS")
+    add_table(doc,
+              ["域", "根", "本树的命令", "方向", "namespace", "典型终结"],
+              [
+                  ["NIC_RX", "root_ns", "固件 DMFS", "只建 RX 半边",
+                   "BYPASS、RX MACSEC、LAG、OFFLOADS、ETHTOOL、KERNEL、LEFTOVERS、ANCHOR",
+                   "TIR，再由 TIR 选 RQ"],
+                  ["NIC_TX", "egress_root_ns", "固件 DMFS", "只建 TX 半边",
+                   "EGRESS、EGRESS_IPSEC、EGRESS_MACSEC",
+                   "改头、L2 到隧道的封装，然后离开 function"],
+                  ["FDB", "fdb_root_ns", "dmfs、smfs 或 hmfs", "RX 与 TX 各一套 STE",
+                   "FDB 根、FDB_BYPASS，以及运行时的 TC chain",
+                   "vport、丢弃、跳表、封装"],
+              ])
+    add_p(doc, "表 4  三个以太网域。RDMA、sniffer、port select、vport ACL 另外还有自己的根和表类型，不在这三列里。", size=9)
+    add_p(doc, "mlx5dr_domain_create() 按类型填半边。NIC_RX 要求接收方向的软件转向能力，默认 ICM 用 nic_rx_drop_address，只初始化 info.rx。NIC_TX 用 nic_tx_allow_address，只初始化 info.tx。FDB 要求 eswitch manager，RX、TX 的默认 ICM 取管理 vport 的两个地址，丢弃地址用 esw_rx_drop 和 esw_tx_drop。表和规则跟着分叉：NIC 域的一张表只有一个方向的锚点，FDB 的一张表在 dr_table_init_fdb() 里把 rx 和 tx 都建出来。FDB 规则还可以按 flow_source 和 source_port 跳过其中一边，这段在 dr_rule_skip()。")
+    add_p(doc, "上一版把域收成 FDB，是因为跟上了 HWS 的创建入口。mlx5_flow_namespace_set_mode() 在根的 table_type 不是 FS_FT_FDB 时返回 -EOPNOTSUPP。全库只有 esw_create_offloads_fdb_tables() 调用它，传入的 namespace 是 MLX5_FLOW_NAMESPACE_FDB。hmfs 因此只在 FDB 根上打开 mlx5hws_context。mlx5_cmd_hws_create_flow_table() 看到其它 table_type 直接返回 -EOPNOTSUPP。enum mlx5hws_table_type 里只有 MLX5HWS_TABLE_TYPE_FDB。smfs 的 mlx5_cmd_dr_create_ns() 调用 mlx5dr_domain_create() 时写死 MLX5DR_DOMAIN_TYPE_FDB。NIC_RX 和 NIC_TX 的创建分支在 dr_domain.c 里是完整的，fs 层没有走到。这两个根的 cmds 一直是 mlx5_fs_cmd_get_default() 返回的固件命令。")
+    add_p(doc, "HWS 源码还留着 NIC 域的口子。表类型不是 FDB 且带了 optimize_flow_src 时，matcher.c 打印 “NIC domain doesn't support flow_src”。table.c 在非 FDB 时用 nic_ft.max_level 填下一张表的 level。mlx5hws_table_get_fw_ft_type() 对非 FDB 返回 -EOPNOTSUPP。本树的 HWS 不会打开 NIC_RX 或 NIC_TX。")
+    add_p(doc, "FDB 域内部还有两个固件资源类型：FS_FT_FDB_RX 与 FS_FT_FDB_TX。hws_matcher_create_rtc() 在表类型为 FDB 时创建第二套 RTC，STE 区间记在 ste_0_base 与 ste_1_base。这两套 RTC 是 FDB 这一个域的两个方向，和 NIC_RX、NIC_TX 两个域并列。context 初始化还要求 eswitch manager、WQE 更新、8DW STE、按哈希和按偏移两种 RTC 更新模式，以及 SELECT definer。不满足这些能力时，上下文不会置上 HWS_SUPPORT。")
     add_h(doc, "3.2  namespace 里有几张表", 2)
-    add_p(doc, "mlx5_flow_namespace_type 列出了 BYPASS、KERNEL、FDB、EGRESS、RDMA、IPsec、MACsec 等二十余个 namespace。HWS 创建路径只接受 FS_FT_FDB。因此在这棵树里，HWS 流表全部挂在 FDB namespace 上，其它 namespace 没有 HWS matcher。")
+    add_p(doc, "namespace 挂在某一个域的根下面。mlx5_get_flow_namespace() 把 BYPASS 到 ANCHOR 这 8 个类型交给 root_ns，把 EGRESS 三个类型交给 egress_root_ns，把 FDB 和 FDB_BYPASS 交给 fdb_root_ns。HWS 创建路径只接受 FS_FT_FDB，所以 hmfs 的 matcher 只出现在 FDB 域里。NIC_RX 和 NIC_TX 的表由固件流表命令创建。")
     add_p(doc, "FDB namespace 内部的表数随 offload 变化，不是一个写死的整数。fs.h 里的优先级梯子是：FDB_BYPASS_PATH、FDB_CRYPTO_INGRESS、FDB_TC_OFFLOAD、FDB_FT_OFFLOAD、FDB_TC_MISS、FDB_BR_OFFLOAD、FDB_SLOW_PATH、FDB_CRYPTO_EGRESS、FDB_PER_VPORT。esw_create_offloads_fdb_tables() 至少创建两张表：慢路径表（优先级 FDB_SLOW_PATH）和 TC miss 表（优先级 FDB_TC_MISS）。TC chain 在运行时继续按 level 加表。每张 mlx5_flow_table 对应一张 mlx5hws_table。")
     add_p(doc, "一张 HWS 表里的 matcher 数等于这张表上的 flow group 数，再加每个大 matcher 的一张碰撞表。碰撞 matcher 使用与主 matcher 相同的 priority，创建时插到主 matcher 后面，查找顺序是先主 RTC、再碰撞 RTC。")
     add_h(doc, "3.3  每张表的 key 和 action", 2)
@@ -164,7 +183,7 @@ def main():
                   ["miss", "外层 DMAC 的组播位（dmac[0] = 0x01）", "单播和组播 miss 都转到管理 vport"],
               ])
     add_p(doc, "业务规则（TC、桥、封装）的 key 由当时的 flow spec 决定，常见字段来自 definer 能选的外层/内层地址、端口、VLAN、隧道和寄存器。action 来自动作模板，类型包括丢弃、跳表、计数、tag、改头、vport、压弹 VLAN、封装与解封装、插入或删除头、meter、采样和目的地数组。终结到 vport 的动作在 fs_hws.c 里通过 mlx5hws_action_create_dest_vport 创建。")
-    add_p(doc, "TIR 出现在 fs 的通用目的地结构里（mlx5_flow_destination.tir_num），供 NIC RX 的终结表使用。HWS 动作枚举里没有 TIR。FDB 命中之后的典型终结是 vport 或丢弃；报文到达代表口之后，才进入 NIC RX，由 TIR 选择 RQ。")
+    add_p(doc, "NIC_RX 的 KERNEL namespace 由 en_fs.c 建 TTC。fs_ttc.c 用外层 ethertype、IP 版本和 L4 协议做 key，目的地类型是 TIR，tir_num 指向 RSS 或 direct TIR。NIC_TX 的表做该 function 发出方向的 IPsec 和 MACsec。软件转向代码里，NIC_RX 的重格式化只接受隧道到 L2，NIC_TX 只接受 L2 到隧道。HWS 动作枚举里没有 TIR。FDB 命中后的典型终结是 vport 或丢弃；报文到达目的 function 之后，再进入那个 function 的 NIC_RX 域，由 TIR 选择 RQ。")
 
     add_h(doc, "4  存储、插入、查找", 1)
     add_fig(doc, "01_objects.png", "图 1  context、table、matcher、RTC、STE、STC 的关系")
@@ -181,11 +200,11 @@ def main():
     add_p(doc, "hws_matcher_connect() 按 priority 把 matcher 串起来。前一张的 end FT 指向下一张的 RTC；最后一张指向 miss 表。碰撞 matcher 与主 matcher 优先级相等，插在后面，所以主 RTC 未命中会进入碰撞 RTC。命中后执行 STE 里指向的 STC。整条 matcher 链都未命中时，FDB 默认 miss 把报文转到 eswitch manager vport。")
 
     add_h(doc, "5  流水线，以及和 TIR、TIS、RQ、SQ、CQ、EQ 的层次", 1)
-    add_fig(doc, "02_rx_pipeline.png", "图 5  RX。HWS 流表在 FDB，TIR 和 RQ 在随后的 NIC RX")
-    add_fig(doc, "03_tx_pipeline.png", "图 6  TX。数据包先到 SQ 和 TIS，再进 FDB 的 TX RTC")
+    add_fig(doc, "02_rx_pipeline.png", "图 5  RX。FDB 域在前，目的 function 的 NIC_RX 域在后，TIR 和 RQ 属于 NIC_RX")
+    add_fig(doc, "03_tx_pipeline.png", "图 6  TX。SQ 和 TIS 之后先过 NIC_TX 域，再进 FDB 域的 TX RTC")
     add_fig(doc, "04_fdb_dual_rtc.png", "图 7  一条 FDB 规则写入 RX、TX 两套 STE，各自带碰撞 RTC")
-    add_p(doc, "从报文方向看，层次是：端口或 vport，然后是 namespace 上的 flow table 链，然后是 matcher 的 RTC，然后是 STC。FDB 的 STC 把报文送到 vport 或丢掉。代表口上的 NIC RX 再用 TIR 选定 RQ。RQ 完成写进 CQ，CQ 的通知到达 EQ。")
-    add_p(doc, "TIS 是发送侧的传输接口。主机把数据包 WQE 放进 SQ 并敲门铃之后，报文带着 TIS 进入 TX 方向，FDB 用 TX RTC 做哈希。")
+    add_p(doc, "switchdev 下，RX 的层次是：上行口，FDB 域（hmfs 时走 RTC RX 和 STC），目的 vport，该 function 的 NIC_RX 域，TIR，RQ，CQ，EQ。NIC_RX 域里的表是固件流表，namespace 按 BYPASS 到 ANCHOR 的优先级串起来。没有 FDB offload 时，线侧报文直接进入 NIC_RX 域。")
+    add_p(doc, "TIS 是发送侧的传输接口。主机把数据包 WQE 放进 SQ 并敲门铃之后，报文先进入该 function 的 NIC_TX 域，做完 egress 规则再离开 function。switchdev 下下一站是 FDB 域的 TX 侧，hmfs 时用 TX RTC 做哈希。没有 FDB offload 时，NIC_TX 之后直接出端口。")
     add_p(doc, "规则下发不走数据包 RQ/SQ。context 按队列数打开一组 HWS SQ/CQ，上面只跑 GTA WQE。完成由驱动轮询这条 CQ 取回；EQ 处于通知层，插入快路径不依赖 EQ 中断。所以图里有两条队列：一条搬包，一条搬 STE。")
 
     add_h(doc, "6  数学模型", 1)
