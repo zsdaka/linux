@@ -44,7 +44,9 @@ Namespace 指内核 `mlx5_flow_namespace`。一张 namespace 里的表数随 lev
 - `MLX5HWS_MATCHER_ASSURED_ROW_RATIO = 5`。碰撞表行数是主表行数的 \(2^{-5} = 1/32\)，注释里的 3% 即 \(\log_2(0.03) \approx 5\)。
 - `MLX5HWS_MATCHER_ASSURED_RULES_TH = 10`。`num_log > 10` 才挂碰撞表。千万级必挂。
 
-`MLX5HWS_MATCHER_RESOURCE_MODE_RULE` 下，`union mlx5hws_matcher_size` 的 `rule.num_log` 与 `table.sz_row_log` 共用第一个字节。主表 `log_hash_size = num_log`。`hws_matcher_rules_to_tbl_depth()` 把大表的 `log_depth` 设为 2。碰撞 matcher 在 `hws_matcher_create_col_matcher()` 里把行对数减 5，列对数设为 4。
+`MLX5HWS_MATCHER_RESOURCE_MODE_RULE` 下，`union mlx5hws_matcher_size` 的 `rule.num_log` 与 `table.sz_row_log` 共用第一个字节。主表 `log_hash_size = num_log`。`hws_matcher_rules_to_tbl_depth()` 把大表的 `log_depth` 设为 2。碰撞 matcher 在 `hws_matcher_create_col_matcher()` 里把行对数减 5，列对数设为 4。代码只从碰撞表的行对数里减，不从主表行对数里减 `log_depth`。
+
+\(2^{24}\) 条 key、`num_log = 24` 时，主表是 \(2^{24}\) 行而不是 \(2^{22}\) 行。每行 4 个槽，STE 总数是 \(2^{24+2} = 2^{26}\)，等于 key 数的 4 倍。平均每行 1 条 key，行内另外 3 个槽是余量。碰撞表是 \(2^{19}\) 行、每行 16 个槽，行数为主表的 1/32。`hws_matcher_bind_mt()` 里 STE 区间是 `sz_row_log + sz_col_log`，BWC 判断能否再放大时用的也是 `size_log + ASSURED_MAIN_TBL_DEPTH`。这两处都把深度加进行数的对数，对应“槽位 = 行数 × 4”，对应“行数 = key 数”，不对应“行数 = key 数 / 4”。若把主表收成 \(2^{22}\) 行，驱动会把它理解成只承诺 \(2^{22}\) 条规则。
 
 插入 WQE 是 `MLX5HWS_WQE_OPCODE_TBL_ACCESS`（0x2c），opmod 为 GTA STE。硬件按 hash 在固定深度的行里找空 STE。主行满时软件再向碰撞 RTC 发一条 WQE（`send.c` 的 retry 路径）。成功插入的硬件往返是 1 条或 2 条 WQE，与已经插入了多少条无关。
 
