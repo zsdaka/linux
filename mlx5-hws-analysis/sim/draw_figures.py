@@ -121,6 +121,55 @@ def fig_domains():
     save(fig, "21_domains.png")
 
 
+def fig_legacy():
+    fig, ax = new_ax(14.2, 8.0)
+    ax.set_title("legacy：FDB 做 L2 转发，每个 function 用自己的 NIC 域", fontsize=15, color=NAVY, pad=6)
+    box(ax, 3, 58, 30, 32, "FDB 域\n固件 DMFS，不切 hmfs\n\nchain 0，prio 1\nDMAC → vport\n组播位 → vport\nuplink 混杂 → vport\n\n打开 VEPA 才有 prio 0", "#D9EDE8", fs=8.5)
+    box(ax, 35, 58, 30, 32, "vport ACL\n非管理 vport 才建\n\ningress：SMAC、CVLAN\n不合法就丢\n\negress：指定 VLAN 放行\n其余丢弃", SAND, fs=8.5)
+    box(ax, 67, 58, 30, 32, "NIC_RX / NIC_TX\nPF 和每个 VF 各一套\n\nKERNEL 的 L2 和 TTC\n目的地是本 function 的 TIR\n\nVF 的表在客户机驱动里建", "#D6E4F0", fs=8.5)
+    stages = [
+        (3, "线侧"),
+        (22, "FDB\n按 DMAC 选 vport"),
+        (41, "VF 的 NIC_RX"),
+        (60, "TIR"),
+        (79, "RQ"),
+    ]
+    for x, t in stages:
+        box(ax, x, 28, 16, 16, t, MIST, fs=8.5)
+    for x in (19, 38, 57, 76):
+        arrow(ax, x, 36, x + 3, 36)
+    ax.text(50, 14, "VF 发出的包先过该 VF 的 NIC_TX，再回到这张 FDB，按目的 MAC 转到 uplink 或另一个 vport。",
+            ha="center", fontsize=9, color=INK)
+    ax.text(50, 6, "esw_legacy_enable() 建表。mlx5_flow_namespace_set_mode() 不会被调用。",
+            ha="center", fontsize=9, color=TEAL)
+    save(fig, "22_legacy.png")
+
+
+def fig_switchdev():
+    fig, ax = new_ax(14.2, 8.2)
+    ax.set_title("switchdev：FDB 可切到 HWS，代表口从 NIC_RX 的 OFFLOADS 表收包", fontsize=14, color=NAVY, pad=6)
+    box(ax, 3, 56, 30, 34, "FDB 域\n可切 dmfs / smfs / hmfs\n\n慢路径：source_sqn、reg_c0\nTC miss 表\nTC / FT chain 运行时加表\n动作为 vport、封装、跳表", "#D9EDE8", fs=8.5)
+    box(ax, 35, 56, 30, 34, "NIC_RX 的 OFFLOADS\n只有 switchdev 建\n\nft_offloads：源 vport\n或 reg_c0 → 代表口\n表尾一条丢弃\nrestore：reg_c1 拷到 reg_b", SAND, fs=8.5)
+    box(ax, 67, 56, 30, 34, "代表口的 NIC_RX / NIC_TX\n\nKERNEL 里仍有 TTC → TIR\n上行口另有一张空 root\nmiss 接到 ethtool / TTC\n\ningress ACL 写 reg_c0", "#D6E4F0", fs=8.5)
+    stages = [
+        (2, "线侧"),
+        (18, "FDB 域"),
+        (34, "vport"),
+        (50, "OFFLOADS\n表"),
+        (66, "代表口\nTTC"),
+        (82, "TIR → RQ"),
+    ]
+    for x, t in stages:
+        box(ax, x, 26, 14, 16, t, MIST, fs=8)
+    for x in (16, 32, 48, 64, 80):
+        arrow(ax, x, 34, x + 2, 34)
+    ax.text(50, 12, "发送方向先过代表口的 NIC_TX，再进 FDB 的 TX 侧。慢路径和 TC miss 在 steering_init 里创建，TC chain 的表在运行时加上。",
+            ha="center", fontsize=9, color=INK)
+    ax.text(50, 5, "hmfs / smfs 只在这条路径上打开，而且只打开 FDB 域。",
+            ha="center", fontsize=9, color=TEAL)
+    save(fig, "23_switchdev.png")
+
+
 def fig_rx():
     fig, ax = new_ax(13.4, 7.2)
     ax.set_title("RX：先过 FDB 域，再进该 function 的 NIC_RX 域，然后才到 TIR", fontsize=15, color=NAVY, pad=8)
@@ -622,6 +671,8 @@ def main():
     depth = load_depth()
     fig_objects()
     fig_domains()
+    fig_legacy()
+    fig_switchdev()
     fig_rx()
     fig_tx()
     fig_fdb()

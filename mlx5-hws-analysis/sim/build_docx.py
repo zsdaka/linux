@@ -183,7 +183,49 @@ def main():
                   ["miss", "外层 DMAC 的组播位（dmac[0] = 0x01）", "单播和组播 miss 都转到管理 vport"],
               ])
     add_p(doc, "业务规则（TC、桥、封装）的 key 由当时的 flow spec 决定，常见字段来自 definer 能选的外层/内层地址、端口、VLAN、隧道和寄存器。action 来自动作模板，类型包括丢弃、跳表、计数、tag、改头、vport、压弹 VLAN、封装与解封装、插入或删除头、meter、采样和目的地数组。终结到 vport 的动作在 fs_hws.c 里通过 mlx5hws_action_create_dest_vport 创建。")
-    add_p(doc, "NIC_RX 的 KERNEL namespace 由 en_fs.c 建 TTC。fs_ttc.c 用外层 ethertype、IP 版本和 L4 协议做 key，目的地类型是 TIR，tir_num 指向 RSS 或 direct TIR。NIC_TX 的表做该 function 发出方向的 IPsec 和 MACsec。软件转向代码里，NIC_RX 的重格式化只接受隧道到 L2，NIC_TX 只接受 L2 到隧道。HWS 动作枚举里没有 TIR。FDB 命中后的典型终结是 vport 或丢弃；报文到达目的 function 之后，再进入那个 function 的 NIC_RX 域，由 TIR 选择 RQ。")
+    add_p(doc, "上面这张慢路径表是 switchdev 的 FDB。NIC_RX 的 KERNEL namespace 由 en_fs.c 建 TTC，两种模式的本机网口都会建。fs_ttc.c 用外层 ethertype、IP 版本和 L4 协议做 key，目的地类型是 TIR，tir_num 指向 RSS 或 direct TIR。HWS 动作枚举里没有 TIR。")
+
+    add_h(doc, "3.4  legacy 和 switchdev", 2)
+    add_p(doc, "两个模式都保留 NIC_RX、NIC_TX、FDB 三个根。eswitch 创建时 mode 写成 MLX5_ESWITCH_LEGACY，devlink 切到 switchdev 之后变成 MLX5_ESWITCH_OFFLOADS。变的是每个根里实际创建的流表和规则，以及 FDB 能不能离开固件流表。ACL 另有表类型 FS_FT_ESW_INGRESS_ACL 和 FS_FT_ESW_EGRESS_ACL，按 vport 各有一个根，两种模式都配，规则不一样。没开 eswitch 的纯网卡不走这两条路径，只有 NIC_RX 和 NIC_TX。")
+    add_h(doc, "3.5  legacy", 2)
+    add_fig(doc, "22_legacy.png", "图 22  legacy。FDB 按目的 MAC 选 vport，收包仍走该 function 自己的 NIC_RX")
+    add_p(doc, "esw_legacy_enable() 调用 esw_create_legacy_fdb_table()。表建在 mlx5_get_fdb_sub_ns(dev, 0)，也就是 FDB_TC_OFFLOAD 优先级下的第 0 个 chain namespace，优先级 LEGACY_FDB_PRIO = 1。命令留在固件流表，set_mode() 不会被调用，所以没有 smfs 域，也没有 hmfs context。")
+    add_table(doc,
+              ["表", "位置", "key", "action"],
+              [
+                  ["主 FDB，地址组", "chain 0，prio 1，索引 0 到 size-3", "外层 DMAC 全匹配", "转到拥有该 MAC 的 vport"],
+                  ["主 FDB，allmulti", "同一张表，索引 size-2", "外层 DMAC 的组播位", "转到打开 allmulti 的 vport"],
+                  ["主 FDB，混杂", "同一张表，索引 size-1", "source_port = uplink", "转到打开混杂的 vport"],
+                  ["VEPA", "同一 namespace，prio 0，只在打开 VEPA 时创建", "source_port = uplink", "转到主 FDB；另一条把其余流量转到 uplink vport"],
+                  ["ingress ACL", "非管理 vport 的 ESW_INGRESS", "CVLAN 标签、SMAC", "允许合法源，其余丢弃"],
+                  ["egress ACL", "非管理 vport 的 ESW_EGRESS", "外层 CVLAN VID", "允许指定 VLAN，其余丢弃并计数"],
+                  ["NIC_RX", "PF，以及客户机里的每个 VF", "KERNEL 的 L2、TTC", "本 function 的 TIR"],
+                  ["NIC_TX", "同上", "EGRESS、IPsec、MACsec", "改头或封装后离开该 function"],
+              ])
+    add_p(doc, "表 5  legacy 实际创建的表。管理 vport 不建 legacy ACL。", size=9)
+    add_p(doc, "线侧报文先在这张 FDB 里按目的 MAC 选 vport，然后进入那个 function 自己的 NIC_RX，再由 TIR 选 RQ。VF 发出的报文先过该 VF 的 NIC_TX，再回到同一张 FDB。地址规则在 __esw_fdb_set_vport_rule() 里写，目的地类型是 VPORT。")
+    add_h(doc, "3.6  switchdev", 2)
+    add_fig(doc, "23_switchdev.png", "图 23  switchdev。FDB 可以切到 HWS，代表口从 NIC_RX 的 OFFLOADS 表收包")
+    add_p(doc, "esw_offloads_enable() 进入 esw_offloads_steering_init()。FDB 表由 esw_create_offloads_fdb_tables() 创建，这里才会调用 mlx5_flow_namespace_set_mode()，所以 smfs 或 hmfs 只出现在这个模式。慢路径表和 TC miss 表挂在 FDB 根上，优先级分别是 FDB_SLOW_PATH 和 FDB_TC_MISS。TC chain 和 FT chain 的 namespace 在 fs_core 初始化时已经排好，表在运行时按 chain 加进去。")
+    add_table(doc,
+              ["表", "位置", "key", "action"],
+              [
+                  ["慢路径 send-to-vport", "FDB 根，FDB_SLOW_PATH", "source_sqn，合并 eswitch 时再加 vhca id", "转到 vport"],
+                  ["慢路径 meta send-to-vport", "同一张表", "reg_c_0 的 vport 元数据，reg_c_1 的隧道位", "转到 vport"],
+                  ["慢路径 miss", "同一张表", "外层 DMAC 的组播位", "转到管理 vport"],
+                  ["TC miss", "FDB 根，FDB_TC_MISS", "空表，用来把后面的优先级接上", "默认 miss 到下一张表"],
+                  ["TC / FT chain", "FDB_TC_OFFLOAD、FDB_FT_OFFLOAD 的 chain", "当时的 flow spec", "封装、改头、跳表、vport、丢弃"],
+                  ["ft_offloads", "NIC_RX 的 OFFLOADS，prio 1", "source_port，或 reg_c_0", "转到代表口的 root 或 TTC"],
+                  ["ft_offloads 丢弃", "同一张表的最后一条", "空匹配", "丢弃"],
+                  ["restore", "NIC_RX 的 OFFLOADS，需要 reg_c1 环回能力", "reg_c_0", "把 reg_c_1 拷到 reg_b"],
+                  ["代表口 TTC", "NIC_RX 的 KERNEL", "外层 ethertype、L4", "该代表口的 TIR"],
+                  ["上行代表口 root", "NIC_RX 的 OFFLOADS，level 1", "空表", "miss 接到 ethtool 或 TTC"],
+                  ["ingress ACL", "uplink、管理 vport，以及后来启用的 vport", "未打标签的包，或全匹配", "把 vport 元数据写入 reg_c_0；可选压上 prio tag"],
+                  ["egress ACL", "同上", "全匹配，或 prio tag", "转到 vport，或弹出 prio tag"],
+              ])
+    add_p(doc, "表 6  switchdev 实际创建的表。ft_offloads 和 restore 只在 esw_offloads_steering_init() 里出现。", size=9)
+    add_p(doc, "线侧报文先过 FDB。命中后目的地是 vport。代表口加载时，en_rep.c 在 ft_offloads 上为这个 vport 加一条规则，目的地是一张流表：上行口是 OFFLOADS 里的空 root，其它代表口直接是自己的 TTC。TTC 再把报文送到该代表口的 TIR。发送方向先过代表口的 NIC_TX，再进入 FDB 的 TX 侧。")
+    add_p(doc, "两边对照下来：legacy 的 FDB 是一张 L2 MAC 表，switchdev 的 FDB 是慢路径加上 TC chain，并且只有后者能切到 hmfs。legacy 的 NIC_RX 属于 PF 和客户机里的 VF；switchdev 在 NIC_RX 的 OFFLOADS namespace 里多出 ft_offloads 和 restore，收包的是 hypervisor 上的代表口。ACL 的根都在，legacy 用它做 spoof check 和 VLAN 过滤，switchdev 用它给报文盖上 vport 元数据。")
 
     add_h(doc, "4  存储、插入、查找", 1)
     add_fig(doc, "01_objects.png", "图 1  context、table、matcher、RTC、STE、STC 的关系")
@@ -203,8 +245,8 @@ def main():
     add_fig(doc, "02_rx_pipeline.png", "图 5  RX。FDB 域在前，目的 function 的 NIC_RX 域在后，TIR 和 RQ 属于 NIC_RX")
     add_fig(doc, "03_tx_pipeline.png", "图 6  TX。SQ 和 TIS 之后先过 NIC_TX 域，再进 FDB 域的 TX RTC")
     add_fig(doc, "04_fdb_dual_rtc.png", "图 7  一条 FDB 规则写入 RX、TX 两套 STE，各自带碰撞 RTC")
-    add_p(doc, "switchdev 下，RX 的层次是：上行口，FDB 域（hmfs 时走 RTC RX 和 STC），目的 vport，该 function 的 NIC_RX 域，TIR，RQ，CQ，EQ。NIC_RX 域里的表是固件流表，namespace 按 BYPASS 到 ANCHOR 的优先级串起来。没有 FDB offload 时，线侧报文直接进入 NIC_RX 域。")
-    add_p(doc, "TIS 是发送侧的传输接口。主机把数据包 WQE 放进 SQ 并敲门铃之后，报文先进入该 function 的 NIC_TX 域，做完 egress 规则再离开 function。switchdev 下下一站是 FDB 域的 TX 侧，hmfs 时用 TX RTC 做哈希。没有 FDB offload 时，NIC_TX 之后直接出端口。")
+    add_p(doc, "图 5 和图 6 画的是 switchdev。RX 的层次是：上行口，FDB 域（hmfs 时走 RTC RX 和 STC），目的 vport，NIC_RX 的 OFFLOADS 表，代表口的 TTC，TIR，RQ，CQ，EQ。legacy 的路径在图 22：FDB 按 DMAC 选 vport，然后进入该 function 自己的 NIC_RX。没有 eswitch 时，线侧报文直接进入 NIC_RX 域。")
+    add_p(doc, "TIS 是发送侧的传输接口。主机把数据包 WQE 放进 SQ 并敲门铃之后，报文先进入该 function 的 NIC_TX 域。switchdev 下下一站是 FDB 域的 TX 侧，hmfs 时用 TX RTC 做哈希。legacy 下下一站是同一张按 DMAC 转发的 FDB。没有 eswitch 时，NIC_TX 之后直接出端口。")
     add_p(doc, "规则下发不走数据包 RQ/SQ。context 按队列数打开一组 HWS SQ/CQ，上面只跑 GTA WQE。完成由驱动轮询这条 CQ 取回；EQ 处于通知层，插入快路径不依赖 EQ 中断。所以图里有两条队列：一条搬包，一条搬 STE。")
 
     add_h(doc, "6  数学模型", 1)
