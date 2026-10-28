@@ -63,23 +63,31 @@ static int get_port_sel_mode(enum mlx5_lag_mode mode, unsigned long flags)
 	return MLX5_LAG_PORT_SELECT_MODE_QUEUE_AFFINITY;
 }
 
-static u8 lag_active_port_bits(struct mlx5_lag *ldev)
+static int lag_active_port_bits(struct mlx5_lag *ldev,
+				struct lag_tracker *tracker)
 {
-	u8 enabled_ports[MLX5_MAX_PORTS] = {};
 	u8 active_port = 0;
+	u8 *enabled_ports;
 	int num_enabled;
 	int idx;
 
-	mlx5_infer_tx_enabled(&ldev->tracker, ldev, enabled_ports,
+	enabled_ports = kcalloc(ldev->ports, sizeof(*enabled_ports),
+				GFP_KERNEL);
+	if (!enabled_ports)
+		return -ENOMEM;
+
+	mlx5_infer_tx_enabled(tracker, ldev, enabled_ports,
 			      &num_enabled);
 	for (idx = 0; idx < num_enabled; idx++)
 		active_port |= BIT_MASK(enabled_ports[idx]);
 
+	kfree(enabled_ports);
 	return active_port;
 }
 
 static int mlx5_cmd_create_lag(struct mlx5_core_dev *dev, struct mlx5_lag *ldev,
-			       int mode, unsigned long flags)
+			       struct lag_tracker *tracker, int mode,
+			       unsigned long flags)
 {
 	bool fdb_sel_mode = test_bit(MLX5_LAG_MODE_FLAG_FDB_SEL_MODE_NATIVE,
 				     &flags);
@@ -103,13 +111,21 @@ static int mlx5_cmd_create_lag(struct mlx5_core_dev *dev, struct mlx5_lag *ldev,
 		MLX5_SET(lagc, lag_ctx, tx_remap_affinity_1, ports[idx0]);
 		MLX5_SET(lagc, lag_ctx, tx_remap_affinity_2, ports[idx1]);
 		break;
-	case MLX5_LAG_PORT_SELECT_MODE_PORT_SELECT_FT:
+	case MLX5_LAG_PORT_SELECT_MODE_PORT_SELECT_FT: {
+		u8 active_port;
+		int ret;
+
 		if (!MLX5_CAP_PORT_SELECTION(dev, port_select_flow_table_bypass))
 			break;
 
-		MLX5_SET(lagc, lag_ctx, active_port,
-			 lag_active_port_bits(mlx5_lag_dev(dev)));
+		ret = lag_active_port_bits(ldev, tracker);
+		if (ret < 0)
+			return ret;
+
+		active_port = ret;
+		MLX5_SET(lagc, lag_ctx, active_port, active_port);
 		break;
+	}
 	default:
 		break;
 	}
@@ -139,9 +155,44 @@ static int mlx5_cmd_modify_lag(struct mlx5_core_dev *dev, struct mlx5_lag *ldev,
 	return mlx5_cmd_exec_in(dev, modify_lag, in);
 }
 
+static u32 mlx5_lag_dev_group_id(struct mlx5_core_dev *dev)
+{
+	struct mlx5_lag *ldev = mlx5_lag_dev(dev);
+	struct lag_func *pf;
+	int i;
+
+	if (!ldev)
+		return 0;
+
+	mlx5_lag_for_each(i, 0, ldev, MLX5_LAG_FILTER_ALL) {
+		pf = mlx5_lag_pf(ldev, i);
+		if (pf->dev == dev)
+			return pf->sd_fdb_active ? pf->group_id : 0;
+	}
+	return 0;
+}
+
+static int mlx5_lag_is_sw_lag(struct mlx5_core_dev *dev)
+{
+	return mlx5_lag_is_sd(dev);
+}
+
 int mlx5_cmd_create_vport_lag(struct mlx5_core_dev *dev)
 {
 	u32 in[MLX5_ST_SZ_DW(create_vport_lag_in)] = {};
+	struct mlx5_lag *ldev = mlx5_lag_dev(dev);
+	int ret;
+
+	if (mlx5_lag_is_sw_lag(dev)) {
+		if (!ldev)
+			return -ENODEV;
+
+		mutex_lock(&ldev->lock);
+		ret = mlx5_lag_create_vport_lag(mlx5_lag_dev(dev),
+						mlx5_lag_dev_group_id(dev));
+		mutex_unlock(&ldev->lock);
+		return ret;
+	}
 
 	MLX5_SET(create_vport_lag_in, in, opcode, MLX5_CMD_OP_CREATE_VPORT_LAG);
 
@@ -152,6 +203,18 @@ EXPORT_SYMBOL(mlx5_cmd_create_vport_lag);
 int mlx5_cmd_destroy_vport_lag(struct mlx5_core_dev *dev)
 {
 	u32 in[MLX5_ST_SZ_DW(destroy_vport_lag_in)] = {};
+	struct mlx5_lag *ldev = mlx5_lag_dev(dev);
+
+	if (mlx5_lag_is_sw_lag(dev)) {
+		if (!ldev)
+			return 0;
+
+		mutex_lock(&ldev->lock);
+		mlx5_lag_destroy_vport_lag(mlx5_lag_dev(dev),
+					   mlx5_lag_dev_group_id(dev));
+		mutex_unlock(&ldev->lock);
+		return 0;
+	}
 
 	MLX5_SET(destroy_vport_lag_in, in, opcode, MLX5_CMD_OP_DESTROY_VPORT_LAG);
 
@@ -191,22 +254,31 @@ static void mlx5_lag_print_mapping(struct mlx5_core_dev *dev,
 				   struct lag_tracker *tracker,
 				   unsigned long flags)
 {
-	char buf[MLX5_MAX_PORTS * 10 + 1] = {};
-	u8 enabled_ports[MLX5_MAX_PORTS] = {};
+	u8 *enabled_ports = NULL;
 	int written = 0;
 	int num_enabled;
+	char *buf;
 	int idx;
 	int err;
 	int i;
 	int j;
 
+	buf = kcalloc(ldev->ports * 10 + 1, sizeof(*buf), GFP_KERNEL);
+	if (!buf)
+		return;
+
 	if (test_bit(MLX5_LAG_MODE_FLAG_HASH_BASED, &flags)) {
+		enabled_ports = kcalloc(ldev->ports, sizeof(*enabled_ports),
+					GFP_KERNEL);
+		if (!enabled_ports)
+			goto free_buf;
+
 		mlx5_infer_tx_enabled(tracker, ldev, enabled_ports,
 				      &num_enabled);
 		for (i = 0; i < num_enabled; i++) {
 			err = scnprintf(buf + written, 4, "%d, ", enabled_ports[i] + 1);
 			if (err != 3)
-				return;
+				goto free_enabled;
 			written += err;
 		}
 		buf[written - 2] = 0;
@@ -218,12 +290,17 @@ static void mlx5_lag_print_mapping(struct mlx5_core_dev *dev,
 				err = scnprintf(buf + written, 10,
 						" port %d:%d", i + 1, ldev->v2p_map[idx]);
 				if (err != 9)
-					return;
+					goto free_enabled;
 				written += err;
 			}
 		}
 		mlx5_core_info(dev, "lag map:%s\n", buf);
 	}
+
+free_enabled:
+	kfree(enabled_ports);
+free_buf:
+	kfree(buf);
 }
 
 static int mlx5_lag_netdev_event(struct notifier_block *this,
@@ -242,7 +319,7 @@ static void mlx5_ldev_free(struct kref *ref)
 		unregister_netdevice_notifier_net(net, &ldev->nb);
 	}
 
-	mlx5_ldev_for_each(i, 0, ldev) {
+	mlx5_lag_for_each(i, 0, ldev, MLX5_LAG_FILTER_ALL) {
 		pf = mlx5_lag_pf(ldev, i);
 		if (pf->port_change_nb.nb.notifier_call) {
 			struct mlx5_nb *nb = &pf->port_change_nb;
@@ -259,6 +336,7 @@ static void mlx5_ldev_free(struct kref *ref)
 	cancel_work_sync(&ldev->speed_update_work);
 	destroy_workqueue(ldev->wq);
 	mutex_destroy(&ldev->lock);
+	kfree(ldev->v2p_map);
 	kfree(ldev);
 }
 
@@ -281,11 +359,16 @@ static struct mlx5_lag *mlx5_lag_dev_alloc(struct mlx5_core_dev *dev)
 	if (!ldev)
 		return NULL;
 
+	ldev->ports = MLX5_CAP_GEN(dev, num_lag_ports);
+	ldev->buckets = 1;
+	ldev->v2p_map = kcalloc(ldev->ports * MLX5_LAG_MAX_HASH_BUCKETS,
+				sizeof(*ldev->v2p_map), GFP_KERNEL);
+	if (!ldev->v2p_map)
+		goto err_v2p_map;
+
 	ldev->wq = create_singlethread_workqueue("mlx5_lag");
-	if (!ldev->wq) {
-		kfree(ldev);
-		return NULL;
-	}
+	if (!ldev->wq)
+		goto err_wq;
 
 	kref_init(&ldev->ref);
 	mutex_init(&ldev->lock);
@@ -293,11 +376,14 @@ static struct mlx5_lag *mlx5_lag_dev_alloc(struct mlx5_core_dev *dev)
 	INIT_DELAYED_WORK(&ldev->bond_work, mlx5_do_bond_work);
 	INIT_WORK(&ldev->speed_update_work, mlx5_mpesw_speed_update_work);
 
-	ldev->nb.notifier_call = mlx5_lag_netdev_event;
-	write_pnet(&ldev->net, mlx5_core_net(dev));
-	if (register_netdevice_notifier_net(read_pnet(&ldev->net), &ldev->nb)) {
-		ldev->nb.notifier_call = NULL;
-		mlx5_core_err(dev, "Failed to register LAG netdev notifier\n");
+	if (!mlx5_sd_is_supported(dev)) {
+		ldev->nb.notifier_call = mlx5_lag_netdev_event;
+		write_pnet(&ldev->net, mlx5_core_net(dev));
+		if (register_netdevice_notifier_net(read_pnet(&ldev->net),
+						    &ldev->nb)) {
+			ldev->nb.notifier_call = NULL;
+			mlx5_core_err(dev, "Failed to register LAG netdev notifier\n");
+		}
 	}
 	ldev->mode = MLX5_LAG_MODE_NONE;
 
@@ -306,10 +392,13 @@ static struct mlx5_lag *mlx5_lag_dev_alloc(struct mlx5_core_dev *dev)
 		mlx5_core_err(dev, "Failed to init multipath lag err=%d\n",
 			      err);
 
-	ldev->ports = MLX5_CAP_GEN(dev, num_lag_ports);
-	ldev->buckets = 1;
-
 	return ldev;
+
+err_wq:
+	kfree(ldev->v2p_map);
+err_v2p_map:
+	kfree(ldev);
+	return NULL;
 }
 
 int mlx5_lag_dev_get_netdev_idx(struct mlx5_lag *ldev,
@@ -370,6 +459,22 @@ int mlx5_lag_get_dev_index_by_seq(struct mlx5_lag *ldev, int seq)
 	return -ENOENT;
 }
 
+/* Return the appropriate iterator filter for a device in LAG:
+ * - SD shared FDB active: iterate only the device's SD group
+ * - SD group exists but shared FDB not active: iterate all devices
+ * - No SD: iterate ports only
+ */
+static u32 mlx5_lag_get_filter(struct mlx5_lag *ldev, struct mlx5_core_dev *dev)
+{
+	struct lag_func *pf = mlx5_lag_pf_by_dev(ldev, dev);
+
+	if (pf && pf->sd_fdb_active)
+		return pf->group_id;
+	if (pf && pf->group_id)
+		return MLX5_LAG_FILTER_ALL;
+	return MLX5_LAG_FILTER_PORTS;
+}
+
 /* Reverse of mlx5_lag_get_dev_index_by_seq: given a device, return its
  * sequence number in the LAG. Master is always 0, others numbered
  * sequentially starting from 1.
@@ -379,11 +484,13 @@ int mlx5_lag_get_dev_seq(struct mlx5_core_dev *dev)
 	struct mlx5_lag *ldev = mlx5_lag_dev(dev);
 	int master_idx, i, num = 1;
 	struct lag_func *pf;
+	u32 filter;
 
 	if (!ldev)
 		return -ENOENT;
 
-	master_idx = mlx5_lag_get_master_idx(ldev);
+	filter = mlx5_lag_get_filter(ldev, dev);
+	master_idx = mlx5_lag_get_dev_index_by_seq_filter(ldev, 0, filter);
 	if (master_idx < 0)
 		return -ENOENT;
 
@@ -391,7 +498,7 @@ int mlx5_lag_get_dev_seq(struct mlx5_core_dev *dev)
 	if (pf && pf->dev == dev)
 		return 0;
 
-	mlx5_ldev_for_each(i, 0, ldev) {
+	mlx5_lag_for_each(i, 0, ldev, filter) {
 		if (i == master_idx)
 			continue;
 		pf = mlx5_lag_pf(ldev, i);
@@ -402,6 +509,69 @@ int mlx5_lag_get_dev_seq(struct mlx5_core_dev *dev)
 	return -ENOENT;
 }
 EXPORT_SYMBOL(mlx5_lag_get_dev_seq);
+
+/* seq 0 = master, then all remaining devices */
+static int mlx5_lag_get_dev_index_by_seq_all(struct mlx5_lag *ldev, int seq)
+{
+	int master_idx, i, num = 0;
+
+	master_idx = mlx5_lag_get_master_idx(ldev);
+
+	if (master_idx >= 0) {
+		if (seq == 0)
+			return master_idx;
+		num++;
+	}
+
+	mlx5_lag_for_each(i, 0, ldev, MLX5_LAG_FILTER_ALL) {
+		if (i == master_idx)
+			continue;
+		if (num == seq)
+			return i;
+		num++;
+	}
+	return -ENOENT;
+}
+
+/* From group POV, port-marked entry is the lag master */
+static int mlx5_lag_get_dev_index_by_seq_group(struct mlx5_lag *ldev, int seq,
+					       u32 group_id)
+{
+	int i, num = 0;
+
+	mlx5_lag_for_each(i, 0, ldev, group_id) {
+		if (xa_get_mark(&ldev->pfs, i, MLX5_LAG_XA_MARK_PORT)) {
+			if (seq == 0)
+				return i;
+			num++;
+			break;
+		}
+	}
+
+	mlx5_lag_for_each(i, 0, ldev, group_id) {
+		if (xa_get_mark(&ldev->pfs, i, MLX5_LAG_XA_MARK_PORT))
+			continue;
+		if (num == seq)
+			return i;
+		num++;
+	}
+	return -ENOENT;
+}
+
+int mlx5_lag_get_dev_index_by_seq_filter(struct mlx5_lag *ldev, int seq,
+					 u32 filter)
+{
+	if (!ldev)
+		return -ENOENT;
+
+	if (!filter || filter == MLX5_LAG_FILTER_PORTS)
+		return mlx5_lag_get_dev_index_by_seq(ldev, seq);
+
+	if (filter == MLX5_LAG_FILTER_ALL)
+		return mlx5_lag_get_dev_index_by_seq_all(ldev, seq);
+
+	return mlx5_lag_get_dev_index_by_seq_group(ldev, seq, filter);
+}
 
 /* Devcom events for LAG master marking */
 #define LAG_DEVCOM_PAIR		(0)
@@ -512,25 +682,41 @@ static bool __mlx5_lag_is_sriov(struct mlx5_lag *ldev)
 	return ldev->mode == MLX5_LAG_MODE_SRIOV;
 }
 
+static bool __mlx5_lag_is_sd_active(struct mlx5_lag *ldev,
+				    struct mlx5_core_dev *dev)
+{
+	struct lag_func *pf = mlx5_lag_pf_by_dev(ldev, dev);
+
+	return pf && pf->sd_fdb_active;
+}
+
 /* Create a mapping between steering slots and active ports.
  * As we have ldev->buckets slots per port first assume the native
  * mapping should be used.
  * If there are ports that are disabled fill the relevant slots
  * with mapping that points to active ports.
  */
-static void mlx5_infer_tx_affinity_mapping(struct lag_tracker *tracker,
-					   struct mlx5_lag *ldev,
-					   u8 buckets,
-					   u8 *ports)
+static int mlx5_infer_tx_affinity_mapping(struct lag_tracker *tracker,
+					  struct mlx5_lag *ldev,
+					  u8 buckets,
+					  u8 *ports)
 {
-	int disabled[MLX5_MAX_PORTS] = {};
-	int enabled[MLX5_MAX_PORTS] = {};
 	int disabled_ports_num = 0;
 	int enabled_ports_num = 0;
+	int *disabled;
+	int *enabled;
+	int err = 0;
 	int idx;
 	u32 rand;
 	int i;
 	int j;
+
+	enabled = kcalloc(ldev->ports, sizeof(*enabled), GFP_KERNEL);
+	disabled = kcalloc(ldev->ports, sizeof(*disabled), GFP_KERNEL);
+	if (!enabled || !disabled) {
+		err = -ENOMEM;
+		goto out;
+	}
 
 	mlx5_ldev_for_each(i, 0, ldev) {
 		if (tracker->netdev_state[i].tx_enabled &&
@@ -554,7 +740,7 @@ static void mlx5_infer_tx_affinity_mapping(struct lag_tracker *tracker,
 	/* If all ports are disabled/enabled keep native mapping */
 	if (enabled_ports_num == ldev->ports ||
 	    disabled_ports_num == ldev->ports)
-		return;
+		goto out;
 
 	/* Go over the disabled ports and for each assign a random active port */
 	for (i = 0; i < disabled_ports_num; i++) {
@@ -567,6 +753,11 @@ static void mlx5_infer_tx_affinity_mapping(struct lag_tracker *tracker,
 				mlx5_lag_xa_to_dev_idx(ldev, rand_xa_idx) + 1;
 		}
 	}
+
+out:
+	kfree(enabled);
+	kfree(disabled);
+	return err;
 }
 
 static bool mlx5_lag_has_drop_rule(struct mlx5_lag *ldev)
@@ -601,11 +792,8 @@ static void mlx5_lag_drop_rule_cleanup(struct mlx5_lag *ldev)
 static void mlx5_lag_drop_rule_setup(struct mlx5_lag *ldev,
 				     struct lag_tracker *tracker)
 {
-	u8 disabled_ports[MLX5_MAX_PORTS] = {};
 	struct mlx5_core_dev *dev;
 	struct lag_func *pf;
-	int disabled_index;
-	int num_disabled;
 	int err;
 	int i;
 
@@ -617,11 +805,11 @@ static void mlx5_lag_drop_rule_setup(struct mlx5_lag *ldev,
 	if (!ldev->tracker.has_inactive)
 		return;
 
-	mlx5_infer_tx_disabled(tracker, ldev, disabled_ports, &num_disabled);
-
-	for (i = 0; i < num_disabled; i++) {
-		disabled_index = disabled_ports[i];
-		pf = mlx5_lag_pf(ldev, disabled_index);
+	mlx5_ldev_for_each(i, 0, ldev) {
+		if (tracker->netdev_state[i].tx_enabled &&
+		    tracker->netdev_state[i].link_up)
+			continue;
+		pf = mlx5_lag_pf(ldev, i);
 		dev = pf->dev;
 		err = mlx5_esw_acl_ingress_vport_drop_rule_create(dev->priv.eswitch,
 								  MLX5_VPORT_UPLINK);
@@ -629,7 +817,8 @@ static void mlx5_lag_drop_rule_setup(struct mlx5_lag *ldev,
 			pf->has_drop = true;
 		else
 			mlx5_core_err(dev,
-				      "Failed to create lag drop rule, error: %d", err);
+				      "Failed to create lag drop rule, error: %d",
+				      err);
 	}
 }
 
@@ -648,7 +837,8 @@ static int mlx5_cmd_modify_active_port(struct mlx5_core_dev *dev, u8 ports)
 	return mlx5_cmd_exec_in(dev, modify_lag, in);
 }
 
-static int _mlx5_modify_lag(struct mlx5_lag *ldev, u8 *ports)
+static int _mlx5_modify_lag(struct mlx5_lag *ldev,
+			    struct lag_tracker *tracker, u8 *ports)
 {
 	int idx = mlx5_lag_get_dev_index_by_seq(ldev, MLX5_LAG_P1);
 	struct mlx5_core_dev *dev0;
@@ -665,7 +855,10 @@ static int _mlx5_modify_lag(struct mlx5_lag *ldev, u8 *ports)
 		    !MLX5_CAP_PORT_SELECTION(dev0, port_select_flow_table_bypass))
 			return ret;
 
-		active_ports = lag_active_port_bits(ldev);
+		ret = lag_active_port_bits(ldev, tracker);
+		if (ret < 0)
+			return ret;
+		active_ports = ret;
 
 		return mlx5_cmd_modify_active_port(dev0, active_ports);
 	}
@@ -711,8 +904,8 @@ void mlx5_modify_lag(struct mlx5_lag *ldev,
 		     struct lag_tracker *tracker)
 {
 	int first_idx = mlx5_lag_get_dev_index_by_seq(ldev, MLX5_LAG_P1);
-	u8 ports[MLX5_MAX_PORTS * MLX5_LAG_MAX_HASH_BUCKETS] = {};
 	struct mlx5_core_dev *dev0;
+	u8 *ports;
 	int idx;
 	int err;
 	int i;
@@ -722,21 +915,35 @@ void mlx5_modify_lag(struct mlx5_lag *ldev,
 		return;
 
 	dev0 = mlx5_lag_pf(ldev, first_idx)->dev;
-	mlx5_infer_tx_affinity_mapping(tracker, ldev, ldev->buckets, ports);
+
+	ports = kcalloc(ldev->ports * MLX5_LAG_MAX_HASH_BUCKETS,
+			sizeof(*ports), GFP_KERNEL);
+	if (!ports)
+		return;
+
+	err = mlx5_infer_tx_affinity_mapping(tracker, ldev, ldev->buckets,
+					     ports);
+	if (err) {
+		mlx5_core_err(dev0,
+			      "mlx5_infer_tx_affinity_mapping failed, err = %d\n",
+			      err);
+		goto out;
+	}
 
 	mlx5_ldev_for_each(i, 0, ldev) {
 		for (j = 0; j < ldev->buckets; j++) {
 			idx = i * ldev->buckets + j;
 			if (ports[idx] == ldev->v2p_map[idx])
 				continue;
-			err = _mlx5_modify_lag(ldev, ports);
+			err = _mlx5_modify_lag(ldev, tracker, ports);
 			if (err) {
 				mlx5_core_err(dev0,
 					      "Failed to modify LAG (%d)\n",
 					      err);
-				return;
+				goto out;
 			}
-			memcpy(ldev->v2p_map, ports, sizeof(ports));
+			memcpy(ldev->v2p_map, ports,
+			       ldev->ports * MLX5_LAG_MAX_HASH_BUCKETS);
 
 			mlx5_lag_print_mapping(dev0, ldev, tracker,
 					       ldev->mode_flags);
@@ -757,6 +964,8 @@ void mlx5_modify_lag(struct mlx5_lag *ldev,
 					     ndev);
 		dev_put(ndev);
 	}
+out:
+	kfree(ports);
 }
 
 static int mlx5_lag_set_port_sel_mode(struct mlx5_lag *ldev,
@@ -817,43 +1026,6 @@ char *mlx5_get_str_port_sel_mode(enum mlx5_lag_mode mode, unsigned long flags)
 	}
 }
 
-static int mlx5_lag_create_single_fdb(struct mlx5_lag *ldev)
-{
-	int master_idx = mlx5_lag_get_dev_index_by_seq(ldev, MLX5_LAG_P1);
-	struct mlx5_eswitch *master_esw;
-	struct mlx5_core_dev *dev0;
-	int i, j;
-	int err;
-
-	if (master_idx < 0)
-		return -EINVAL;
-
-	dev0 = mlx5_lag_pf(ldev, master_idx)->dev;
-	master_esw = dev0->priv.eswitch;
-	mlx5_ldev_for_each(i, 0, ldev) {
-		struct mlx5_eswitch *slave_esw;
-
-		if (i == master_idx)
-			continue;
-
-		slave_esw = mlx5_lag_pf(ldev, i)->dev->priv.eswitch;
-
-		err = mlx5_eswitch_offloads_single_fdb_add_one(master_esw,
-							       slave_esw, ldev->ports);
-		if (err)
-			goto err;
-	}
-	return 0;
-err:
-	mlx5_ldev_for_each_reverse(j, i, 0, ldev) {
-		if (j == master_idx)
-			continue;
-		mlx5_eswitch_offloads_single_fdb_del_one(master_esw,
-							 mlx5_lag_pf(ldev, j)->dev->priv.eswitch);
-	}
-	return err;
-}
-
 static int mlx5_create_lag(struct mlx5_lag *ldev,
 			   struct lag_tracker *tracker,
 			   enum mlx5_lag_mode mode,
@@ -874,7 +1046,7 @@ static int mlx5_create_lag(struct mlx5_lag *ldev,
 	mlx5_core_info(dev0, "shared_fdb:%d mode:%s\n",
 		       shared_fdb, mlx5_get_str_port_sel_mode(mode, flags));
 
-	err = mlx5_cmd_create_lag(dev0, ldev, mode, flags);
+	err = mlx5_cmd_create_lag(dev0, ldev, tracker, mode, flags);
 	if (err) {
 		mlx5_core_err(dev0,
 			      "Failed to create LAG (%d)\n",
@@ -922,7 +1094,16 @@ int mlx5_activate_lag(struct mlx5_lag *ldev,
 		return err;
 
 	if (mode != MLX5_LAG_MODE_MPESW) {
-		mlx5_infer_tx_affinity_mapping(tracker, ldev, ldev->buckets, ldev->v2p_map);
+		err = mlx5_infer_tx_affinity_mapping(tracker, ldev,
+						     ldev->buckets,
+						     ldev->v2p_map);
+		if (err) {
+			mlx5_core_err(dev0,
+				      "mlx5_infer_tx_affinity_mapping failed, err = %d\n",
+				      err);
+			return err;
+		}
+
 		if (test_bit(MLX5_LAG_MODE_FLAG_HASH_BASED, &flags)) {
 			err = mlx5_lag_port_sel_create(ldev, tracker->hash_type,
 						       ldev->v2p_map);
@@ -964,27 +1145,19 @@ int mlx5_deactivate_lag(struct mlx5_lag *ldev)
 	u32 in[MLX5_ST_SZ_DW(destroy_lag_in)] = {};
 	bool roce_lag = __mlx5_lag_is_roce(ldev);
 	unsigned long flags = ldev->mode_flags;
-	struct mlx5_eswitch *master_esw;
 	struct mlx5_core_dev *dev0;
 	int err;
-	int i;
 
 	if (master_idx < 0)
 		return -EINVAL;
 
 	dev0 = mlx5_lag_pf(ldev, master_idx)->dev;
-	master_esw = dev0->priv.eswitch;
 	ldev->mode = MLX5_LAG_MODE_NONE;
 	ldev->mode_flags = 0;
 	mlx5_lag_mp_reset(ldev);
 
 	if (test_bit(MLX5_LAG_MODE_FLAG_SHARED_FDB, &flags)) {
-		mlx5_ldev_for_each(i, 0, ldev) {
-			if (i == master_idx)
-				continue;
-			mlx5_eswitch_offloads_single_fdb_del_one(master_esw,
-								 mlx5_lag_pf(ldev, i)->dev->priv.eswitch);
-		}
+		mlx5_lag_destroy_single_fdb(ldev);
 		clear_bit(MLX5_LAG_MODE_FLAG_SHARED_FDB, &flags);
 	}
 
@@ -1063,34 +1236,205 @@ bool mlx5_lag_check_prereq(struct mlx5_lag *ldev)
 	return true;
 }
 
-void mlx5_lag_add_devices(struct mlx5_lag *ldev)
+static void mlx5_lag_assert_locked_transition(struct mlx5_lag *ldev, u32 filter)
 {
+	struct mlx5_devcom_comp_dev *devcom = NULL;
 	struct lag_func *pf;
 	int i;
 
-	mlx5_ldev_for_each(i, 0, ldev) {
+	lockdep_assert_held(&ldev->lock);
+
+	i = mlx5_get_next_lag_func(ldev, 0, filter);
+	if (i < MLX5_MAX_PORTS) {
+		pf = mlx5_lag_pf(ldev, i);
+		if (filter == MLX5_LAG_FILTER_PORTS ||
+		    filter == MLX5_LAG_FILTER_ALL)
+			devcom = pf->dev->priv.hca_devcom_comp;
+		else
+			devcom = mlx5_sd_get_devcom(pf->dev);
+	}
+	mlx5_devcom_comp_assert_locked(devcom);
+}
+
+static void mlx5_lag_drop_lock_for_reps(struct mlx5_lag *ldev, u32 filter)
+{
+	mlx5_lag_assert_locked_transition(ldev, filter);
+
+	/* Keep PF membership stable while ldev->lock is dropped. Device add
+	 * and remove paths observe mode_changes_in_progress and retry.
+	 */
+	ldev->mode_changes_in_progress++;
+	mutex_unlock(&ldev->lock);
+}
+
+static void mlx5_lag_retake_lock_after_reps(struct mlx5_lag *ldev)
+{
+	mutex_lock(&ldev->lock);
+	ldev->mode_changes_in_progress--;
+}
+
+void mlx5_lag_rescan_dev_locked(struct mlx5_lag *ldev,
+				struct mlx5_core_dev *dev,
+				bool enable)
+{
+	if (dev->priv.flags & MLX5_PRIV_FLAGS_DISABLE_ALL_ADEV)
+		return;
+
+	if (enable)
+		dev->priv.flags &= ~MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
+	else
+		dev->priv.flags |= MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
+
+	/* Auxiliary bus probe/remove can register or unregister representor
+	 * callbacks and take reps_lock. Drop ldev->lock so the only ordering
+	 * remains reps_lock -> ldev->lock from representor callbacks.
+	 */
+	mlx5_lag_drop_lock_for_reps(ldev, mlx5_lag_get_filter(ldev, dev));
+	mlx5_rescan_drivers_locked(dev);
+	mlx5_lag_retake_lock_after_reps(ldev);
+}
+
+static void mlx5_lag_rescan_devices_locked_filter(struct mlx5_lag *ldev,
+						  bool enable, u32 filter)
+{
+	struct mlx5_core_dev *devs[MLX5_MAX_PORTS];
+	struct lag_func *pf;
+	int num_devs = 0;
+	int i;
+
+	mlx5_lag_assert_locked_transition(ldev, filter);
+
+	mlx5_lag_for_each(i, 0, ldev, filter) {
 		pf = mlx5_lag_pf(ldev, i);
 		if (pf->dev->priv.flags & MLX5_PRIV_FLAGS_DISABLE_ALL_ADEV)
 			continue;
 
-		pf->dev->priv.flags &= ~MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
-		mlx5_rescan_drivers_locked(pf->dev);
+		if (enable)
+			pf->dev->priv.flags &= ~MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
+		else
+			pf->dev->priv.flags |= MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
+		devs[num_devs++] = pf->dev;
 	}
+
+	mlx5_lag_drop_lock_for_reps(ldev, filter);
+	for (i = 0; i < num_devs; i++)
+		mlx5_rescan_drivers_locked(devs[i]);
+	mlx5_lag_retake_lock_after_reps(ldev);
+}
+
+void mlx5_lag_add_devices_filter(struct mlx5_lag *ldev, u32 filter)
+{
+	mlx5_lag_rescan_devices_locked_filter(ldev, true, filter);
+}
+
+void mlx5_lag_add_devices(struct mlx5_lag *ldev)
+{
+	mlx5_lag_add_devices_filter(ldev, MLX5_LAG_FILTER_PORTS);
+}
+
+void mlx5_lag_remove_devices_filter(struct mlx5_lag *ldev, u32 filter)
+{
+	mlx5_lag_rescan_devices_locked_filter(ldev, false, filter);
 }
 
 void mlx5_lag_remove_devices(struct mlx5_lag *ldev)
 {
+	mlx5_lag_remove_devices_filter(ldev, MLX5_LAG_FILTER_PORTS);
+}
+
+static int mlx5_lag_reload_ib_reps_idx(struct mlx5_lag *ldev, int idx,
+				       u32 flags)
+{
+	struct lag_func *pf = mlx5_lag_pf(ldev, idx);
+	struct mlx5_eswitch *esw;
+	int ret;
+
+	if (pf->dev->priv.flags & flags)
+		return 0;
+
+	esw = pf->dev->priv.eswitch;
+	mlx5_esw_reps_block(esw);
+	ret = mlx5_eswitch_reload_ib_reps(esw);
+	mlx5_esw_reps_unblock(esw);
+
+	return ret;
+}
+
+static int mlx5_lag_reload_ib_reps_unlocked(struct mlx5_lag *ldev, u32 flags,
+					    u32 filter, bool cont_on_fail)
+{
+	int master_idx = mlx5_lag_get_dev_index_by_seq_filter(ldev, MLX5_LAG_P1,
+							     filter);
+	int ret;
+	int i;
+
+	if (master_idx < 0)
+		return -EINVAL;
+
+	ret = mlx5_lag_reload_ib_reps_idx(ldev, master_idx, flags);
+	if (ret && !cont_on_fail)
+		return ret;
+
+	mlx5_lag_for_each(i, 0, ldev, filter) {
+		if (i == master_idx)
+			continue;
+		ret = mlx5_lag_reload_ib_reps_idx(ldev, i, flags);
+		if (ret && !cont_on_fail)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int mlx5_lag_reload_ib_reps(struct mlx5_lag *ldev, u32 flags,
+				   u32 filter, bool cont_on_fail)
+{
+	int ret;
+
+	/* The HCA devcom component lock serializes LAG mode transitions while
+	 * ldev->lock is dropped here. Dropping ldev->lock is required because
+	 * the reload takes the per-E-Switch reps_lock, and representor
+	 * load/unload callbacks can re-enter LAG netdev add/remove and take
+	 * ldev->lock. Keep the ordering reps_lock -> ldev->lock.
+	 */
+	mlx5_lag_drop_lock_for_reps(ldev, filter);
+	ret = mlx5_lag_reload_ib_reps_unlocked(ldev, flags, filter,
+					       cont_on_fail);
+	mlx5_lag_retake_lock_after_reps(ldev);
+
+	return ret;
+}
+
+int mlx5_lag_reload_ib_reps_from_locked(struct mlx5_lag *ldev, u32 flags,
+					u32 filter, bool cont_on_fail)
+{
+	return mlx5_lag_reload_ib_reps(ldev, flags, filter, cont_on_fail);
+}
+
+static void mlx5_lag_unload_reps_unlocked(struct mlx5_lag *ldev, u32 filter)
+{
 	struct lag_func *pf;
 	int i;
 
-	mlx5_ldev_for_each(i, 0, ldev) {
-		pf = mlx5_lag_pf(ldev, i);
-		if (pf->dev->priv.flags & MLX5_PRIV_FLAGS_DISABLE_ALL_ADEV)
-			continue;
+	mlx5_lag_for_each(i, 0, ldev, filter) {
+		struct mlx5_eswitch *esw;
 
-		pf->dev->priv.flags |= MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
-		mlx5_rescan_drivers_locked(pf->dev);
+		pf = mlx5_lag_pf(ldev, i);
+		esw = pf->dev->priv.eswitch;
+		mlx5_esw_reps_block(esw);
+		mlx5_eswitch_unload_reps(esw);
+		mlx5_esw_reps_unblock(esw);
 	}
+}
+
+void mlx5_lag_unload_reps_from_locked(struct mlx5_lag *ldev, u32 filter)
+{
+	/* Same lock dance as mlx5_lag_reload_ib_reps: drop ldev->lock around
+	 * the per-eswitch reps_lock to keep the reps_lock -> ldev->lock order.
+	 */
+	mlx5_lag_drop_lock_for_reps(ldev, filter);
+	mlx5_lag_unload_reps_unlocked(ldev, filter);
+	mlx5_lag_retake_lock_after_reps(ldev);
 }
 
 void mlx5_disable_lag(struct mlx5_lag *ldev)
@@ -1105,16 +1449,16 @@ void mlx5_disable_lag(struct mlx5_lag *ldev)
 	if (idx < 0)
 		return;
 
+	if (shared_fdb) {
+		mlx5_lag_shared_fdb_destroy(ldev, 0);
+		return;
+	}
+
 	dev0 = mlx5_lag_pf(ldev, idx)->dev;
 	roce_lag = __mlx5_lag_is_roce(ldev);
 
-	if (shared_fdb) {
-		mlx5_lag_remove_devices(ldev);
-	} else if (roce_lag) {
-		if (!(dev0->priv.flags & MLX5_PRIV_FLAGS_DISABLE_ALL_ADEV)) {
-			dev0->priv.flags |= MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
-			mlx5_rescan_drivers_locked(dev0);
-		}
+	if (roce_lag) {
+		mlx5_lag_rescan_dev_locked(ldev, dev0, false);
 		mlx5_ldev_for_each(i, 0, ldev) {
 			if (i == idx)
 				continue;
@@ -1126,49 +1470,8 @@ void mlx5_disable_lag(struct mlx5_lag *ldev)
 	if (err)
 		return;
 
-	if (shared_fdb || roce_lag)
+	if (roce_lag)
 		mlx5_lag_add_devices(ldev);
-
-	if (shared_fdb)
-		mlx5_ldev_for_each(i, 0, ldev)
-			if (!(mlx5_lag_pf(ldev, i)->dev->priv.flags & MLX5_PRIV_FLAGS_DISABLE_ALL_ADEV))
-				mlx5_eswitch_reload_ib_reps(mlx5_lag_pf(ldev, i)->dev->priv.eswitch);
-}
-
-bool mlx5_lag_shared_fdb_supported(struct mlx5_lag *ldev)
-{
-	struct mlx5_core_dev *dev;
-	bool ret = false;
-	int idx;
-	int i;
-
-	idx = mlx5_lag_get_dev_index_by_seq(ldev, MLX5_LAG_P1);
-	if (idx < 0)
-		return false;
-
-	mlx5_ldev_for_each(i, 0, ldev) {
-		if (i == idx)
-			continue;
-		dev = mlx5_lag_pf(ldev, i)->dev;
-		if (is_mdev_switchdev_mode(dev) &&
-		    mlx5_eswitch_vport_match_metadata_enabled(dev->priv.eswitch) &&
-		    MLX5_CAP_GEN(dev, lag_native_fdb_selection) &&
-		    MLX5_CAP_ESW(dev, root_ft_on_other_esw) &&
-		    mlx5_eswitch_get_npeers(dev->priv.eswitch) ==
-		    MLX5_CAP_GEN(dev, num_lag_ports) - 1)
-			continue;
-		return false;
-	}
-
-	dev = mlx5_lag_pf(ldev, idx)->dev;
-	if (is_mdev_switchdev_mode(dev) &&
-	    mlx5_eswitch_vport_match_metadata_enabled(dev->priv.eswitch) &&
-	    mlx5_esw_offloads_devcom_is_ready(dev->priv.eswitch) &&
-	    MLX5_CAP_ESW(dev, esw_shared_ingress_acl) &&
-	    mlx5_eswitch_get_npeers(dev->priv.eswitch) == MLX5_CAP_GEN(dev, num_lag_ports) - 1)
-		ret = true;
-
-	return ret;
 }
 
 static bool mlx5_lag_is_roce_lag(struct mlx5_lag *ldev)
@@ -1205,30 +1508,40 @@ static bool mlx5_lag_should_disable_lag(struct mlx5_lag *ldev, bool do_bond)
 }
 
 #ifdef CONFIG_MLX5_ESWITCH
-static int
-mlx5_lag_sum_devices_speed(struct mlx5_lag *ldev, u32 *sum_speed,
-			   int (*get_speed)(struct mlx5_core_dev *, u32 *))
+static int mlx5_lag_get_devices_oper_speed(struct mlx5_lag *ldev,
+					   u32 *sum_speed)
 {
-	struct mlx5_core_dev *pf_mdev;
-	struct lag_func *pf;
 	int pf_idx;
-	u32 speed;
-	int ret;
 
 	*sum_speed = 0;
 	mlx5_ldev_for_each(pf_idx, 0, ldev) {
+		u8 opmod = MLX5_VPORT_STATE_OP_MOD_VNIC_VPORT;
+		struct mlx5_core_dev *pf_mdev;
+		struct lag_func *pf;
+		u32 speed;
+		u8 state;
+		int ret;
+
 		pf = mlx5_lag_pf(ldev, pf_idx);
 		if (!pf)
 			continue;
 		pf_mdev = pf->dev;
 		if (!pf_mdev)
 			continue;
+		ret = mlx5_query_vport_max_tx_speed(pf_mdev, opmod, 0, 0,
+						    &speed, &state);
+		if (ret) {
+			mlx5_core_dbg(pf_mdev, "State query failed (err=%d)\n",
+				      ret);
+			return ret;
+		}
+		if (state != VPORT_STATE_UP)
+			continue;
 
-		ret = get_speed(pf_mdev, &speed);
+		ret = mlx5_port_oper_linkspeed(pf_mdev, &speed);
 		if (ret) {
 			mlx5_core_dbg(pf_mdev,
-				      "Failed to get device speed using %ps. Device %s speed is not available (err=%d)\n",
-				      get_speed, dev_name(pf_mdev->device),
+				      "Failed to get oper speed (err=%d)\n",
 				      ret);
 			return ret;
 		}
@@ -1239,17 +1552,42 @@ mlx5_lag_sum_devices_speed(struct mlx5_lag *ldev, u32 *sum_speed,
 	return 0;
 }
 
-static int mlx5_lag_sum_devices_max_speed(struct mlx5_lag *ldev, u32 *max_speed)
+static int mlx5_lag_get_devices_max_speed(struct mlx5_lag *ldev, u32 *max_speed)
 {
-	return mlx5_lag_sum_devices_speed(ldev, max_speed,
-					  mlx5_port_max_linkspeed);
-}
+	bool take_max;
+	int pf_idx;
 
-static int mlx5_lag_sum_devices_oper_speed(struct mlx5_lag *ldev,
-					   u32 *oper_speed)
-{
-	return mlx5_lag_sum_devices_speed(ldev, oper_speed,
-					  mlx5_port_oper_linkspeed);
+	take_max = ldev->tracker.tx_type == NETDEV_LAG_TX_TYPE_ACTIVEBACKUP;
+	if (ldev->mode == MLX5_LAG_MODE_MPESW)
+		take_max = false;
+
+	*max_speed = 0;
+	mlx5_ldev_for_each(pf_idx, 0, ldev) {
+		struct mlx5_core_dev *pf_mdev;
+		struct lag_func *pf;
+		u32 speed;
+		int ret;
+
+		pf = mlx5_lag_pf(ldev, pf_idx);
+		if (!pf)
+			continue;
+		pf_mdev = pf->dev;
+		if (!pf_mdev)
+			continue;
+
+		ret = mlx5_port_max_linkspeed(pf_mdev, &speed);
+		if (ret) {
+			mlx5_core_dbg(pf_mdev,
+				      "Failed to get max speed (err=%d)\n",
+				      ret);
+			return ret;
+		}
+
+		*max_speed = take_max ?
+			max(*max_speed, speed) : *max_speed + speed;
+	}
+
+	return 0;
 }
 
 static void mlx5_lag_modify_device_vports_speed(struct mlx5_core_dev *mdev,
@@ -1267,6 +1605,7 @@ static void mlx5_lag_modify_device_vports_speed(struct mlx5_core_dev *mdev,
 	if (!MLX5_CAP_ESW(mdev, esw_vport_state_max_tx_speed))
 		return;
 
+	mutex_lock(&esw->state_lock);
 	mlx5_esw_for_each_vport(esw, i, vport) {
 		if (!vport)
 			continue;
@@ -1286,6 +1625,7 @@ static void mlx5_lag_modify_device_vports_speed(struct mlx5_core_dev *mdev,
 				      "Failed to set vport %d speed %d, err=%d\n",
 				      vport->vport, speed, ret);
 	}
+	mutex_unlock(&esw->state_lock);
 }
 
 void mlx5_lag_set_vports_agg_speed(struct mlx5_lag *ldev)
@@ -1296,7 +1636,7 @@ void mlx5_lag_set_vports_agg_speed(struct mlx5_lag *ldev)
 	int pf_idx;
 
 	if (ldev->mode == MLX5_LAG_MODE_MPESW) {
-		if (mlx5_lag_sum_devices_oper_speed(ldev, &speed))
+		if (mlx5_lag_get_devices_oper_speed(ldev, &speed))
 			return;
 	} else {
 		speed = ldev->tracker.bond_speed_mbps;
@@ -1304,8 +1644,8 @@ void mlx5_lag_set_vports_agg_speed(struct mlx5_lag *ldev)
 			return;
 	}
 
-	/* If speed is not set, use the sum of max speeds of all PFs */
-	if (!speed && mlx5_lag_sum_devices_max_speed(ldev, &speed))
+	/* If speed is not set, fall back to the max achievable speed */
+	if (!speed && mlx5_lag_get_devices_max_speed(ldev, &speed))
 		return;
 
 	speed = speed / MLX5_MAX_TX_SPEED_UNIT;
@@ -1383,57 +1723,37 @@ static void mlx5_do_bond(struct mlx5_lag *ldev)
 
 		roce_lag = mlx5_lag_is_roce_lag(ldev);
 
-		if (shared_fdb || roce_lag)
-			mlx5_lag_remove_devices(ldev);
-
-		err = mlx5_activate_lag(ldev, &tracker,
-					roce_lag ? MLX5_LAG_MODE_ROCE :
-						   MLX5_LAG_MODE_SRIOV,
-					shared_fdb);
-		if (err) {
-			if (shared_fdb || roce_lag)
-				mlx5_lag_add_devices(ldev);
-			if (shared_fdb) {
-				mlx5_ldev_for_each(i, 0, ldev)
-					mlx5_eswitch_reload_ib_reps(mlx5_lag_pf(ldev, i)->dev->priv.eswitch);
-			}
-
-			return;
-		}
-
-		if (roce_lag) {
-			struct mlx5_core_dev *dev;
-
-			dev0->priv.flags &= ~MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
-			mlx5_rescan_drivers_locked(dev0);
-			mlx5_ldev_for_each(i, 0, ldev) {
-				if (i == idx)
-					continue;
-				dev = mlx5_lag_pf(ldev, i)->dev;
-				if (mlx5_get_roce_state(dev))
-					mlx5_nic_vport_enable_roce(dev);
-			}
-		} else if (shared_fdb) {
-			int i;
-
-			dev0->priv.flags &= ~MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
-			mlx5_rescan_drivers_locked(dev0);
-
-			mlx5_ldev_for_each(i, 0, ldev) {
-				err = mlx5_eswitch_reload_ib_reps(mlx5_lag_pf(ldev, i)->dev->priv.eswitch);
-				if (err)
-					break;
-			}
-
-			if (err) {
-				dev0->priv.flags |= MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
-				mlx5_rescan_drivers_locked(dev0);
-				mlx5_deactivate_lag(ldev);
-				mlx5_lag_add_devices(ldev);
-				mlx5_ldev_for_each(i, 0, ldev)
-					mlx5_eswitch_reload_ib_reps(mlx5_lag_pf(ldev, i)->dev->priv.eswitch);
-				mlx5_core_err(dev0, "Failed to enable lag\n");
+		if (shared_fdb) {
+			err = mlx5_lag_shared_fdb_create(ldev, &tracker,
+							 MLX5_LAG_MODE_SRIOV,
+							 0);
+			if (err)
 				return;
+		} else {
+			if (roce_lag)
+				mlx5_lag_remove_devices(ldev);
+
+			err = mlx5_activate_lag(ldev, &tracker,
+						roce_lag ? MLX5_LAG_MODE_ROCE :
+							   MLX5_LAG_MODE_SRIOV,
+						false);
+			if (err) {
+				if (roce_lag)
+					mlx5_lag_add_devices(ldev);
+				return;
+			}
+
+			if (roce_lag) {
+				struct mlx5_core_dev *dev;
+
+				mlx5_lag_rescan_dev_locked(ldev, dev0, true);
+				mlx5_ldev_for_each(i, 0, ldev) {
+					if (i == idx)
+						continue;
+					dev = mlx5_lag_pf(ldev, i)->dev;
+					if (mlx5_get_roce_state(dev))
+						mlx5_nic_vport_enable_roce(dev);
+				}
 			}
 		}
 		if (tracker.tx_type == NETDEV_LAG_TX_TYPE_ACTIVEBACKUP) {
@@ -1446,7 +1766,8 @@ static void mlx5_do_bond(struct mlx5_lag *ldev)
 						     ndev);
 			dev_put(ndev);
 		}
-		mlx5_lag_set_vports_agg_speed(ldev);
+		if (!shared_fdb)
+			mlx5_lag_set_vports_agg_speed(ldev);
 	} else if (mlx5_lag_should_modify_lag(ldev, do_bond)) {
 		mlx5_modify_lag(ldev, &tracker);
 		mlx5_lag_set_vports_agg_speed(ldev);
@@ -1467,7 +1788,7 @@ struct mlx5_devcom_comp_dev *mlx5_lag_get_devcom_comp(struct mlx5_lag *ldev)
 	int i;
 
 	mutex_lock(&ldev->lock);
-	i = mlx5_get_next_ldev_func(ldev, 0);
+	i = mlx5_get_next_lag_func(ldev, 0, MLX5_LAG_FILTER_PORTS);
 	if (i < MLX5_MAX_PORTS) {
 		pf = mlx5_lag_pf(ldev, i);
 		devcom = pf->dev->priv.hca_devcom_comp;
@@ -1478,7 +1799,7 @@ struct mlx5_devcom_comp_dev *mlx5_lag_get_devcom_comp(struct mlx5_lag *ldev)
 
 static int mlx5_lag_demux_ft_fg_init(struct mlx5_core_dev *dev,
 				     struct mlx5_flow_table_attr *ft_attr,
-				     struct mlx5_lag *ldev)
+				     struct lag_func *pf)
 {
 #ifdef CONFIG_MLX5_ESWITCH
 	struct mlx5_flow_namespace *ns;
@@ -1489,20 +1810,20 @@ static int mlx5_lag_demux_ft_fg_init(struct mlx5_core_dev *dev,
 	if (!ns)
 		return 0;
 
-	ldev->lag_demux_ft = mlx5_create_flow_table(ns, ft_attr);
-	if (IS_ERR(ldev->lag_demux_ft))
-		return PTR_ERR(ldev->lag_demux_ft);
+	pf->lag_demux_ft = mlx5_create_flow_table(ns, ft_attr);
+	if (IS_ERR(pf->lag_demux_ft))
+		return PTR_ERR(pf->lag_demux_ft);
 
 	fg = mlx5_esw_lag_demux_fg_create(dev->priv.eswitch,
-					  ldev->lag_demux_ft);
+					  pf->lag_demux_ft);
 	if (IS_ERR(fg)) {
 		err = PTR_ERR(fg);
-		mlx5_destroy_flow_table(ldev->lag_demux_ft);
-		ldev->lag_demux_ft = NULL;
+		mlx5_destroy_flow_table(pf->lag_demux_ft);
+		pf->lag_demux_ft = NULL;
 		return err;
 	}
 
-	ldev->lag_demux_fg = fg;
+	pf->lag_demux_fg = fg;
 	return 0;
 #else
 	return -EOPNOTSUPP;
@@ -1511,7 +1832,7 @@ static int mlx5_lag_demux_ft_fg_init(struct mlx5_core_dev *dev,
 
 static int mlx5_lag_demux_fw_init(struct mlx5_core_dev *dev,
 				  struct mlx5_flow_table_attr *ft_attr,
-				  struct mlx5_lag *ldev)
+				  struct lag_func *pf)
 {
 	struct mlx5_flow_namespace *ns;
 	int err;
@@ -1520,12 +1841,12 @@ static int mlx5_lag_demux_fw_init(struct mlx5_core_dev *dev,
 	if (!ns)
 		return 0;
 
-	ldev->lag_demux_fg = NULL;
+	pf->lag_demux_fg = NULL;
 	ft_attr->max_fte = 1;
-	ldev->lag_demux_ft = mlx5_create_lag_demux_flow_table(ns, ft_attr);
-	if (IS_ERR(ldev->lag_demux_ft)) {
-		err = PTR_ERR(ldev->lag_demux_ft);
-		ldev->lag_demux_ft = NULL;
+	pf->lag_demux_ft = mlx5_create_lag_demux_flow_table(ns, ft_attr);
+	if (IS_ERR(pf->lag_demux_ft)) {
+		err = PTR_ERR(pf->lag_demux_ft);
+		pf->lag_demux_ft = NULL;
 		return err;
 	}
 
@@ -1536,6 +1857,7 @@ int mlx5_lag_demux_init(struct mlx5_core_dev *dev,
 			struct mlx5_flow_table_attr *ft_attr)
 {
 	struct mlx5_lag *ldev;
+	struct lag_func *pf;
 
 	if (!ft_attr)
 		return -EINVAL;
@@ -1544,12 +1866,16 @@ int mlx5_lag_demux_init(struct mlx5_core_dev *dev,
 	if (!ldev)
 		return -ENODEV;
 
-	xa_init(&ldev->lag_demux_rules);
+	pf = mlx5_lag_pf_by_dev(ldev, dev);
+	if (!pf)
+		return -ENODEV;
 
-	if (mlx5_get_sd(dev))
-		return mlx5_lag_demux_ft_fg_init(dev, ft_attr, ldev);
+	xa_init(&pf->lag_demux_rules);
 
-	return mlx5_lag_demux_fw_init(dev, ft_attr, ldev);
+	if (mlx5_lag_is_sw_lag(dev))
+		return mlx5_lag_demux_ft_fg_init(dev, ft_attr, pf);
+
+	return mlx5_lag_demux_fw_init(dev, ft_attr, pf);
 }
 EXPORT_SYMBOL(mlx5_lag_demux_init);
 
@@ -1558,40 +1884,63 @@ void mlx5_lag_demux_cleanup(struct mlx5_core_dev *dev)
 	struct mlx5_flow_handle *rule;
 	struct mlx5_lag *ldev;
 	unsigned long vport_num;
+	struct lag_func *pf;
 
 	ldev = mlx5_lag_dev(dev);
 	if (!ldev)
 		return;
 
-	xa_for_each(&ldev->lag_demux_rules, vport_num, rule)
-		mlx5_del_flow_rules(rule);
-	xa_destroy(&ldev->lag_demux_rules);
+	pf = mlx5_lag_pf_by_dev(ldev, dev);
+	if (!pf)
+		return;
 
-	if (ldev->lag_demux_fg)
-		mlx5_destroy_flow_group(ldev->lag_demux_fg);
-	if (ldev->lag_demux_ft)
-		mlx5_destroy_flow_table(ldev->lag_demux_ft);
-	ldev->lag_demux_fg = NULL;
-	ldev->lag_demux_ft = NULL;
+	xa_for_each(&pf->lag_demux_rules, vport_num, rule)
+		mlx5_del_flow_rules(rule);
+	xa_destroy(&pf->lag_demux_rules);
+
+	if (pf->lag_demux_fg)
+		mlx5_destroy_flow_group(pf->lag_demux_fg);
+	if (pf->lag_demux_ft)
+		mlx5_destroy_flow_table(pf->lag_demux_ft);
+	pf->lag_demux_fg = NULL;
+	pf->lag_demux_ft = NULL;
 }
 EXPORT_SYMBOL(mlx5_lag_demux_cleanup);
+
+static struct lag_func *mlx5_lag_dev_get_master_pf(struct mlx5_lag *ldev,
+						   struct mlx5_core_dev *dev)
+{
+	u32 filter = mlx5_lag_get_filter(ldev, dev);
+	int idx;
+
+	idx = mlx5_lag_get_dev_index_by_seq_filter(ldev, MLX5_LAG_P1, filter);
+	if (idx < 0)
+		return NULL;
+
+	return mlx5_lag_pf(ldev, idx);
+}
 
 int mlx5_lag_demux_rule_add(struct mlx5_core_dev *vport_dev, u16 vport_num,
 			    int index)
 {
 	struct mlx5_flow_handle *rule;
+	struct lag_func *master;
 	struct mlx5_lag *ldev;
 	int err;
 
 	ldev = mlx5_lag_dev(vport_dev);
-	if (!ldev || !ldev->lag_demux_fg)
+	if (!ldev)
 		return 0;
 
-	if (xa_load(&ldev->lag_demux_rules, index))
+	master = mlx5_lag_dev_get_master_pf(ldev, vport_dev);
+	if (!master || !master->lag_demux_fg)
+		return 0;
+
+	if (xa_load(&master->lag_demux_rules, index))
 		return 0;
 
 	rule = mlx5_esw_lag_demux_rule_create(vport_dev->priv.eswitch,
-					      vport_num, ldev->lag_demux_ft);
+					      vport_num, master->lag_demux_ft);
 	if (IS_ERR(rule)) {
 		err = PTR_ERR(rule);
 		mlx5_core_warn(vport_dev,
@@ -1600,7 +1949,7 @@ int mlx5_lag_demux_rule_add(struct mlx5_core_dev *vport_dev, u16 vport_num,
 		return err;
 	}
 
-	err = xa_err(xa_store(&ldev->lag_demux_rules, index, rule,
+	err = xa_err(xa_store(&master->lag_demux_rules, index, rule,
 			      GFP_KERNEL));
 	if (err) {
 		mlx5_del_flow_rules(rule);
@@ -1616,13 +1965,18 @@ EXPORT_SYMBOL(mlx5_lag_demux_rule_add);
 void mlx5_lag_demux_rule_del(struct mlx5_core_dev *dev, int index)
 {
 	struct mlx5_flow_handle *rule;
+	struct lag_func *master_pf;
 	struct mlx5_lag *ldev;
 
 	ldev = mlx5_lag_dev(dev);
-	if (!ldev || !ldev->lag_demux_fg)
+	if (!ldev)
 		return;
 
-	rule = xa_erase(&ldev->lag_demux_rules, index);
+	master_pf = mlx5_lag_dev_get_master_pf(ldev, dev);
+	if (!master_pf || !master_pf->lag_demux_fg)
+		return;
+
+	rule = xa_erase(&master_pf->lag_demux_rules, index);
 	if (rule)
 		mlx5_del_flow_rules(rule);
 }
@@ -1700,9 +2054,11 @@ static int mlx5_handle_changeupper_event(struct mlx5_lag *ldev,
 			}
 		}
 		if (i < MLX5_MAX_PORTS) {
-			slave = bond_slave_get_rcu(ndev_tmp);
-			if (slave)
-				has_inactive |= bond_is_slave_inactive(slave);
+			if (netif_is_bond_master(upper)) {
+				slave = bond_slave_get_rcu(ndev_tmp);
+				if (slave)
+					has_inactive |= bond_is_slave_inactive(slave);
+			}
 			bond_status |= (1 << idx);
 		}
 
@@ -1786,7 +2142,7 @@ static int mlx5_handle_changeinfodata_event(struct mlx5_lag *ldev,
 	bool has_inactive = 0;
 	int idx;
 
-	if (!netif_is_lag_master(ndev))
+	if (!netif_is_bond_master(ndev))
 		return 0;
 
 	rcu_read_lock();
@@ -1950,8 +2306,9 @@ static void mlx5_ldev_remove_netdev(struct mlx5_lag *ldev,
 	spin_unlock_irqrestore(&lag_lock, flags);
 }
 
-static int mlx5_ldev_add_mdev(struct mlx5_lag *ldev,
-			      struct mlx5_core_dev *dev)
+int mlx5_ldev_add_mdev(struct mlx5_lag *ldev,
+		       struct mlx5_core_dev *dev,
+		       u32 group_id)
 {
 	struct lag_func *pf;
 	u32 idx;
@@ -1970,7 +2327,13 @@ static int mlx5_ldev_add_mdev(struct mlx5_lag *ldev,
 
 	pf->idx = idx;
 	pf->dev = dev;
+	pf->group_id = group_id;
 	dev->priv.lag = ldev;
+
+	if (group_id)
+		return 0;
+
+	xa_set_mark(&ldev->pfs, idx, MLX5_LAG_XA_MARK_PORT);
 
 	MLX5_NB_INIT(&pf->port_change_nb,
 		     mlx5_lag_mpesw_port_change_event, PORT_CHANGE);
@@ -1979,13 +2342,13 @@ static int mlx5_ldev_add_mdev(struct mlx5_lag *ldev,
 	return 0;
 }
 
-static void mlx5_ldev_remove_mdev(struct mlx5_lag *ldev,
-				  struct mlx5_core_dev *dev)
+void mlx5_ldev_remove_mdev(struct mlx5_lag *ldev,
+			   struct mlx5_core_dev *dev)
 {
 	struct lag_func *pf;
 	int i;
 
-	mlx5_ldev_for_each(i, 0, ldev) {
+	mlx5_lag_for_each(i, 0, ldev, MLX5_LAG_FILTER_ALL) {
 		pf = mlx5_lag_pf(ldev, i);
 		if (pf->dev == dev)
 			break;
@@ -2020,7 +2383,7 @@ static int __mlx5_lag_dev_add_mdev(struct mlx5_core_dev *dev)
 			mlx5_core_err(dev, "Failed to alloc lag dev\n");
 			return 0;
 		}
-		err = mlx5_ldev_add_mdev(ldev, dev);
+		err = mlx5_ldev_add_mdev(ldev, dev, 0);
 		if (err) {
 			mlx5_core_err(dev, "Failed to add mdev to lag dev\n");
 			mlx5_ldev_put(ldev);
@@ -2035,7 +2398,7 @@ static int __mlx5_lag_dev_add_mdev(struct mlx5_core_dev *dev)
 		return -EAGAIN;
 	}
 	mlx5_ldev_get(ldev);
-	err = mlx5_ldev_add_mdev(ldev, dev);
+	err = mlx5_ldev_add_mdev(ldev, dev, 0);
 	if (err) {
 		mlx5_ldev_put(ldev);
 		mutex_unlock(&ldev->lock);
@@ -2172,27 +2535,47 @@ void mlx5_lag_add_netdev(struct mlx5_core_dev *dev,
 	mlx5_queue_bond_work(ldev, 0);
 }
 
-int mlx5_get_pre_ldev_func(struct mlx5_lag *ldev, int start_idx, int end_idx)
+int mlx5_get_pre_lag_func(struct mlx5_lag *ldev, int start_idx, int end_idx,
+			  u32 filter)
 {
 	struct lag_func *pf;
 	int i;
 
 	for (i = start_idx; i >= end_idx; i--) {
 		pf = xa_load(&ldev->pfs, i);
-		if (pf && pf->dev)
+		if (!pf || !pf->dev)
+			continue;
+		if (filter == MLX5_LAG_FILTER_PORTS) {
+			if (xa_get_mark(&ldev->pfs, i, MLX5_LAG_XA_MARK_PORT))
+				return i;
+		} else if (filter == MLX5_LAG_FILTER_ALL ||
+			   filter == pf->group_id) {
 			return i;
+		}
 	}
 	return -1;
 }
 
-int mlx5_get_next_ldev_func(struct mlx5_lag *ldev, int start_idx)
+int mlx5_get_next_lag_func(struct mlx5_lag *ldev, int start_idx, u32 filter)
 {
 	struct lag_func *pf;
 	unsigned long idx;
 
-	xa_for_each_start(&ldev->pfs, idx, pf, start_idx)
-		if (pf->dev)
+	if (filter == MLX5_LAG_FILTER_PORTS) {
+		xa_for_each_marked_start(&ldev->pfs, idx, pf,
+					 MLX5_LAG_XA_MARK_PORT, start_idx)
+			if (pf->dev)
+				return idx;
+		return MLX5_MAX_PORTS;
+	}
+
+	xa_for_each_start(&ldev->pfs, idx, pf, start_idx) {
+		if (!pf->dev)
+			continue;
+		if (filter == MLX5_LAG_FILTER_ALL ||
+		    filter == pf->group_id)
 			return idx;
+	}
 	return MLX5_MAX_PORTS;
 }
 
@@ -2219,7 +2602,8 @@ bool mlx5_lag_is_active(struct mlx5_core_dev *dev)
 
 	spin_lock_irqsave(&lag_lock, flags);
 	ldev = mlx5_lag_dev(dev);
-	res  = ldev && __mlx5_lag_is_active(ldev);
+	res  = ldev && (__mlx5_lag_is_active(ldev) ||
+			__mlx5_lag_is_sd_active(ldev, dev));
 	spin_unlock_irqrestore(&lag_lock, flags);
 
 	return res;
@@ -2252,10 +2636,17 @@ bool mlx5_lag_is_master(struct mlx5_core_dev *dev)
 
 	spin_lock_irqsave(&lag_lock, flags);
 	ldev = mlx5_lag_dev(dev);
-	idx = mlx5_lag_get_dev_index_by_seq(ldev, MLX5_LAG_P1);
-	if (ldev && __mlx5_lag_is_active(ldev) && idx >= 0) {
-		pf = mlx5_lag_pf(ldev, idx);
-		res = pf && dev == pf->dev;
+	if (ldev) {
+		u32 filter;
+
+		filter = mlx5_lag_get_filter(ldev, dev);
+		idx = mlx5_lag_get_dev_index_by_seq_filter(ldev, MLX5_LAG_P1,
+							   filter);
+		if ((__mlx5_lag_is_active(ldev) ||
+		     __mlx5_lag_is_sd_active(ldev, dev)) && idx >= 0) {
+			pf = mlx5_lag_pf(ldev, idx);
+			res = pf && dev == pf->dev;
+		}
 	}
 	spin_unlock_irqrestore(&lag_lock, flags);
 
@@ -2278,7 +2669,7 @@ bool mlx5_lag_is_sriov(struct mlx5_core_dev *dev)
 }
 EXPORT_SYMBOL(mlx5_lag_is_sriov);
 
-bool mlx5_lag_is_shared_fdb(struct mlx5_core_dev *dev)
+bool mlx5_lag_is_sd(struct mlx5_core_dev *dev)
 {
 	struct mlx5_lag *ldev;
 	unsigned long flags;
@@ -2286,7 +2677,26 @@ bool mlx5_lag_is_shared_fdb(struct mlx5_core_dev *dev)
 
 	spin_lock_irqsave(&lag_lock, flags);
 	ldev = mlx5_lag_dev(dev);
-	res = ldev && test_bit(MLX5_LAG_MODE_FLAG_SHARED_FDB, &ldev->mode_flags);
+	res  = ldev && __mlx5_lag_is_sd(ldev, dev);
+	spin_unlock_irqrestore(&lag_lock, flags);
+
+	return res;
+}
+
+bool mlx5_lag_is_shared_fdb(struct mlx5_core_dev *dev)
+{
+	struct mlx5_lag *ldev;
+	unsigned long flags;
+	bool res = false;
+
+	spin_lock_irqsave(&lag_lock, flags);
+	ldev = mlx5_lag_dev(dev);
+	if (ldev) {
+		res = test_bit(MLX5_LAG_MODE_FLAG_SHARED_FDB,
+			       &ldev->mode_flags);
+		if (__mlx5_lag_is_sd(ldev, dev) && !__mlx5_lag_is_active(ldev))
+			res = __mlx5_lag_is_sd_active(ldev, dev);
+	}
 	spin_unlock_irqrestore(&lag_lock, flags);
 
 	return res;
@@ -2295,13 +2705,26 @@ EXPORT_SYMBOL(mlx5_lag_is_shared_fdb);
 
 void mlx5_lag_disable_change(struct mlx5_core_dev *dev)
 {
+	struct mlx5_devcom_comp_dev *sd_devcom = mlx5_sd_get_devcom(dev);
+	struct mlx5_core_dev *primary = dev;
 	struct mlx5_lag *ldev;
+	struct lag_func *pf;
+	bool mpesw;
+	int i;
 
 	ldev = mlx5_lag_dev(dev);
 	if (!ldev)
 		return;
 
-	mlx5_devcom_comp_lock(dev->priv.hca_devcom_comp);
+	if (sd_devcom) {
+		mlx5_devcom_comp_lock(sd_devcom);
+		primary = mlx5_sd_get_primary(dev) ?: dev;
+		mlx5_devcom_comp_unlock(sd_devcom);
+	}
+	mlx5_devcom_comp_lock(primary->priv.hca_devcom_comp);
+	mpesw = ldev->mode == MLX5_LAG_MODE_MPESW;
+	if (mpesw)
+		mlx5_mpesw_sd_devcoms_lock(ldev);
 	mutex_lock(&ldev->lock);
 
 	ldev->mode_changes_in_progress++;
@@ -2313,7 +2736,25 @@ void mlx5_lag_disable_change(struct mlx5_core_dev *dev)
 	}
 
 	mutex_unlock(&ldev->lock);
-	mlx5_devcom_comp_unlock(dev->priv.hca_devcom_comp);
+	if (mpesw)
+		mlx5_mpesw_sd_devcoms_unlock(ldev);
+	mlx5_devcom_comp_unlock(primary->priv.hca_devcom_comp);
+
+	if (!sd_devcom)
+		return;
+
+	/* Teardown SD shared FDB for this device's group if active */
+	mlx5_devcom_comp_lock(sd_devcom);
+	mutex_lock(&ldev->lock);
+	mlx5_lag_for_each(i, 0, ldev, MLX5_LAG_FILTER_ALL) {
+		pf = mlx5_lag_pf(ldev, i);
+		if (pf->dev == dev && pf->sd_fdb_active) {
+			mlx5_lag_shared_fdb_destroy(ldev, pf->group_id);
+			break;
+		}
+	}
+	mutex_unlock(&ldev->lock);
+	mlx5_devcom_comp_unlock(sd_devcom);
 }
 
 void mlx5_lag_enable_change(struct mlx5_core_dev *dev)
@@ -2387,7 +2828,7 @@ struct mlx5_core_dev *mlx5_lag_get_next_peer_mdev(struct mlx5_core_dev *dev, int
 
 	if (*i == MLX5_MAX_PORTS)
 		goto unlock;
-	mlx5_ldev_for_each(idx, *i, ldev) {
+	mlx5_lag_for_each(idx, *i, ldev, mlx5_lag_get_filter(ldev, dev)) {
 		pf = mlx5_lag_pf(ldev, idx);
 		if (pf->dev != dev)
 			break;

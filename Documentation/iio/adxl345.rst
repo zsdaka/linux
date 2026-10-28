@@ -4,7 +4,7 @@
 ADXL345 driver
 ===============
 
-This driver supports Analog Device's ADXL345/375 on SPI/I2C bus.
+This driver supports Analog Devices' ADXL345/375 on SPI/I2C bus.
 
 1. Supported Devices
 ====================
@@ -47,7 +47,7 @@ specific device folder path ``/sys/bus/iio/devices/iio:deviceX``.
 +-------------------------------------------+----------------------------------------------------------+
 | in_accel_x_raw                            | Raw X-axis accelerometer channel value.                  |
 +-------------------------------------------+----------------------------------------------------------+
-| in_accel_y_calibbias                      | Y-axis acceleration offset correction                    |
+| in_accel_y_calibbias                      | Calibration offset for the Y-axis accelerometer channel. |
 +-------------------------------------------+----------------------------------------------------------+
 | in_accel_y_raw                            | Raw Y-axis accelerometer channel value.                  |
 +-------------------------------------------+----------------------------------------------------------+

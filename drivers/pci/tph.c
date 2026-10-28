@@ -119,12 +119,14 @@ static acpi_status tph_invoke_dsm(acpi_handle handle, u32 cpu_uid,
 	if (!out_obj)
 		return AE_ERROR;
 
-	if (out_obj->type != ACPI_TYPE_BUFFER) {
+	if (out_obj->type != ACPI_TYPE_BUFFER ||
+	    out_obj->buffer.length < sizeof(st_out->value) ||
+	    !out_obj->buffer.pointer) {
 		ACPI_FREE(out_obj);
 		return AE_ERROR;
 	}
 
-	st_out->value = *((u64 *)(out_obj->buffer.pointer));
+	memcpy(&st_out->value, out_obj->buffer.pointer, sizeof(st_out->value));
 
 	ACPI_FREE(out_obj);
 
@@ -139,8 +141,7 @@ static void set_ctrl_reg_req_en(struct pci_dev *pdev, u8 req_type)
 
 	pci_read_config_dword(pdev, pdev->tph_cap + PCI_TPH_CTRL, &reg);
 
-	reg &= ~PCI_TPH_CTRL_REQ_EN_MASK;
-	reg |= FIELD_PREP(PCI_TPH_CTRL_REQ_EN_MASK, req_type);
+	FIELD_MODIFY(PCI_TPH_CTRL_REQ_EN_MASK, &reg, req_type);
 
 	pci_write_config_dword(pdev, pdev->tph_cap + PCI_TPH_CTRL, reg);
 }
@@ -427,11 +428,8 @@ int pcie_enable_tph(struct pci_dev *pdev, int mode)
 	/* Write them into TPH control register */
 	pci_read_config_dword(pdev, pdev->tph_cap + PCI_TPH_CTRL, &reg);
 
-	reg &= ~PCI_TPH_CTRL_MODE_SEL_MASK;
-	reg |= FIELD_PREP(PCI_TPH_CTRL_MODE_SEL_MASK, pdev->tph_mode);
-
-	reg &= ~PCI_TPH_CTRL_REQ_EN_MASK;
-	reg |= FIELD_PREP(PCI_TPH_CTRL_REQ_EN_MASK, pdev->tph_req_type);
+	FIELD_MODIFY(PCI_TPH_CTRL_MODE_SEL_MASK, &reg, pdev->tph_mode);
+	FIELD_MODIFY(PCI_TPH_CTRL_REQ_EN_MASK, &reg, pdev->tph_req_type);
 
 	pci_write_config_dword(pdev, pdev->tph_cap + PCI_TPH_CTRL, reg);
 

@@ -211,8 +211,7 @@ static int eswin_pcie_host_init(struct dw_pcie_rp *pp)
 
 	/* Configure Root Port type */
 	val = readl_relaxed(pci->elbi_base + PCIEELBI_CTRL0_OFFSET);
-	val &= ~PCIEELBI_CTRL0_DEV_TYPE;
-	val |= FIELD_PREP(PCIEELBI_CTRL0_DEV_TYPE, PCI_EXP_TYPE_ROOT_PORT);
+	FIELD_MODIFY(PCIEELBI_CTRL0_DEV_TYPE, &val, PCI_EXP_TYPE_ROOT_PORT);
 	writel_relaxed(val, pci->elbi_base + PCIEELBI_CTRL0_OFFSET);
 
 	list_for_each_entry(port, &pcie->ports, list) {
@@ -389,6 +388,7 @@ static const struct of_device_id eswin_pcie_of_match[] = {
 	{ .compatible = "eswin,eic7700-pcie", .data = &eswin_eic7700_data },
 	{}
 };
+MODULE_DEVICE_TABLE(of, eswin_pcie_of_match);
 
 static struct platform_driver eswin_pcie_driver = {
 	.probe = eswin_pcie_probe,

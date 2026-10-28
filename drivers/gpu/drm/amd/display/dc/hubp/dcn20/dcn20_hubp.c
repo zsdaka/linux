@@ -68,10 +68,10 @@ void hubp2_set_vm_system_aperture_settings(struct hubp *hubp,
 			DCN_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB, mc_vm_apt_default.low_part);
 
 	REG_SET(DCN_VM_SYSTEM_APERTURE_LOW_ADDR, 0,
-			MC_VM_SYSTEM_APERTURE_LOW_ADDR, mc_vm_apt_low.quad_part);
+			MC_VM_SYSTEM_APERTURE_LOW_ADDR, mc_vm_apt_low.low_part);
 
 	REG_SET(DCN_VM_SYSTEM_APERTURE_HIGH_ADDR, 0,
-			MC_VM_SYSTEM_APERTURE_HIGH_ADDR, mc_vm_apt_high.quad_part);
+			MC_VM_SYSTEM_APERTURE_HIGH_ADDR, mc_vm_apt_high.low_part);
 
 	REG_SET_2(DCN_VM_MX_L1_TLB_CNTL, 0,
 			ENABLE_L1_TLB, 1,
@@ -710,7 +710,7 @@ void hubp2_dmdata_load(
 		uint32_t dmdata_sw_size,
 		const uint32_t *dmdata_sw_data)
 {
-	int i;
+	unsigned int i;
 	struct dcn20_hubp *hubp2 = TO_DCN20_HUBP(hubp);
 
 	/* load dmdata into HUBP buffer in SW mode */
@@ -730,9 +730,12 @@ bool hubp2_dmdata_status_done(struct hubp *hubp)
 bool hubp2_program_surface_flip_and_addr(
 	struct hubp *hubp,
 	const struct dc_plane_address *address,
-	bool flip_immediate)
+	bool flip_immediate,
+	bool dcc)
 {
 	struct dcn20_hubp *hubp2 = TO_DCN20_HUBP(hubp);
+
+	(void)dcc;
 
 	//program flip type
 	REG_UPDATE(DCSURF_FLIP_CONTROL,

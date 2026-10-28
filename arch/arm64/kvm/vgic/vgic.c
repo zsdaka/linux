@@ -86,19 +86,32 @@ static struct vgic_irq *vgic_get_lpi(struct kvm *kvm, u32 intid)
  */
 struct vgic_irq *vgic_get_irq(struct kvm *kvm, u32 intid)
 {
-	/* Non-private IRQs are not yet implemented for GICv5 */
-	if (vgic_is_v5(kvm))
-		return NULL;
+	enum kvm_device_type type = kvm->arch.vgic.vgic_model;
 
 	/* SPIs */
-	if (intid >= VGIC_NR_PRIVATE_IRQS &&
-	    intid < (kvm->arch.vgic.nr_spis + VGIC_NR_PRIVATE_IRQS)) {
-		intid = array_index_nospec(intid, kvm->arch.vgic.nr_spis + VGIC_NR_PRIVATE_IRQS);
-		return &kvm->arch.vgic.spis[intid - VGIC_NR_PRIVATE_IRQS];
+	if (__irq_is_spi(type, intid)) {
+		switch (type) {
+		case KVM_DEV_TYPE_ARM_VGIC_V5:
+			intid = vgic_v5_get_hwirq_id(intid);
+
+			if (intid >= kvm->arch.vgic.nr_spis)
+				return NULL;
+
+			intid = array_index_nospec(intid, kvm->arch.vgic.nr_spis);
+			return &kvm->arch.vgic.spis[intid];
+		default: {
+			u32 max_intid = kvm->arch.vgic.nr_spis + VGIC_NR_PRIVATE_IRQS;
+
+			if (intid < max_intid) {
+				intid -= VGIC_NR_PRIVATE_IRQS;
+				intid = array_index_nospec(intid, kvm->arch.vgic.nr_spis);
+				return &kvm->arch.vgic.spis[intid];
+			}
+		}}
 	}
 
 	/* LPIs */
-	if (irq_is_lpi(kvm, intid))
+	if (__irq_is_lpi(type, intid))
 		return vgic_get_lpi(kvm, intid);
 
 	return NULL;
@@ -106,24 +119,25 @@ struct vgic_irq *vgic_get_irq(struct kvm *kvm, u32 intid)
 
 struct vgic_irq *vgic_get_vcpu_irq(struct kvm_vcpu *vcpu, u32 intid)
 {
+	enum kvm_device_type type;
+
 	if (WARN_ON(!vcpu))
 		return NULL;
 
-	if (vgic_is_v5(vcpu->kvm)) {
-		u32 int_num, hwirq_id;
+	type = vcpu->kvm->arch.vgic.vgic_model;
 
-		if (!__irq_is_ppi(KVM_DEV_TYPE_ARM_VGIC_V5, intid))
-			return NULL;
+	if (__irq_is_sgi(type, intid) || __irq_is_ppi(type, intid)) {
+		switch (type) {
+		case KVM_DEV_TYPE_ARM_VGIC_V5:
+			intid = vgic_v5_get_hwirq_id(intid);
+			if (intid >= VGIC_V5_NR_PRIVATE_IRQS)
+				return NULL;
+			intid = array_index_nospec(intid, VGIC_V5_NR_PRIVATE_IRQS);
+			break;
+		default:
+			intid = array_index_nospec(intid, VGIC_NR_PRIVATE_IRQS);
+		}
 
-		hwirq_id = FIELD_GET(GICV5_HWIRQ_ID, intid);
-		int_num = array_index_nospec(hwirq_id, VGIC_V5_NR_PRIVATE_IRQS);
-
-		return &vcpu->arch.vgic_cpu.private_irqs[int_num];
-	}
-
-	/* SGIs and PPIs */
-	if (intid < VGIC_NR_PRIVATE_IRQS) {
-		intid = array_index_nospec(intid, VGIC_NR_PRIVATE_IRQS);
 		return &vcpu->arch.vgic_cpu.private_irqs[intid];
 	}
 
@@ -147,11 +161,7 @@ static __must_check bool __vgic_put_irq(struct kvm *kvm, struct vgic_irq *irq)
 
 static __must_check bool vgic_put_irq_norelease(struct kvm *kvm, struct vgic_irq *irq)
 {
-	if (!__vgic_put_irq(kvm, irq))
-		return false;
-
-	irq->pending_release = true;
-	return true;
+	return __vgic_put_irq(kvm, irq);
 }
 
 void vgic_put_irq(struct kvm *kvm, struct vgic_irq *irq)
@@ -168,12 +178,14 @@ void vgic_put_irq(struct kvm *kvm, struct vgic_irq *irq)
 		guard(spinlock_irqsave)(&dist->lpi_xa.xa_lock);
 	}
 
-	if (!__vgic_put_irq(kvm, irq))
+	if (!irq_is_lpi(kvm, irq->intid))
 		return;
 
-	xa_lock_irqsave(&dist->lpi_xa, flags);
-	vgic_release_lpi_locked(dist, irq);
-	xa_unlock_irqrestore(&dist->lpi_xa, flags);
+	if (refcount_dec_and_lock_irqsave(&irq->refcount,
+					  &dist->lpi_xa.xa_lock, &flags)) {
+		vgic_release_lpi_locked(dist, irq);
+		xa_unlock_irqrestore(&dist->lpi_xa, flags);
+	}
 }
 
 static void vgic_release_deleted_lpis(struct kvm *kvm)
@@ -185,7 +197,7 @@ static void vgic_release_deleted_lpis(struct kvm *kvm)
 	xa_lock_irqsave(&dist->lpi_xa, flags);
 
 	xa_for_each(&dist->lpi_xa, intid, irq) {
-		if (irq->pending_release)
+		if (!refcount_read(&irq->refcount))
 			vgic_release_lpi_locked(dist, irq);
 	}
 
@@ -204,6 +216,7 @@ void vgic_flush_pending_lpis(struct kvm_vcpu *vcpu)
 	list_for_each_entry_safe(irq, tmp, &vgic_cpu->ap_list_head, ap_list) {
 		if (irq_is_lpi(vcpu->kvm, irq->intid)) {
 			raw_spin_lock(&irq->irq_lock);
+			irq->pending_latch = false;
 			list_del(&irq->ap_list);
 			irq->vcpu = NULL;
 			raw_spin_unlock(&irq->irq_lock);
@@ -534,11 +547,9 @@ int kvm_vgic_inject_irq(struct kvm *kvm, struct kvm_vcpu *vcpu,
 {
 	struct vgic_irq *irq;
 	unsigned long flags;
-	int ret;
 
-	ret = vgic_lazy_init(kvm);
-	if (ret)
-		return ret;
+	if (unlikely(!vgic_initialized(kvm)))
+		return 0;
 
 	if (!vcpu && irq_is_private(kvm, intid))
 		return -EINVAL;
@@ -566,6 +577,9 @@ int kvm_vgic_inject_irq(struct kvm *kvm, struct kvm_vcpu *vcpu,
 	else
 		irq->pending_latch = true;
 
+	if (irq->ops && irq->ops->set_pending_state)
+		WARN_ON_ONCE(!irq->ops->set_pending_state(vcpu, irq));
+
 	vgic_queue_irq_unlock(kvm, irq, flags);
 	vgic_put_irq(kvm, irq);
 
@@ -573,7 +587,7 @@ int kvm_vgic_inject_irq(struct kvm *kvm, struct kvm_vcpu *vcpu,
 }
 
 void kvm_vgic_set_irq_ops(struct kvm_vcpu *vcpu, u32 vintid,
-			  struct irq_ops *ops)
+			  const struct irq_ops *ops)
 {
 	struct vgic_irq *irq = vgic_get_vcpu_irq(vcpu, vintid);
 
@@ -795,7 +809,11 @@ retry:
 			continue;
 		}
 
-		/* This interrupt looks like it has to be migrated. */
+		/*
+		 * This interrupt looks like it has to be migrated,
+		 * make sure it is kept alive while locks are dropped.
+		 */
+		vgic_get_irq_ref(irq);
 
 		raw_spin_unlock(&irq->irq_lock);
 		raw_spin_unlock(&vgic_cpu->ap_list_lock);
@@ -818,15 +836,16 @@ retry:
 		raw_spin_lock(&irq->irq_lock);
 
 		/*
-		 * If the affinity has been preserved, move the
-		 * interrupt around. Otherwise, it means things have
-		 * changed while the interrupt was unlocked, and we
-		 * need to replay this.
+		 * If the interrupt is still ours and its affinity has
+		 * been preserved, move it around. Otherwise, it means
+		 * things have changed while the interrupt was unlocked
+		 * (it may even have been taken off the list with its
+		 * affinity left untouched), and we need to replay this.
 		 *
 		 * In all cases, we cannot trust the list not to have
 		 * changed, so we restart from the beginning.
 		 */
-		if (target_vcpu == vgic_target_oracle(irq)) {
+		if (irq->vcpu == vcpu && target_vcpu == vgic_target_oracle(irq)) {
 			struct vgic_cpu *new_cpu = &target_vcpu->arch.vgic_cpu;
 
 			list_del(&irq->ap_list);
@@ -839,12 +858,25 @@ retry:
 		raw_spin_unlock(&vcpuB->arch.vgic_cpu.ap_list_lock);
 		raw_spin_unlock(&vcpuA->arch.vgic_cpu.ap_list_lock);
 
+		deleted_lpis |= vgic_put_irq_norelease(vcpu->kvm, irq);
+
 		if (target_vcpu_needs_kick) {
 			kvm_make_request(KVM_REQ_IRQ_PENDING, target_vcpu);
 			kvm_vcpu_kick(target_vcpu);
 		}
 
 		goto retry;
+	}
+
+	/*
+	 * Fix the last_lr_irq refcount which was obtained while
+	 * populating the LRs. This can also result in the LPI being
+	 * deleted.
+	 */
+	irq = *host_data_ptr(last_lr_irq);
+	if (irq) {
+		deleted_lpis |= vgic_put_irq_norelease(vcpu->kvm, irq);
+		*host_data_ptr(last_lr_irq) = NULL;
 	}
 
 	raw_spin_unlock(&vgic_cpu->ap_list_lock);
@@ -859,9 +891,6 @@ static void vgic_fold_state(struct kvm_vcpu *vcpu)
 		vgic_v5_fold_ppi_state(vcpu);
 		return;
 	}
-
-	if (!*host_data_ptr(last_lr_irq))
-		return;
 
 	if (kvm_vgic_global_state.type == VGIC_V2)
 		vgic_v2_fold_lr_state(vcpu);
@@ -1015,11 +1044,14 @@ static void vgic_flush_lr_state(struct kvm_vcpu *vcpu)
 		scoped_guard(raw_spinlock,  &irq->irq_lock) {
 			if (likely(vgic_target_oracle(irq) == vcpu)) {
 				vgic_populate_lr(vcpu, irq, count++);
-				*host_data_ptr(last_lr_irq) = irq;
+				if (count == kvm_vgic_global_state.nr_lr) {
+					vgic_get_irq_ref(irq);
+					*host_data_ptr(last_lr_irq) = irq;
+				}
 			}
 		}
 
-		if (count == kvm_vgic_global_state.nr_lr)
+		if (*host_data_ptr(last_lr_irq))
 			break;
 	}
 
@@ -1230,8 +1262,12 @@ int kvm_vgic_vcpu_pending_irq(struct kvm_vcpu *vcpu)
 	unsigned long flags;
 	struct vgic_vmcr vmcr;
 
-	if (vgic_is_v5(vcpu->kvm))
+	if (vgic_is_v5(vcpu->kvm)) {
+		if (READ_ONCE(vcpu->arch.vgic_cpu.vgic_v5.gicv5_vpe.db_fired))
+			return true;
+
 		return vgic_v5_has_pending_ppi(vcpu);
+	}
 
 	if (!vcpu->kvm->arch.vgic.enabled)
 		return false;

@@ -3833,9 +3833,9 @@ lpfc_offline_prep(struct lpfc_hba *phba, int mbx_action)
 			if (test_bit(FC_UNLOADING, &vports[i]->load_flag))
 				continue;
 			shost = lpfc_shost_from_vport(vports[i]);
-			spin_lock_irq(shost->host_lock);
+			spin_lock_irq(&shost->host_lock);
 			vports[i]->vpi_state &= ~LPFC_VPI_REGISTERED;
-			spin_unlock_irq(shost->host_lock);
+			spin_unlock_irq(&shost->host_lock);
 			set_bit(FC_VPORT_NEEDS_REG_VPI, &vports[i]->fc_flag);
 			clear_bit(FC_VFI_REGISTERED, &vports[i]->fc_flag);
 
@@ -3926,9 +3926,9 @@ lpfc_offline(struct lpfc_hba *phba)
 	if (vports != NULL)
 		for (i = 0; i <= phba->max_vports && vports[i] != NULL; i++) {
 			shost = lpfc_shost_from_vport(vports[i]);
-			spin_lock_irq(shost->host_lock);
+			spin_lock_irq(&shost->host_lock);
 			vports[i]->work_port_events = 0;
-			spin_unlock_irq(shost->host_lock);
+			spin_unlock_irq(&shost->host_lock);
 			set_bit(FC_OFFLINE_MODE, &vports[i]->fc_flag);
 		}
 	lpfc_destroy_vport_work_array(phba, vports);
@@ -4103,7 +4103,7 @@ lpfc_sli4_els_sgl_update(struct lpfc_hba *phba)
 				 &phba->sli4_hba.lpfc_els_sgl_list);
 		spin_unlock_irq(&phba->sli4_hba.sgl_list_lock);
 	} else if (els_xri_cnt < phba->sli4_hba.els_xri_cnt) {
-		/* els xri-sgl shrinked */
+		/* els xri-sgl shrunk */
 		xri_cnt = phba->sli4_hba.els_xri_cnt - els_xri_cnt;
 		lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
 				"3158 ELS xri-sgl count decreased from "
@@ -4930,7 +4930,7 @@ int lpfc_scan_finished(struct Scsi_Host *shost, unsigned long time)
 	struct lpfc_hba   *phba = vport->phba;
 	int stat = 0;
 
-	spin_lock_irq(shost->host_lock);
+	spin_lock_irq(&shost->host_lock);
 
 	if (test_bit(FC_UNLOADING, &vport->load_flag)) {
 		stat = 1;
@@ -4965,7 +4965,7 @@ int lpfc_scan_finished(struct Scsi_Host *shost, unsigned long time)
 	stat = 1;
 
 finished:
-	spin_unlock_irq(shost->host_lock);
+	spin_unlock_irq(&shost->host_lock);
 	return stat;
 }
 
@@ -8024,7 +8024,7 @@ lpfc_sli4_driver_resource_setup(struct lpfc_hba *phba)
 	 * Initialize driver internal slow-path work queues
 	 */
 
-	/* Driver internel slow-path CQ Event pool */
+	/* Driver internal slow-path CQ Event pool */
 	INIT_LIST_HEAD(&phba->sli4_hba.sp_cqe_event_pool);
 	/* Response IOCB work queue list */
 	INIT_LIST_HEAD(&phba->sli4_hba.sp_queue_event);
@@ -8189,6 +8189,7 @@ lpfc_sli4_driver_resource_setup(struct lpfc_hba *phba)
 		mempool_free(mboxq, phba->mbox_mem_pool);
 		goto out_free_bsmbx;
 	}
+	mempool_free(mboxq, phba->mbox_mem_pool);
 
 	/*
 	 * 1 for cmd, 1 for rsp, NVME adds an extra one
@@ -8310,8 +8311,6 @@ lpfc_sli4_driver_resource_setup(struct lpfc_hba *phba)
 		rc = -ENOMEM;
 		goto out_free_sg_dma_buf;
 	}
-
-	mempool_free(mboxq, phba->mbox_mem_pool);
 
 	/* Verify OAS is supported */
 	lpfc_sli4_oas_verify(phba);
@@ -9227,9 +9226,9 @@ lpfc_post_init_setup(struct lpfc_hba *phba)
 	lpfc_host_attrib_init(shost);
 
 	if (phba->cfg_poll & DISABLE_FCP_RING_INT) {
-		spin_lock_irq(shost->host_lock);
+		spin_lock_irq(&shost->host_lock);
 		lpfc_poll_start_timer(phba);
-		spin_unlock_irq(shost->host_lock);
+		spin_unlock_irq(&shost->host_lock);
 	}
 
 	lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
@@ -9740,7 +9739,7 @@ lpfc_create_bootstrap_mbox(struct lpfc_hba *phba)
 	 * Initialize the bootstrap mailbox pointers now so that the register
 	 * operations are simple later.  The mailbox dma address is required
 	 * to be 16-byte aligned.  Also align the virtual memory as each
-	 * maibox is copied into the bmbx mailbox region before issuing the
+	 * mailbox is copied into the bmbx mailbox region before issuing the
 	 * command to the port.
 	 */
 	phba->sli4_hba.bmbx.dmabuf = dmabuf;
@@ -10206,7 +10205,7 @@ lpfc_sli4_read_config(struct lpfc_hba *phba)
 		goto read_cfg_out;
 	}
 
-	/* search for fc_fcoe resrouce descriptor */
+	/* search for fc_fcoe resource descriptor */
 	get_func_cfg = &pmb->u.mqe.un.get_func_cfg;
 
 	pdesc_0 = (char *)&get_func_cfg->func_cfg.desc[0];
@@ -10414,7 +10413,7 @@ lpfc_alloc_io_wq_cq(struct lpfc_hba *phba, int idx)
  *
  * Return codes
  *      0 - successful
- *      -ENOMEM - No availble memory
+ *      -ENOMEM - No available memory
  *      -EIO - The mailbox failed to complete successfully.
  **/
 int
@@ -12490,7 +12489,7 @@ lpfc_cpu_affinity_check(struct lpfc_hba *phba, int vectors)
 
 			/* If so, find a new_cpup that is on the SAME
 			 * phys_id as cpup. start_cpu will start where we
-			 * left off so all unassigned entries don't get assgined
+			 * left off so all unassigned entries don't get assigned
 			 * the IRQ of the first entry.
 			 */
 			new_cpu = start_cpu;

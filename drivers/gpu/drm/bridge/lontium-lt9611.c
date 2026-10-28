@@ -5,6 +5,7 @@
  */
 
 #include <linux/gpio/consumer.h>
+#include <linux/hdmi.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/media-bus-format.h>
@@ -37,7 +38,6 @@
 struct lt9611 {
 	struct device *dev;
 	struct drm_bridge bridge;
-	struct drm_bridge *next_bridge;
 
 	struct regmap *regmap;
 
@@ -657,7 +657,7 @@ lt9611_get_edid_block(void *data, u8 *buf, unsigned int block, size_t len)
 
 /* bridge funcs */
 static void lt9611_bridge_atomic_enable(struct drm_bridge *bridge,
-					struct drm_atomic_state *state)
+					struct drm_atomic_commit *state)
 {
 	struct lt9611 *lt9611 = bridge_to_lt9611(bridge);
 	struct drm_connector *connector;
@@ -704,7 +704,7 @@ static void lt9611_bridge_atomic_enable(struct drm_bridge *bridge,
 }
 
 static void lt9611_bridge_atomic_disable(struct drm_bridge *bridge,
-					 struct drm_atomic_state *state)
+					 struct drm_atomic_commit *state)
 {
 	struct lt9611 *lt9611 = bridge_to_lt9611(bridge);
 	int ret;
@@ -761,7 +761,7 @@ static int lt9611_bridge_attach(struct drm_bridge *bridge,
 {
 	struct lt9611 *lt9611 = bridge_to_lt9611(bridge);
 
-	return drm_bridge_attach(encoder, lt9611->next_bridge,
+	return drm_bridge_attach(encoder, lt9611->bridge.next_bridge,
 				 bridge, flags);
 }
 
@@ -782,7 +782,7 @@ static enum drm_mode_status lt9611_bridge_mode_valid(struct drm_bridge *bridge,
 }
 
 static void lt9611_bridge_atomic_pre_enable(struct drm_bridge *bridge,
-					    struct drm_atomic_state *state)
+					    struct drm_atomic_commit *state)
 {
 	struct lt9611 *lt9611 = bridge_to_lt9611(bridge);
 	static const struct reg_sequence reg_cfg[] = {
@@ -802,7 +802,7 @@ static void lt9611_bridge_atomic_pre_enable(struct drm_bridge *bridge,
 }
 
 static void lt9611_bridge_atomic_post_disable(struct drm_bridge *bridge,
-					      struct drm_atomic_state *state)
+					      struct drm_atomic_commit *state)
 {
 	struct lt9611 *lt9611 = bridge_to_lt9611(bridge);
 
@@ -953,18 +953,6 @@ static int lt9611_hdmi_write_hdmi_infoframe(struct drm_bridge *bridge,
 	return 0;
 }
 
-static enum drm_mode_status
-lt9611_hdmi_tmds_char_rate_valid(const struct drm_bridge *bridge,
-				 const struct drm_display_mode *mode,
-				 unsigned long long tmds_rate)
-{
-	/* 297 MHz for 4k@30 mode */
-	if (tmds_rate > 297000000)
-		return MODE_CLOCK_HIGH;
-
-	return MODE_OK;
-}
-
 static int lt9611_hdmi_audio_startup(struct drm_bridge *bridge,
 				     struct drm_connector *connector)
 {
@@ -1027,10 +1015,9 @@ static const struct drm_bridge_funcs lt9611_bridge_funcs = {
 	.atomic_post_disable = lt9611_bridge_atomic_post_disable,
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
-	.atomic_reset = drm_atomic_helper_bridge_reset,
+	.atomic_create_state = drm_atomic_helper_bridge_create_state,
 	.atomic_get_input_bus_fmts = lt9611_atomic_get_input_bus_fmts,
 
-	.hdmi_tmds_char_rate_valid = lt9611_hdmi_tmds_char_rate_valid,
 	.hdmi_write_audio_infoframe = lt9611_hdmi_write_audio_infoframe,
 	.hdmi_clear_audio_infoframe = lt9611_hdmi_clear_audio_infoframe,
 	.hdmi_write_avi_infoframe = lt9611_hdmi_write_avi_infoframe,
@@ -1058,7 +1045,11 @@ static int lt9611_parse_dt(struct device *dev,
 
 	lt9611->ac_mode = of_property_read_bool(dev->of_node, "lt,ac-mode");
 
-	return drm_of_find_panel_or_bridge(dev->of_node, 2, -1, NULL, &lt9611->next_bridge);
+	lt9611->bridge.next_bridge = of_drm_get_bridge_by_endpoint(dev->of_node, 2, -1);
+	if (IS_ERR(lt9611->bridge.next_bridge))
+		return PTR_ERR(lt9611->bridge.next_bridge);
+
+	return 0;
 }
 
 static int lt9611_gpio_init(struct lt9611 *lt9611)
@@ -1153,10 +1144,8 @@ static int lt9611_probe(struct i2c_client *client)
 	ret = devm_request_threaded_irq(dev, client->irq, NULL,
 					lt9611_irq_thread_handler,
 					IRQF_ONESHOT, "lt9611", lt9611);
-	if (ret) {
-		dev_err(dev, "failed to request irq\n");
+	if (ret)
 		goto err_disable_regulators;
-	}
 
 	i2c_set_clientdata(client, lt9611);
 
@@ -1174,6 +1163,8 @@ static int lt9611_probe(struct i2c_client *client)
 	lt9611->bridge.hdmi_audio_dev = dev;
 	lt9611->bridge.hdmi_audio_max_i2s_playback_channels = 8;
 	lt9611->bridge.hdmi_audio_dai_port = 2;
+	lt9611->bridge.supported_hdmi_ver = HDMI_VERSION_1_4;
+	lt9611->bridge.max_tmds_char_rate = 297000000; /* 297 MHz for 4k@30 mode */
 
 	drm_bridge_add(&lt9611->bridge);
 
@@ -1226,8 +1217,8 @@ static void lt9611_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id lt9611_id[] = {
-	{ "lontium,lt9611" },
-	{}
+	{ .name = "lt9611" },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, lt9611_id);
 

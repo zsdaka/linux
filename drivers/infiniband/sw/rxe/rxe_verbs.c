@@ -22,19 +22,13 @@ static int rxe_query_device(struct ib_device *ibdev,
 	struct rxe_dev *rxe = to_rdev(ibdev);
 	int err;
 
-	if (udata->inlen || udata->outlen) {
-		rxe_dbg_dev(rxe, "malformed udata\n");
-		err = -EINVAL;
-		goto err_out;
-	}
+	err = ib_no_udata_io(udata);
+	if (err)
+		return err;
 
 	memcpy(attr, &rxe->attr, sizeof(*attr));
 
 	return 0;
-
-err_out:
-	rxe_err_dev(rxe, "returned err = %d\n", err);
-	return err;
 }
 
 static int rxe_query_port(struct ib_device *ibdev,
@@ -50,7 +44,7 @@ static int rxe_query_port(struct ib_device *ibdev,
 		goto err_out;
 	}
 
-	ndev = rxe_ib_device_get_netdev(ibdev);
+	ndev = ib_device_get_netdev(ibdev, 1);
 	if (!ndev) {
 		err = -ENODEV;
 		goto err_out;
@@ -244,6 +238,10 @@ static void rxe_dealloc_ucontext(struct ib_ucontext *ibuc)
 	err = rxe_cleanup(uc);
 	if (err)
 		rxe_err_uc(uc, "cleanup failed, err = %d\n", err);
+}
+
+static void rxe_disassociate_ucontext(struct ib_ucontext *ibuc)
+{
 }
 
 /* pd */
@@ -1319,6 +1317,7 @@ static struct ib_mr *rxe_rereg_user_mr(struct ib_mr *ibmr, int flags,
 	struct rxe_mr *mr = to_rmr(ibmr);
 	struct rxe_pd *old_pd = to_rpd(ibmr->pd);
 	struct rxe_pd *pd = to_rpd(ibpd);
+	int err;
 
 	/* for now only support the two easy cases:
 	 * rereg_pd and rereg_access
@@ -1328,19 +1327,30 @@ static struct ib_mr *rxe_rereg_user_mr(struct ib_mr *ibmr, int flags,
 		return ERR_PTR(-EOPNOTSUPP);
 	}
 
+	err = ib_umem_check_rereg(mr->umem, flags, access);
+	if (err)
+		return ERR_PTR(err);
+
+	if ((flags & IB_MR_REREG_ACCESS) &&
+	    (access & ~RXE_ACCESS_SUPPORTED_MR)) {
+		rxe_err_mr(mr, "access = %#x not supported\n", access);
+		return ERR_PTR(-EOPNOTSUPP);
+	}
+
+	if ((flags & IB_MR_REREG_ACCESS) &&
+	    ((access ^ mr->access) & IB_ACCESS_ON_DEMAND)) {
+		rxe_err_mr(mr, "cannot change IB_ACCESS_ON_DEMAND\n");
+		return ERR_PTR(-EOPNOTSUPP);
+	}
+
 	if (flags & IB_MR_REREG_PD) {
 		rxe_put(old_pd);
 		rxe_get(pd);
 		mr->ibmr.pd = ibpd;
 	}
 
-	if (flags & IB_MR_REREG_ACCESS) {
-		if (access & ~RXE_ACCESS_SUPPORTED_MR) {
-			rxe_err_mr(mr, "access = %#x not supported\n", access);
-			return ERR_PTR(-EOPNOTSUPP);
-		}
+	if (flags & IB_MR_REREG_ACCESS)
 		mr->access = access;
-	}
 
 	return NULL;
 }
@@ -1441,7 +1451,7 @@ static int rxe_enable_driver(struct ib_device *ib_dev)
 	struct rxe_dev *rxe = container_of(ib_dev, struct rxe_dev, ib_dev);
 	struct net_device *ndev;
 
-	ndev = rxe_ib_device_get_netdev(ib_dev);
+	ndev = ib_device_get_netdev(ib_dev, 1);
 	if (!ndev)
 		return -ENODEV;
 
@@ -1479,6 +1489,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.destroy_srq = rxe_destroy_srq,
 	.detach_mcast = rxe_detach_mcast,
 	.device_group = &rxe_attr_group,
+	.disassociate_ucontext = rxe_disassociate_ucontext,
 	.enable_driver = rxe_enable_driver,
 	.get_dma_mr = rxe_get_dma_mr,
 	.get_hw_stats = rxe_ib_get_hw_stats,
@@ -1496,6 +1507,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.post_recv = rxe_post_recv,
 	.post_send = rxe_post_send,
 	.post_srq_recv = rxe_post_srq_recv,
+	.process_mad = rxe_process_mad,
 	.query_ah = rxe_query_ah,
 	.query_device = rxe_query_device,
 	.query_pkey = rxe_query_pkey,

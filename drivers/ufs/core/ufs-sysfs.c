@@ -54,6 +54,7 @@ static const char *ufs_hs_gear_to_string(enum ufs_hs_gear_tag gear)
 	case UFS_HS_G3:	return "HS_GEAR3";
 	case UFS_HS_G4:	return "HS_GEAR4";
 	case UFS_HS_G5:	return "HS_GEAR5";
+	case UFS_HS_G6:	return "HS_GEAR6";
 	default:	return "UNKNOWN";
 	}
 }
@@ -149,12 +150,12 @@ static inline ssize_t ufs_sysfs_pm_lvl_store(struct device *dev,
 	     !(dev_info->wspecversion >= 0x310)))
 		return -EINVAL;
 
-	spin_lock_irqsave(hba->host->host_lock, flags);
+	spin_lock_irqsave(&hba->host->host_lock, flags);
 	if (rpm)
 		hba->rpm_lvl = value;
 	else
 		hba->spm_lvl = value;
-	spin_unlock_irqrestore(hba->host->host_lock, flags);
+	spin_unlock_irqrestore(&hba->host->host_lock, flags);
 	return count;
 }
 
@@ -594,8 +595,13 @@ static ssize_t device_lvl_exception_id_show(struct device *dev,
 	u64 exception_id;
 	int err;
 
+	if (hba->dev_info.wspecversion < 0x410)
+		return -EOPNOTSUPP;
+
 	ufshcd_rpm_get_sync(hba);
-	err = ufshcd_read_device_lvl_exception_id(hba, &exception_id);
+	err = ufshcd_query_attr_qword(hba, UPIU_QUERY_OPCODE_READ_ATTR,
+				      QUERY_ATTR_IDN_DEV_LVL_EXCEPTION_ID,
+				      0, 0, &exception_id);
 	ufshcd_rpm_put_sync(hba);
 
 	if (err)
@@ -781,7 +787,7 @@ static ssize_t monitor_enable_store(struct device *dev,
 		return -EINVAL;
 
 	value = !!value;
-	spin_lock_irqsave(hba->host->host_lock, flags);
+	spin_lock_irqsave(&hba->host->host_lock, flags);
 	if (value == hba->monitor.enabled)
 		goto out_unlock;
 
@@ -793,7 +799,7 @@ static ssize_t monitor_enable_store(struct device *dev,
 	}
 
 out_unlock:
-	spin_unlock_irqrestore(hba->host->host_lock, flags);
+	spin_unlock_irqrestore(&hba->host->host_lock, flags);
 	return count;
 }
 
@@ -815,11 +821,11 @@ static ssize_t monitor_chunk_size_store(struct device *dev,
 	if (kstrtoul(buf, 0, &value))
 		return -EINVAL;
 
-	spin_lock_irqsave(hba->host->host_lock, flags);
+	spin_lock_irqsave(&hba->host->host_lock, flags);
 	/* Only allow chunk size change when monitor is disabled */
 	if (!hba->monitor.enabled)
 		hba->monitor.chunk_size = value;
-	spin_unlock_irqrestore(hba->host->host_lock, flags);
+	spin_unlock_irqrestore(&hba->host->host_lock, flags);
 	return count;
 }
 
@@ -1670,6 +1676,12 @@ static inline bool ufshcd_is_wb_attrs(enum attr_idn idn)
 		idn <= QUERY_ATTR_IDN_CURR_WB_BUFF_SIZE;
 }
 
+static inline bool ufshcd_is_qword_attr(enum attr_idn idn)
+{
+	return idn == QUERY_ATTR_IDN_TIMESTAMP ||
+	       idn == QUERY_ATTR_IDN_DEV_LVL_EXCEPTION_ID;
+}
+
 static int wb_read_resize_attrs(struct ufs_hba *hba,
 			enum attr_idn idn, u32 *attr_val)
 {
@@ -1736,6 +1748,7 @@ static ssize_t _name##_show(struct device *dev,				\
 	struct device_attribute *attr, char *buf)			\
 {									\
 	struct ufs_hba *hba = dev_get_drvdata(dev);			\
+	u64 qword_value;						\
 	u32 value;							\
 	int ret;							\
 	u8 index = 0;							\
@@ -1748,14 +1761,24 @@ static ssize_t _name##_show(struct device *dev,				\
 	if (ufshcd_is_wb_attrs(QUERY_ATTR_IDN##_uname))			\
 		index = ufshcd_wb_get_query_index(hba);			\
 	ufshcd_rpm_get_sync(hba);					\
-	ret = ufshcd_query_attr(hba, UPIU_QUERY_OPCODE_READ_ATTR,	\
-		QUERY_ATTR_IDN##_uname, index, 0, &value);		\
+	if (ufshcd_is_qword_attr(QUERY_ATTR_IDN##_uname))		\
+		ret = ufshcd_query_attr_qword(hba,			\
+			UPIU_QUERY_OPCODE_READ_ATTR,			\
+			QUERY_ATTR_IDN##_uname,				\
+			index, 0, &qword_value);			\
+	else								\
+		ret = ufshcd_query_attr(hba,				\
+			UPIU_QUERY_OPCODE_READ_ATTR,			\
+			QUERY_ATTR_IDN##_uname, index, 0, &value);	\
 	ufshcd_rpm_put_sync(hba);					\
 	if (ret) {							\
 		ret = -EINVAL;						\
 		goto out;						\
 	}								\
-	ret = sysfs_emit(buf, "0x%08X\n", value);			\
+	if (ufshcd_is_qword_attr(QUERY_ATTR_IDN##_uname))		\
+		ret = sysfs_emit(buf, "0x%016llX\n", qword_value);	\
+	else								\
+		ret = sysfs_emit(buf, "0x%08X\n", value);		\
 out:									\
 	up(&hba->host_sem);						\
 	return ret;							\

@@ -13,11 +13,6 @@ enum { MAX_NESTED_LINKS = 8 };
 
 #define MAXSYMLINKS 40
 
-/*
- * Type of the last component on LOOKUP_PARENT
- */
-enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT};
-
 /* pathwalk mode */
 #define LOOKUP_FOLLOW		BIT(0)	/* follow links at the end */
 #define LOOKUP_DIRECTORY	BIT(1)	/* require a directory */
@@ -37,8 +32,9 @@ enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT};
 #define LOOKUP_CREATE		BIT(17)	/* ... in object creation */
 #define LOOKUP_EXCL		BIT(18)	/* ... in target must not exist */
 #define LOOKUP_RENAME_TARGET	BIT(19)	/* ... in destination of rename() */
+#define LOOKUP_SHARED		BIT(20) /* Parent lock is held shared */
 
-/* 4 spare bits for intent */
+/* 3 spare bits for intent */
 
 /* Scoping flags for lookup. */
 #define LOOKUP_NO_SYMLINKS	BIT(24) /* No symlink crossing. */
@@ -61,13 +57,12 @@ extern struct dentry *start_creating_path(int, const char *, struct path *, unsi
 extern struct dentry *start_creating_user_path(int, const char __user *, struct path *, unsigned int);
 extern void end_creating_path(const struct path *, struct dentry *);
 extern struct dentry *start_removing_path(const char *, struct path *);
-extern struct dentry *start_removing_user_path_at(int , const char __user *, struct path *);
 static inline void end_removing_path(const struct path *path , struct dentry *dentry)
 {
 	end_creating_path(path, dentry);
 }
 int vfs_path_parent_lookup(struct filename *filename, unsigned int flags,
-			   struct path *parent, struct qstr *last, int *type,
+			   struct path *parent, struct qstr *last,
 			   const struct path *root);
 int vfs_path_lookup(struct dentry *, struct vfsmount *, const char *,
 		    unsigned int, struct path *);
@@ -76,24 +71,24 @@ extern struct dentry *try_lookup_noperm(struct qstr *, struct dentry *);
 extern struct dentry *lookup_noperm(struct qstr *, struct dentry *);
 extern struct dentry *lookup_noperm_unlocked(struct qstr *, struct dentry *);
 extern struct dentry *lookup_noperm_positive_unlocked(struct qstr *, struct dentry *);
-struct dentry *lookup_one(struct mnt_idmap *, struct qstr *, struct dentry *);
-struct dentry *lookup_one_unlocked(struct mnt_idmap *idmap,
+struct dentry *lookup_one(const struct mnt_idmap *, struct qstr *, struct dentry *);
+struct dentry *lookup_one_unlocked(const struct mnt_idmap *idmap,
 				   struct qstr *name, struct dentry *base);
-struct dentry *lookup_one_positive_unlocked(struct mnt_idmap *idmap,
+struct dentry *lookup_one_positive_unlocked(const struct mnt_idmap *idmap,
 					    struct qstr *name,
 					    struct dentry *base);
-struct dentry *lookup_one_positive_killable(struct mnt_idmap *idmap,
+struct dentry *lookup_one_positive_killable(const struct mnt_idmap *idmap,
 					    struct qstr *name,
 					    struct dentry *base);
 
-struct dentry *start_creating(struct mnt_idmap *idmap, struct dentry *parent,
+struct dentry *start_creating(const struct mnt_idmap *idmap, struct dentry *parent,
 			      struct qstr *name);
-struct dentry *start_removing(struct mnt_idmap *idmap, struct dentry *parent,
+struct dentry *start_removing(const struct mnt_idmap *idmap, struct dentry *parent,
 			      struct qstr *name);
-struct dentry *start_creating_killable(struct mnt_idmap *idmap,
+struct dentry *start_creating_killable(const struct mnt_idmap *idmap,
 				       struct dentry *parent,
 				       struct qstr *name);
-struct dentry *start_removing_killable(struct mnt_idmap *idmap,
+struct dentry *start_removing_killable(const struct mnt_idmap *idmap,
 				       struct dentry *parent,
 				       struct qstr *name);
 struct dentry *start_creating_noperm(struct dentry *parent, struct qstr *name);
@@ -102,6 +97,9 @@ struct dentry *start_creating_dentry(struct dentry *parent,
 				     struct dentry *child);
 struct dentry *start_removing_dentry(struct dentry *parent,
 				     struct dentry *child);
+
+struct file *vfs_lookup_open(struct path *parent, struct qstr *last,
+			     int open_flag, umode_t mode);
 
 /* end_creating - finish action started with start_creating
  * @child: dentry returned by start_creating() or vfs_mkdir()

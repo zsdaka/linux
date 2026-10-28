@@ -45,6 +45,7 @@ obj-$(CONFIG_INET_TCP_DIAG) += tcp_diag.o
 obj-$(CONFIG_INET_UDP_DIAG) += udp_diag.o
 obj-$(CONFIG_INET_RAW_DIAG) += raw_diag.o
 obj-$(CONFIG_TCP_CONG_BBR) += tcp_bbr.o
+obj-$(CONFIG_TCP_CONG_ROCCET) += tcp_roccet.o
 obj-$(CONFIG_TCP_CONG_BIC) += tcp_bic.o
 obj-$(CONFIG_TCP_CONG_CDG) += tcp_cdg.o
 obj-$(CONFIG_TCP_CONG_CUBIC) += tcp_cubic.o
@@ -60,7 +61,6 @@ obj-$(CONFIG_TCP_CONG_SCALABLE) += tcp_scalable.o
 obj-$(CONFIG_TCP_CONG_LP) += tcp_lp.o
 obj-$(CONFIG_TCP_CONG_YEAH) += tcp_yeah.o
 obj-$(CONFIG_TCP_CONG_ILLINOIS) += tcp_illinois.o
-obj-$(CONFIG_TCP_SIGPOOL) += tcp_sigpool.o
 obj-$(CONFIG_NET_SOCK_MSG) += tcp_bpf.o
 obj-$(CONFIG_BPF_SYSCALL) += udp_bpf.o
 obj-$(CONFIG_NETLABEL) += cipso_ipv4.o
@@ -71,4 +71,9 @@ obj-$(CONFIG_TCP_AO) += tcp_ao.o
 
 ifeq ($(CONFIG_BPF_JIT),y)
 obj-$(CONFIG_BPF_SYSCALL) += bpf_tcp_ca.o
+obj-$(CONFIG_CGROUP_BPF) += bpf_tcp_ops.o
+endif
+
+ifdef CONFIG_GCOV_PROFILE_NETFILTER
+GCOV_PROFILE_netfilter.o := y
 endif

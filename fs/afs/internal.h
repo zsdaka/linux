@@ -251,6 +251,8 @@ struct afs_super_info {
 	struct afs_volume	*volume;	/* volume record */
 	enum afs_flock_mode	flock_mode:8;	/* File locking emulation mode */
 	bool			dyn_root;	/* True if dynamic root */
+	/* afs_atcell_get_link() reads ->net_ns in rcu pathwalk */
+	struct rcu_head		rcu;
 };
 
 static inline struct afs_super_info *AFS_FS_S(struct super_block *sb)
@@ -388,6 +390,7 @@ struct afs_cell {
 #define AFS_CELL_FL_NO_GC	0		/* The cell was added manually, don't auto-gc */
 #define AFS_CELL_FL_DO_LOOKUP	1		/* DNS lookup requested */
 #define AFS_CELL_FL_CHECK_ALIAS	2		/* Need to check for aliases */
+#define AFS_CELL_FL_HAVE_INO	3		/* Have dynroot_ino */
 	enum afs_cell_state	state;
 	short			error;
 	enum dns_record_source	dns_source:8;	/* Latest source of data from lookup */
@@ -750,8 +753,6 @@ static inline void afs_vnode_set_cache(struct afs_vnode *vnode,
 {
 #ifdef CONFIG_AFS_FSCACHE
 	vnode->netfs.cache = cookie;
-	if (cookie)
-		mapping_set_release_always(vnode->netfs.inode.i_mapping);
 #endif
 }
 
@@ -1134,6 +1135,14 @@ int afs_dir_search_bucket(struct afs_dir_iter *iter, const struct qstr *name,
 int afs_dir_search(struct afs_vnode *dvnode, const struct qstr *name,
 		   struct afs_fid *_fid, afs_dataversion_t *_dir_version);
 
+static inline void afs_dir_end_iter(struct afs_dir_iter *iter)
+{
+	if (iter->block) {
+		kunmap_local(iter->block);
+		iter->block = NULL;
+	}
+}
+
 /*
  * dir_silly.c
  */
@@ -1164,7 +1173,7 @@ extern int afs_open(struct inode *, struct file *);
 extern int afs_release(struct inode *, struct file *);
 void afs_fetch_data_async_rx(struct work_struct *work);
 void afs_fetch_data_immediate_cancel(struct afs_call *call);
-void afs_set_i_size(struct afs_vnode *vnode, loff_t new_i_size);
+void afs_set_i_size(struct afs_vnode *vnode, uoff_t new_i_size);
 
 /*
  * flock.c
@@ -1259,9 +1268,9 @@ extern int afs_fetch_status(struct afs_vnode *, struct key *, bool, afs_access_t
 extern int afs_ilookup5_test_by_fid(struct inode *, void *);
 extern struct inode *afs_iget(struct afs_operation *, struct afs_vnode_param *);
 extern struct inode *afs_root_iget(struct super_block *, struct key *);
-extern int afs_getattr(struct mnt_idmap *idmap, const struct path *,
+extern int afs_getattr(const struct mnt_idmap *idmap, const struct path *,
 		       struct kstat *, u32, unsigned int);
-extern int afs_setattr(struct mnt_idmap *idmap, struct dentry *, struct iattr *);
+extern int afs_setattr(const struct mnt_idmap *idmap, struct dentry *, struct iattr *);
 extern void afs_evict_inode(struct inode *);
 extern int afs_drop_inode(struct inode *);
 
@@ -1422,7 +1431,7 @@ static inline void afs_make_op_call(struct afs_operation *op, struct afs_call *c
 {
 	struct afs_addr_list *alist = op->estate->addresses;
 
-	op->call	= call;
+	op->call	= afs_get_call(call, afs_call_trace_get);
 	op->type	= call->type;
 	call->op	= op;
 	call->key	= op->key;
@@ -1430,6 +1439,7 @@ static inline void afs_make_op_call(struct afs_operation *op, struct afs_call *c
 	call->peer	= rxrpc_kernel_get_peer(alist->addrs[op->addr_index].peer);
 	call->service_id = op->server->service_id;
 	afs_make_call(call, gfp);
+	afs_put_call(call);
 }
 
 static inline void afs_extract_begin(struct afs_call *call, void *buf, size_t size)
@@ -1530,7 +1540,7 @@ extern void afs_cache_permit(struct afs_vnode *, struct key *, unsigned int,
 extern struct key *afs_request_key(struct afs_cell *);
 extern struct key *afs_request_key_rcu(struct afs_cell *);
 extern int afs_check_permit(struct afs_vnode *, struct key *, afs_access_t *);
-extern int afs_permission(struct mnt_idmap *, struct inode *, int);
+extern int afs_permission(const struct mnt_idmap *, struct inode *, int);
 extern void __exit afs_clean_up_permit_cache(void);
 
 /*

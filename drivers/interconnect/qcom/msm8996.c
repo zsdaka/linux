@@ -8,7 +8,6 @@
 #include <linux/device.h>
 #include <linux/interconnect-provider.h>
 #include <linux/io.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
@@ -502,6 +501,7 @@ static struct qcom_icc_node mas_venus = {
 	.qos.areq_prio = 0,
 	.qos.prio_level = 0,
 	.qos.qos_port = 3,
+	.qos.aux_qos_port = 4,
 	.num_links = ARRAY_SIZE(mas_mnoc_bimc_common_links),
 	.links = mas_mnoc_bimc_common_links
 };

@@ -47,6 +47,7 @@ enum sec_device_type {
 	S2MPS15X,
 	S2MPU02,
 	S2MPU05,
+	S2MU005,
 };
 
 /**
@@ -105,7 +106,7 @@ struct sec_platform_data {
 /**
  * sec_regulator_data - regulator data
  * @id: regulator id
- * @initdata: regulator init data (contraints, supplies, ...)
+ * @initdata: regulator init data (constraints, supplies, ...)
  */
 struct sec_regulator_data {
 	int				id;

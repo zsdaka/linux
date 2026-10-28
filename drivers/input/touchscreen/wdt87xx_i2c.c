@@ -1140,14 +1140,14 @@ static int wdt87xx_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(wdt87xx_pm_ops, wdt87xx_suspend, wdt87xx_resume);
 
 static const struct i2c_device_id wdt87xx_dev_id[] = {
-	{ WDT87XX_NAME },
+	{ .name = WDT87XX_NAME },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, wdt87xx_dev_id);
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id wdt87xx_acpi_id[] = {
-	{ "WDHT0001", 0 },
+	{ .id = "WDHT0001" },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, wdt87xx_acpi_id);

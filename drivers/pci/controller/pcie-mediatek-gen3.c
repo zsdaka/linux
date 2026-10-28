@@ -7,6 +7,8 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/bitops.h>
+#include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
@@ -30,6 +32,7 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 
+#include "pci-host-common.h"
 #include "../pci.h"
 
 #define PCIE_BASE_CFG_REG		0x14
@@ -62,6 +65,12 @@
 #define PCIE_PHY_RSTB			BIT(1)
 #define PCIE_BRG_RSTB			BIT(2)
 #define PCIE_PE_RSTB			BIT(3)
+
+/*
+ * As described in the datasheet of MediaTek PCIe Gen3 controller, wait 10ms
+ * after setting PCIE_BRG_RSTB, and before accessing PCIe internal registers.
+ */
+#define PCIE_BRG_RST_RDY_MS		10
 
 #define PCIE_LTSSM_STATUS_REG		0x150
 #define PCIE_LTSSM_STATE_MASK		GENMASK(28, 24)
@@ -327,10 +336,10 @@ static int mtk_pcie_set_trans_table(struct mtk_gen3_pcie *pcie,
 
 	while (remaining && (*num < PCIE_MAX_TRANS_TABLES)) {
 		/* Table size needs to be a power of 2 */
-		table_size = BIT(fls(remaining) - 1);
+		table_size = BIT_ULL(fls64(remaining) - 1);
 
 		if (cpu_addr > 0) {
-			addr_align = BIT(ffs(cpu_addr) - 1);
+			addr_align = BIT_ULL(__ffs64(cpu_addr));
 			table_size = min(table_size, addr_align);
 		}
 
@@ -342,7 +351,8 @@ static int mtk_pcie_set_trans_table(struct mtk_gen3_pcie *pcie,
 		}
 
 		table = pcie->base + PCIE_TRANS_TABLE_BASE_REG + *num * PCIE_ATR_TLB_SET_OFFSET;
-		writel_relaxed(lower_32_bits(cpu_addr) | PCIE_ATR_SIZE(fls(table_size) - 1), table);
+		writel_relaxed(lower_32_bits(cpu_addr) |
+		PCIE_ATR_SIZE(fls64(table_size) - 1), table);
 		writel_relaxed(upper_32_bits(cpu_addr), table + PCIE_ATR_SRC_ADDR_MSB_OFFSET);
 		writel_relaxed(lower_32_bits(pci_addr), table + PCIE_ATR_TRSL_ADDR_LSB_OFFSET);
 		writel_relaxed(upper_32_bits(pci_addr), table + PCIE_ATR_TRSL_ADDR_MSB_OFFSET);
@@ -368,9 +378,11 @@ static int mtk_pcie_set_trans_table(struct mtk_gen3_pcie *pcie,
 		(*num)++;
 	}
 
-	if (remaining)
-		dev_warn(pcie->dev, "not enough translate table for addr: %#llx, limited to [%d]\n",
+	if (remaining) {
+		dev_err(pcie->dev, "not enough translate table for addr: %#llx, limited to [%d]\n",
 			 (unsigned long long)cpu_addr, PCIE_MAX_TRANS_TABLES);
+		return -ENOMEM;
+	}
 
 	return 0;
 }
@@ -431,6 +443,21 @@ static int mtk_pcie_devices_power_up(struct mtk_gen3_pcie *pcie)
 	}
 
 	/*
+	 * Some of MediaTek's chips won't output REFCLK when PCIE_PHY_RSTB is
+	 * asserted, we have to de-assert MAC & PHY & BRG reset signals first
+	 * to allow the REFCLK to be stable. While PCIE_BRG_RSTB is asserted,
+	 * there is a short period during which the PCIe internal register
+	 * cannot be accessed, so we need to wait 10ms here.
+	 */
+	msleep(PCIE_BRG_RST_RDY_MS);
+
+	if (!(pcie->soc->flags & SKIP_PCIE_RSTB)) {
+		/* De-assert MAC, PHY and BRG reset signals */
+		val &= ~(PCIE_MAC_RSTB | PCIE_PHY_RSTB | PCIE_BRG_RSTB);
+		writel_relaxed(val, pcie->base + PCIE_RST_CTRL_REG);
+	}
+
+	/*
 	 * Described in PCIe CEM specification revision 6.0.
 	 *
 	 * The deassertion of PERST# should be delayed 100ms (TPVPERL)
@@ -439,9 +466,8 @@ static int mtk_pcie_devices_power_up(struct mtk_gen3_pcie *pcie)
 	msleep(PCIE_T_PVPERL_MS);
 
 	if (!(pcie->soc->flags & SKIP_PCIE_RSTB)) {
-		/* De-assert reset signals */
-		val &= ~(PCIE_MAC_RSTB | PCIE_PHY_RSTB | PCIE_BRG_RSTB |
-			 PCIE_PE_RSTB);
+		/* De-assert PERST# signal */
+		val &= ~PCIE_PE_RSTB;
 		writel_relaxed(val, pcie->base + PCIE_RST_CTRL_REG);
 	}
 
@@ -494,8 +520,7 @@ static int mtk_pcie_startup_port(struct mtk_gen3_pcie *pcie)
 	/* Set Link Control 2 (LNKCTL2) speed restriction, if any */
 	if (pcie->max_link_speed) {
 		val = readl_relaxed(pcie->base + PCIE_CONF_LINK2_CTL_STS);
-		val &= ~PCIE_CONF_LINK2_LCR2_LINK_SPEED;
-		val |= FIELD_PREP(PCIE_CONF_LINK2_LCR2_LINK_SPEED, pcie->max_link_speed);
+		FIELD_MODIFY(PCIE_CONF_LINK2_LCR2_LINK_SPEED, &val, pcie->max_link_speed);
 		writel_relaxed(val, pcie->base + PCIE_CONF_LINK2_CTL_STS);
 	}
 
@@ -569,6 +594,8 @@ static int mtk_pcie_startup_port(struct mtk_gen3_pcie *pcie)
 			ltssm_state, val);
 		goto err_power_down_device;
 	}
+
+	pci_host_common_link_train_delay(pcie->max_link_speed);
 
 	return 0;
 
@@ -1222,8 +1249,8 @@ static int mtk_pcie_probe(struct platform_device *pdev)
 
 	err = pci_pwrctrl_create_devices(pcie->dev);
 	if (err) {
-		goto err_tear_down_irq;
 		dev_err_probe(dev, err, "failed to create pwrctrl devices\n");
+		goto err_tear_down_irq;
 	}
 
 	err = mtk_pcie_setup(pcie);
@@ -1260,10 +1287,18 @@ static void mtk_pcie_remove(struct platform_device *pdev)
 	pci_remove_root_bus(host->bus);
 	pci_unlock_rescan_remove();
 
-	pci_pwrctrl_power_off_devices(pcie->dev);
+	mtk_pcie_devices_power_down(pcie);
 	mtk_pcie_power_down(pcie);
 	pci_pwrctrl_destroy_devices(pcie->dev);
 	mtk_pcie_irq_teardown(pcie);
+}
+
+static void mtk_pcie_shutdown(struct platform_device *pdev)
+{
+	struct mtk_gen3_pcie *pcie = platform_get_drvdata(pdev);
+
+	mtk_pcie_devices_power_down(pcie);
+	mtk_pcie_power_down(pcie);
 }
 
 static void mtk_pcie_irq_save(struct mtk_gen3_pcie *pcie)
@@ -1404,6 +1439,7 @@ MODULE_DEVICE_TABLE(of, mtk_pcie_of_match);
 static struct platform_driver mtk_pcie_driver = {
 	.probe = mtk_pcie_probe,
 	.remove = mtk_pcie_remove,
+	.shutdown = mtk_pcie_shutdown,
 	.driver = {
 		.name = "mtk-pcie-gen3",
 		.of_match_table = mtk_pcie_of_match,

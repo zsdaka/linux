@@ -23,7 +23,6 @@
 #include <linux/kernel.h>
 #include <linux/memregion.h>
 #include <linux/module.h>
-#include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 
@@ -171,7 +170,7 @@ static void hisi_soc_hha_remove(struct platform_device *pdev)
 }
 
 static const struct acpi_device_id hisi_soc_hha_ids[] = {
-	{ "HISI0511", },
+	{ .id = "HISI0511" },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, hisi_soc_hha_ids);

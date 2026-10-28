@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/slab.h>
+#include <linux/async.h>
 #include <linux/err.h>
 #include <linux/crc32.h>
 #include <linux/nvme-tcp.h>
@@ -54,7 +55,132 @@ MODULE_PARM_DESC(tls_handshake_timeout,
 		 "nvme TLS handshake timeout in seconds (default 10)");
 #endif
 
-static atomic_t nvme_tcp_cpu_queues[NR_CPUS];
+static int nvme_tcp_cpu_queues[NR_CPUS];
+static DEFINE_SPINLOCK(nvme_tcp_cpu_queues_lock);
+
+enum nvme_tcp_send_state {
+	NVME_TCP_SEND_CMD_PDU = 0,
+	NVME_TCP_SEND_H2C_PDU,
+	NVME_TCP_SEND_DATA,
+	NVME_TCP_SEND_DDGST,
+};
+
+struct nvme_tcp_request {
+	struct nvme_request	req;
+	void			*pdu;
+	struct nvme_tcp_queue	*queue;
+	u32			data_len;
+	u32			pdu_len;
+	u32			pdu_sent;
+	u32			h2cdata_left;
+	u32			h2cdata_offset;
+	u16			ttag;
+	__le16			status;
+	struct list_head	entry;
+	struct llist_node	lentry;
+	__le32			ddgst;
+
+	struct bio		*curr_bio;
+	struct iov_iter		iter;
+	u32			data_recvd;
+
+	/* send state */
+	size_t			offset;
+	size_t			data_sent;
+	enum nvme_tcp_send_state state;
+};
+
+enum nvme_tcp_queue_flags {
+	NVME_TCP_Q_ALLOCATED	= 0,
+	NVME_TCP_Q_LIVE		= 1,
+	NVME_TCP_Q_POLLING	= 2,
+	NVME_TCP_Q_IO_CPU_SET	= 3,
+};
+
+enum nvme_tcp_recv_state {
+	NVME_TCP_RECV_PDU = 0,
+	NVME_TCP_RECV_DATA,
+	NVME_TCP_RECV_DDGST,
+};
+
+struct nvme_tcp_ctrl;
+struct nvme_tcp_queue {
+	struct socket		*sock;
+	struct work_struct	io_work;
+	int			io_cpu;
+
+	struct mutex		queue_lock;
+	struct mutex		send_mutex;
+	struct mutex		pf_cache_lock;
+	struct llist_head	req_list;
+	struct list_head	send_list;
+
+	/* recv state */
+	void			*pdu;
+	int			pdu_remaining;
+	int			pdu_offset;
+	size_t			data_remaining;
+	size_t			ddgst_remaining;
+	unsigned int		nr_cqe;
+
+	/* send state */
+	struct nvme_tcp_request *request;
+
+	u32			maxh2cdata;
+	size_t			cmnd_capsule_len;
+	struct nvme_tcp_ctrl	*ctrl;
+	unsigned long		flags;
+	bool			rd_enabled;
+
+	bool			hdr_digest;
+	bool			data_digest;
+	bool			tls_enabled;
+	u32			rcv_crc;
+	u32			snd_crc;
+	__le32			exp_ddgst;
+	__le32			recv_ddgst;
+	struct completion       tls_complete;
+	int                     tls_err;
+	struct page_frag_cache	pf_cache;
+
+	void (*state_change)(struct sock *);
+	void (*data_ready)(struct sock *);
+	void (*write_space)(struct sock *);
+};
+
+static DEFINE_MUTEX(nvme_tcp_ctrl_mutex);
+static LIST_HEAD_GUARDED(nvme_tcp_ctrl_list, nvme_tcp_ctrl_mutex);
+
+struct nvme_tcp_queue_setup_ctx {
+	struct nvme_ctrl	*ctrl;
+	int			qid;
+	int			*err;
+};
+
+struct nvme_tcp_ctrl {
+	/* read only in the hot path */
+	struct nvme_tcp_queue	*queues;
+	struct blk_mq_tag_set	tag_set;
+
+	/* other member variables */
+	struct list_head	list
+		__guarded_by(&nvme_tcp_ctrl_mutex);
+	struct blk_mq_tag_set	admin_tag_set;
+	struct sockaddr_storage addr;
+	struct sockaddr_storage src_addr;
+	struct nvme_ctrl	ctrl;
+
+	struct work_struct	err_work;
+	struct delayed_work	connect_work;
+	struct nvme_tcp_request async_req;
+	u32			io_queues[HCTX_MAX_TYPES];
+	struct net		*net;
+};
+
+static struct workqueue_struct *nvme_tcp_wq;
+static const struct blk_mq_ops nvme_tcp_mq_ops;
+static const struct blk_mq_ops nvme_tcp_admin_mq_ops;
+static int nvme_tcp_try_send(struct nvme_tcp_queue *queue);
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 /* lockdep can detect a circular dependency of the form
@@ -93,119 +219,6 @@ static void nvme_tcp_reclassify_socket(struct socket *sock)
 #else
 static void nvme_tcp_reclassify_socket(struct socket *sock) { }
 #endif
-
-enum nvme_tcp_send_state {
-	NVME_TCP_SEND_CMD_PDU = 0,
-	NVME_TCP_SEND_H2C_PDU,
-	NVME_TCP_SEND_DATA,
-	NVME_TCP_SEND_DDGST,
-};
-
-struct nvme_tcp_request {
-	struct nvme_request	req;
-	void			*pdu;
-	struct nvme_tcp_queue	*queue;
-	u32			data_len;
-	u32			pdu_len;
-	u32			pdu_sent;
-	u32			h2cdata_left;
-	u32			h2cdata_offset;
-	u16			ttag;
-	__le16			status;
-	struct list_head	entry;
-	struct llist_node	lentry;
-	__le32			ddgst;
-
-	struct bio		*curr_bio;
-	struct iov_iter		iter;
-
-	/* send state */
-	size_t			offset;
-	size_t			data_sent;
-	enum nvme_tcp_send_state state;
-};
-
-enum nvme_tcp_queue_flags {
-	NVME_TCP_Q_ALLOCATED	= 0,
-	NVME_TCP_Q_LIVE		= 1,
-	NVME_TCP_Q_POLLING	= 2,
-	NVME_TCP_Q_IO_CPU_SET	= 3,
-};
-
-enum nvme_tcp_recv_state {
-	NVME_TCP_RECV_PDU = 0,
-	NVME_TCP_RECV_DATA,
-	NVME_TCP_RECV_DDGST,
-};
-
-struct nvme_tcp_ctrl;
-struct nvme_tcp_queue {
-	struct socket		*sock;
-	struct work_struct	io_work;
-	int			io_cpu;
-
-	struct mutex		queue_lock;
-	struct mutex		send_mutex;
-	struct llist_head	req_list;
-	struct list_head	send_list;
-
-	/* recv state */
-	void			*pdu;
-	int			pdu_remaining;
-	int			pdu_offset;
-	size_t			data_remaining;
-	size_t			ddgst_remaining;
-	unsigned int		nr_cqe;
-
-	/* send state */
-	struct nvme_tcp_request *request;
-
-	u32			maxh2cdata;
-	size_t			cmnd_capsule_len;
-	struct nvme_tcp_ctrl	*ctrl;
-	unsigned long		flags;
-	bool			rd_enabled;
-
-	bool			hdr_digest;
-	bool			data_digest;
-	bool			tls_enabled;
-	u32			rcv_crc;
-	u32			snd_crc;
-	__le32			exp_ddgst;
-	__le32			recv_ddgst;
-	struct completion       tls_complete;
-	int                     tls_err;
-	struct page_frag_cache	pf_cache;
-
-	void (*state_change)(struct sock *);
-	void (*data_ready)(struct sock *);
-	void (*write_space)(struct sock *);
-};
-
-struct nvme_tcp_ctrl {
-	/* read only in the hot path */
-	struct nvme_tcp_queue	*queues;
-	struct blk_mq_tag_set	tag_set;
-
-	/* other member variables */
-	struct list_head	list;
-	struct blk_mq_tag_set	admin_tag_set;
-	struct sockaddr_storage addr;
-	struct sockaddr_storage src_addr;
-	struct nvme_ctrl	ctrl;
-
-	struct work_struct	err_work;
-	struct delayed_work	connect_work;
-	struct nvme_tcp_request async_req;
-	u32			io_queues[HCTX_MAX_TYPES];
-};
-
-static LIST_HEAD(nvme_tcp_ctrl_list);
-static DEFINE_MUTEX(nvme_tcp_ctrl_mutex);
-static struct workqueue_struct *nvme_tcp_wq;
-static const struct blk_mq_ops nvme_tcp_mq_ops;
-static const struct blk_mq_ops nvme_tcp_admin_mq_ops;
-static int nvme_tcp_try_send(struct nvme_tcp_queue *queue);
 
 static inline struct nvme_tcp_ctrl *to_tcp_ctrl(struct nvme_ctrl *ctrl)
 {
@@ -340,32 +353,25 @@ static void nvme_tcp_init_iter(struct nvme_tcp_request *req,
 		unsigned int dir)
 {
 	struct request *rq = blk_mq_rq_from_pdu(req);
-	struct bio_vec *vec;
-	unsigned int size;
-	int nr_bvec;
-	size_t offset;
 
 	if (rq->rq_flags & RQF_SPECIAL_PAYLOAD) {
-		vec = &rq->special_vec;
-		nr_bvec = 1;
-		size = blk_rq_payload_bytes(rq);
-		offset = 0;
+		iov_iter_bvec(&req->iter, dir, &rq->special_vec, 1,
+				blk_rq_payload_bytes(rq));
+		req->iter.iov_offset = 0;
 	} else {
 		struct bio *bio = req->curr_bio;
 		struct bvec_iter bi;
 		struct bio_vec bv;
+		int nr_bvec = 0;
 
-		vec = __bvec_iter_bvec(bio->bi_io_vec, bio->bi_iter);
-		nr_bvec = 0;
-		bio_for_each_bvec(bv, bio, bi) {
+		bio_for_each_bvec(bv, bio, bi)
 			nr_bvec++;
-		}
-		size = bio->bi_iter.bi_size;
-		offset = bio->bi_iter.bi_bvec_done;
-	}
 
-	iov_iter_bvec(&req->iter, dir, vec, nr_bvec, size);
-	req->iter.iov_offset = offset;
+		iov_iter_bvec(&req->iter, dir,
+			__bvec_iter_bvec(bio->bi_io_vec, bio->bi_iter), nr_bvec,
+			bio->bi_iter.bi_size);
+		req->iter.iov_offset = bio->bi_iter.bi_offset;
+	}
 }
 
 static inline void nvme_tcp_advance_req(struct nvme_tcp_request *req,
@@ -416,8 +422,13 @@ static inline void nvme_tcp_queue_request(struct nvme_tcp_request *req,
 	 * if we're the first on the send_list and we can try to send
 	 * directly, otherwise queue io_work. Also, only do that if we
 	 * are on the same cpu, so we don't introduce contention.
+	 *
+	 * TLS kTLS send takes ctx->tx_lock while blk_mq holds set->srcu.
+	 * lockdep reports circular locking via elevator_lock.  Defer TLS
+	 * sends to the io workqueue instead of inline from this path.
 	 */
 	if (queue->io_cpu == raw_smp_processor_id() &&
+	    !nvme_tcp_queue_tls(queue) &&
 	    empty && mutex_trylock(&queue->send_mutex)) {
 		nvme_tcp_send_all(queue);
 		mutex_unlock(&queue->send_mutex);
@@ -548,7 +559,7 @@ static void nvme_tcp_exit_request(struct blk_mq_tag_set *set,
 
 static int nvme_tcp_init_request(struct blk_mq_tag_set *set,
 		struct request *rq, unsigned int hctx_idx,
-		unsigned int numa_node)
+		int numa_node)
 {
 	struct nvme_tcp_ctrl *ctrl = to_tcp_ctrl(set->driver_data);
 	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
@@ -557,9 +568,11 @@ static int nvme_tcp_init_request(struct blk_mq_tag_set *set,
 	struct nvme_tcp_queue *queue = &ctrl->queues[queue_idx];
 	u8 hdgst = nvme_tcp_hdgst_len(queue);
 
+	mutex_lock(&queue->pf_cache_lock);
 	req->pdu = page_frag_alloc(&queue->pf_cache,
 		sizeof(struct nvme_tcp_cmd_pdu) + hdgst,
 		GFP_KERNEL | __GFP_ZERO);
+	mutex_unlock(&queue->pf_cache_lock);
 	if (!req->pdu)
 		return -ENOMEM;
 
@@ -619,6 +632,29 @@ static void nvme_tcp_error_recovery(struct nvme_ctrl *ctrl)
 	queue_work(nvme_reset_wq, &to_tcp_ctrl(ctrl)->err_work);
 }
 
+/*
+ * NVMe has no short read: a read that completes successfully must
+ * have transferred everything it asked for.
+ */
+static bool nvme_tcp_data_in_short(struct nvme_tcp_queue *queue,
+				   struct request *rq)
+{
+	struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
+
+	if (le16_to_cpu(req->status) >> 1)
+		return false;
+	if (req_op(rq) != REQ_OP_READ || !req->data_len)
+		return false;
+	if (likely(req->data_recvd == req->data_len))
+		return false;
+
+	dev_err(queue->ctrl->ctrl.device,
+		"queue %d tag %#x short data-in: got %u of %u\n",
+		nvme_tcp_queue_id(queue), rq->tag,
+		req->data_recvd, req->data_len);
+	return true;
+}
+
 static int nvme_tcp_process_nvme_cqe(struct nvme_tcp_queue *queue,
 		struct nvme_completion *cqe)
 {
@@ -638,6 +674,9 @@ static int nvme_tcp_process_nvme_cqe(struct nvme_tcp_queue *queue,
 	if (req->status == cpu_to_le16(NVME_SC_SUCCESS))
 		req->status = cqe->status;
 
+	if (unlikely(nvme_tcp_data_in_short(queue, rq)))
+		return -EPROTO;
+
 	if (!nvme_try_complete_req(rq, req->status, cqe->result))
 		nvme_complete_rq(rq);
 	queue->nr_cqe++;
@@ -648,6 +687,7 @@ static int nvme_tcp_process_nvme_cqe(struct nvme_tcp_queue *queue,
 static int nvme_tcp_handle_c2h_data(struct nvme_tcp_queue *queue,
 		struct nvme_tcp_data_pdu *pdu)
 {
+	struct nvme_tcp_request *req;
 	struct request *rq;
 
 	rq = nvme_find_rq(nvme_tcp_tagset(queue), pdu->command_id);
@@ -658,7 +698,15 @@ static int nvme_tcp_handle_c2h_data(struct nvme_tcp_queue *queue,
 		return -ENOENT;
 	}
 
-	if (!blk_rq_payload_bytes(rq)) {
+	if (rq_data_dir(rq) != READ) {
+		dev_err(queue->ctrl->ctrl.device,
+			"queue %d tag %#x unexpected data for a write\n",
+			nvme_tcp_queue_id(queue), rq->tag);
+		return -EPROTO;
+	}
+
+	req = blk_mq_rq_to_pdu(rq);
+	if (!blk_rq_payload_bytes(rq) || !req->curr_bio || !req->data_len) {
 		dev_err(queue->ctrl->ctrl.device,
 			"queue %d tag %#x unexpected data\n",
 			nvme_tcp_queue_id(queue), rq->tag);
@@ -751,6 +799,13 @@ static int nvme_tcp_handle_r2t(struct nvme_tcp_queue *queue,
 		return -ENOENT;
 	}
 	req = blk_mq_rq_to_pdu(rq);
+
+	if (unlikely(rq_data_dir(rq) != WRITE)) {
+		dev_err(queue->ctrl->ctrl.device,
+			"req %d unexpected r2t for a non-write command\n",
+			rq->tag);
+		return -EPROTO;
+	}
 
 	if (unlikely(!r2t_length)) {
 		dev_err(queue->ctrl->ctrl.device,
@@ -960,6 +1015,7 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 		*len -= recv_len;
 		*offset += recv_len;
 		queue->data_remaining -= recv_len;
+		req->data_recvd += recv_len;
 	}
 
 	if (!queue->data_remaining) {
@@ -968,6 +1024,8 @@ static int nvme_tcp_recv_data(struct nvme_tcp_queue *queue, struct sk_buff *skb,
 			queue->ddgst_remaining = NVME_TCP_DIGEST_LENGTH;
 		} else {
 			if (pdu->hdr.flags & NVME_TCP_F_DATA_SUCCESS) {
+				if (unlikely(nvme_tcp_data_in_short(queue, rq)))
+					return -EPROTO;
 				nvme_tcp_end_request(rq,
 						le16_to_cpu(req->status));
 				queue->nr_cqe++;
@@ -1015,6 +1073,9 @@ static int nvme_tcp_recv_ddgst(struct nvme_tcp_queue *queue,
 		struct request *rq = nvme_cid_to_rq(nvme_tcp_tagset(queue),
 					pdu->command_id);
 		struct nvme_tcp_request *req = blk_mq_rq_to_pdu(rq);
+
+		if (unlikely(nvme_tcp_data_in_short(queue, rq)))
+			return -EPROTO;
 
 		nvme_tcp_end_request(rq, le16_to_cpu(req->status));
 		queue->nr_cqe++;
@@ -1081,7 +1142,7 @@ static void nvme_tcp_write_space(struct sock *sk)
 	read_lock_bh(&sk->sk_callback_lock);
 	queue = sk->sk_user_data;
 	if (likely(queue && sk_stream_is_writeable(sk))) {
-		clear_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+		sk_clear_nospace(sk);
 		/* Ensure pending TLS partial records are retried */
 		if (nvme_tcp_queue_tls(queue))
 			queue->write_space(sk);
@@ -1424,9 +1485,11 @@ static int nvme_tcp_alloc_async_req(struct nvme_tcp_ctrl *ctrl)
 	struct nvme_tcp_request *async = &ctrl->async_req;
 	u8 hdgst = nvme_tcp_hdgst_len(queue);
 
+	mutex_lock(&queue->pf_cache_lock);
 	async->pdu = page_frag_alloc(&queue->pf_cache,
 		sizeof(struct nvme_tcp_cmd_pdu) + hdgst,
 		GFP_KERNEL | __GFP_ZERO);
+	mutex_unlock(&queue->pf_cache_lock);
 	if (!async->pdu)
 		return -ENOMEM;
 
@@ -1468,6 +1531,7 @@ static void nvme_tcp_free_queue(struct nvme_ctrl *nctrl, int qid)
 	kfree(queue->pdu);
 	mutex_destroy(&queue->send_mutex);
 	mutex_destroy(&queue->queue_lock);
+	mutex_destroy(&queue->pf_cache_lock);
 }
 
 static int nvme_tcp_init_connection(struct nvme_tcp_queue *queue)
@@ -1670,9 +1734,10 @@ static void nvme_tcp_set_queue_io_cpu(struct nvme_tcp_queue *queue)
 		goto out;
 
 	/* Search for the least used cpu from the mq_map */
+	spin_lock(&nvme_tcp_cpu_queues_lock);
 	io_cpu = WORK_CPU_UNBOUND;
 	for_each_online_cpu(cpu) {
-		int num_queues = atomic_read(&nvme_tcp_cpu_queues[cpu]);
+		int num_queues = nvme_tcp_cpu_queues[cpu];
 
 		if (mq_map[cpu] != qid)
 			continue;
@@ -1683,9 +1748,10 @@ static void nvme_tcp_set_queue_io_cpu(struct nvme_tcp_queue *queue)
 	}
 	if (io_cpu != WORK_CPU_UNBOUND) {
 		queue->io_cpu = io_cpu;
-		atomic_inc(&nvme_tcp_cpu_queues[io_cpu]);
+		nvme_tcp_cpu_queues[io_cpu]++;
 		set_bit(NVME_TCP_Q_IO_CPU_SET, &queue->flags);
 	}
+	spin_unlock(&nvme_tcp_cpu_queues_lock);
 out:
 	dev_dbg(ctrl->ctrl.device, "queue %d: using cpu %d\n",
 		qid, queue->io_cpu);
@@ -1790,6 +1856,7 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 	INIT_LIST_HEAD(&queue->send_list);
 	mutex_init(&queue->send_mutex);
 	INIT_WORK(&queue->io_work, nvme_tcp_io_work);
+	mutex_init(&queue->pf_cache_lock);
 
 	if (qid > 0)
 		queue->cmnd_capsule_len = nctrl->ioccsz * 16;
@@ -1797,7 +1864,7 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 		queue->cmnd_capsule_len = sizeof(struct nvme_command) +
 						NVME_TCP_ADMIN_CCSZ;
 
-	ret = sock_create_kern(current->nsproxy->net_ns,
+	ret = sock_create_kern(ctrl->net,
 			ctrl->addr.ss_family, SOCK_STREAM,
 			IPPROTO_TCP, &queue->sock);
 	if (ret) {
@@ -1813,7 +1880,6 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 	}
 
 	sk_net_refcnt_upgrade(queue->sock->sk);
-	nvme_tcp_reclassify_socket(queue->sock);
 
 	/* Single syn retry */
 	tcp_sock_set_syncnt(queue->sock->sk, 1);
@@ -1902,6 +1968,8 @@ static int nvme_tcp_alloc_queue(struct nvme_ctrl *nctrl, int qid,
 			goto err_init_connect;
 	}
 
+	nvme_tcp_reclassify_socket(queue->sock);
+
 	ret = nvme_tcp_init_connection(queue);
 	if (ret)
 		goto err_init_connect;
@@ -1921,6 +1989,7 @@ err_sock:
 err_destroy_mutex:
 	mutex_destroy(&queue->send_mutex);
 	mutex_destroy(&queue->queue_lock);
+	mutex_destroy(&queue->pf_cache_lock);
 	return ret;
 }
 
@@ -1951,8 +2020,11 @@ static void nvme_tcp_stop_queue_nowait(struct nvme_ctrl *nctrl, int qid)
 	if (!test_bit(NVME_TCP_Q_ALLOCATED, &queue->flags))
 		return;
 
-	if (test_and_clear_bit(NVME_TCP_Q_IO_CPU_SET, &queue->flags))
-		atomic_dec(&nvme_tcp_cpu_queues[queue->io_cpu]);
+	if (test_and_clear_bit(NVME_TCP_Q_IO_CPU_SET, &queue->flags)) {
+		spin_lock(&nvme_tcp_cpu_queues_lock);
+		nvme_tcp_cpu_queues[queue->io_cpu]--;
+		spin_unlock(&nvme_tcp_cpu_queues_lock);
+	}
 
 	mutex_lock(&queue->queue_lock);
 	if (test_and_clear_bit(NVME_TCP_Q_LIVE, &queue->flags))
@@ -2059,25 +2131,6 @@ static void nvme_tcp_stop_io_queues(struct nvme_ctrl *ctrl)
 		nvme_tcp_wait_queue(ctrl, i);
 }
 
-static int nvme_tcp_start_io_queues(struct nvme_ctrl *ctrl,
-				    int first, int last)
-{
-	int i, ret;
-
-	for (i = first; i < last; i++) {
-		ret = nvme_tcp_start_queue(ctrl, i);
-		if (ret)
-			goto out_stop_queues;
-	}
-
-	return 0;
-
-out_stop_queues:
-	for (i--; i >= first; i--)
-		nvme_tcp_stop_queue(ctrl, i);
-	return ret;
-}
-
 static int nvme_tcp_alloc_admin_queue(struct nvme_ctrl *ctrl)
 {
 	int ret;
@@ -2112,10 +2165,8 @@ out_free_queue:
 	return ret;
 }
 
-static int __nvme_tcp_alloc_io_queues(struct nvme_ctrl *ctrl)
+static int nvme_tcp_tls_check_psk(struct nvme_ctrl *ctrl)
 {
-	int i, ret;
-
 	if (nvme_tcp_tls_configured(ctrl)) {
 		if (ctrl->opts->concat) {
 			/*
@@ -2137,23 +2188,75 @@ static int __nvme_tcp_alloc_io_queues(struct nvme_ctrl *ctrl)
 		}
 	}
 
-	for (i = 1; i < ctrl->queue_count; i++) {
-		ret = nvme_tcp_alloc_queue(ctrl, i,
-				ctrl->tls_pskid);
-		if (ret)
-			goto out_free_queues;
+	return 0;
+}
+
+static void nvme_tcp_setup_queue_async(void *data, async_cookie_t cookie)
+{
+	struct nvme_tcp_queue_setup_ctx *ctx = data;
+	struct nvme_ctrl *ctrl = ctx->ctrl;
+	int ret;
+
+	ret = nvme_tcp_alloc_queue(ctrl, ctx->qid, ctrl->tls_pskid);
+	if (ret)
+		goto out_err;
+
+	ret = nvme_tcp_start_queue(ctrl, ctx->qid);
+	if (ret)
+		goto out_err;
+
+	return;
+
+out_err:
+	WRITE_ONCE(*ctx->err, ret);
+}
+
+static int nvme_tcp_setup_io_queues(struct nvme_ctrl *ctrl, unsigned int first,
+		unsigned int last)
+{
+	ASYNC_DOMAIN_EXCLUSIVE(queue_domain);
+	struct nvme_tcp_queue_setup_ctx *ctxs;
+	int nr_queues = last - first;
+	int err = 0, i, ret;
+
+	if (first >= last)
+		return 0;
+
+	ctxs = kmalloc_objs(*ctxs, nr_queues);
+	if (!ctxs)
+		return -ENOMEM;
+
+	for (i = 0; i < nr_queues; i++) {
+		ctxs[i].ctrl = ctrl;
+		ctxs[i].qid = first + i;
+		ctxs[i].err = &err;
+		async_schedule_domain(nvme_tcp_setup_queue_async, &ctxs[i],
+				&queue_domain);
 	}
+
+	async_synchronize_full_domain(&queue_domain);
+	kfree(ctxs);
+
+	ret = READ_ONCE(err);
+	if (ret)
+		goto out_free_queues;
 
 	return 0;
 
 out_free_queues:
-	for (i--; i >= 1; i--)
-		nvme_tcp_free_queue(ctrl, i);
+	for (i = first; i < last; i++) {
+		struct nvme_tcp_queue *queue = &to_tcp_ctrl(ctrl)->queues[i];
+
+		if (test_bit(NVME_TCP_Q_LIVE, &queue->flags))
+			nvme_tcp_stop_queue(ctrl, i);
+		if (test_bit(NVME_TCP_Q_ALLOCATED, &queue->flags))
+			nvme_tcp_free_queue(ctrl, i);
+	}
 
 	return ret;
 }
 
-static int nvme_tcp_alloc_io_queues(struct nvme_ctrl *ctrl)
+static int nvme_tcp_set_io_queue_count(struct nvme_ctrl *ctrl)
 {
 	unsigned int nr_io_queues;
 	int ret;
@@ -2175,14 +2278,18 @@ static int nvme_tcp_alloc_io_queues(struct nvme_ctrl *ctrl)
 
 	nvmf_set_io_queues(ctrl->opts, nr_io_queues,
 			   to_tcp_ctrl(ctrl)->io_queues);
-	return __nvme_tcp_alloc_io_queues(ctrl);
+	return 0;
 }
 
 static int nvme_tcp_configure_io_queues(struct nvme_ctrl *ctrl, bool new)
 {
 	int ret, nr_queues;
 
-	ret = nvme_tcp_alloc_io_queues(ctrl);
+	ret = nvme_tcp_set_io_queue_count(ctrl);
+	if (ret)
+		return ret;
+
+	ret = nvme_tcp_tls_check_psk(ctrl);
 	if (ret)
 		return ret;
 
@@ -2196,19 +2303,19 @@ static int nvme_tcp_configure_io_queues(struct nvme_ctrl *ctrl, bool new)
 	}
 
 	/*
-	 * Only start IO queues for which we have allocated the tagset
+	 * Only setup IO queues for which we have allocated the tagset
 	 * and limited it to the available queues. On reconnects, the
 	 * queue number might have changed.
 	 */
 	nr_queues = min(ctrl->tagset->nr_hw_queues + 1, ctrl->queue_count);
-	ret = nvme_tcp_start_io_queues(ctrl, 1, nr_queues);
+	ret = nvme_tcp_setup_io_queues(ctrl, 1, nr_queues);
 	if (ret)
 		goto out_cleanup_connect_q;
 
 	if (!new) {
 		nvme_start_freeze(ctrl);
 		nvme_unquiesce_io_queues(ctrl);
-		if (!nvme_wait_freeze_timeout(ctrl, NVME_IO_TIMEOUT)) {
+		if (!nvme_wait_freeze_timeout(ctrl)) {
 			/*
 			 * If we timed out waiting for freeze we are likely to
 			 * be stuck.  Fail the controller initialization just
@@ -2225,9 +2332,9 @@ static int nvme_tcp_configure_io_queues(struct nvme_ctrl *ctrl, bool new)
 
 	/*
 	 * If the number of queues has increased (reconnect case)
-	 * start all new queues now.
+	 * setup all new queues now.
 	 */
-	ret = nvme_tcp_start_io_queues(ctrl, nr_queues,
+	ret = nvme_tcp_setup_io_queues(ctrl, nr_queues,
 				       ctrl->tagset->nr_hw_queues + 1);
 	if (ret)
 		goto out_wait_freeze_timed_out;
@@ -2475,6 +2582,8 @@ static void nvme_tcp_reconnect_ctrl_work(struct work_struct *work)
 	dev_info(ctrl->device, "Successfully reconnected (attempt %d/%d)\n",
 		 ctrl->nr_reconnects, ctrl->opts->max_reconnects);
 
+	/* accumulate reconnect attempts before resetting it to zero */
+	atomic_long_add(ctrl->nr_reconnects, &ctrl->acc_reconnects);
 	ctrl->nr_reconnects = 0;
 
 	return;
@@ -2568,7 +2677,7 @@ static void nvme_tcp_free_ctrl(struct nvme_ctrl *nctrl)
 {
 	struct nvme_tcp_ctrl *ctrl = to_tcp_ctrl(nctrl);
 
-	if (list_empty(&ctrl->list))
+	if (list_empty_careful(&ctrl->list))
 		goto free_ctrl;
 
 	mutex_lock(&nvme_tcp_ctrl_mutex);
@@ -2577,6 +2686,7 @@ static void nvme_tcp_free_ctrl(struct nvme_ctrl *nctrl)
 
 	nvmf_free_options(nctrl->opts);
 free_ctrl:
+	put_net(ctrl->net);
 	kfree(ctrl->queues);
 	kfree(ctrl);
 }
@@ -2727,6 +2837,7 @@ static blk_status_t nvme_tcp_setup_cmd_pdu(struct nvme_ns *ns,
 	req->status = cpu_to_le16(NVME_SC_SUCCESS);
 	req->offset = 0;
 	req->data_sent = 0;
+	req->data_recvd = 0;
 	req->pdu_len = 0;
 	req->pdu_sent = 0;
 	req->h2cdata_left = 0;
@@ -2910,7 +3021,10 @@ static struct nvme_tcp_ctrl *nvme_tcp_alloc_ctrl(struct device *dev,
 	if (!ctrl)
 		return ERR_PTR(-ENOMEM);
 
-	INIT_LIST_HEAD(&ctrl->list);
+	/*
+	 * Safe to init list while allocating ctrl object.
+	 */
+	context_unsafe(INIT_LIST_HEAD(&ctrl->list));
 	ctrl->ctrl.opts = opts;
 	ctrl->ctrl.queue_count = opts->nr_io_queues + opts->nr_write_queues +
 				opts->nr_poll_queues + 1;
@@ -2951,7 +3065,8 @@ static struct nvme_tcp_ctrl *nvme_tcp_alloc_ctrl(struct device *dev,
 	}
 
 	if (opts->mask & NVMF_OPT_HOST_IFACE) {
-		if (!__dev_get_by_name(&init_net, opts->host_iface)) {
+		if (!__dev_get_by_name(current->nsproxy->net_ns,
+				       opts->host_iface)) {
 			pr_err("invalid interface passed: %s\n",
 			       opts->host_iface);
 			ret = -ENODEV;
@@ -2970,12 +3085,15 @@ static struct nvme_tcp_ctrl *nvme_tcp_alloc_ctrl(struct device *dev,
 		goto out_free_ctrl;
 	}
 
+	ctrl->net = get_net(current->nsproxy->net_ns);
+
 	ret = nvme_init_ctrl(&ctrl->ctrl, dev, &nvme_tcp_ctrl_ops, 0);
 	if (ret)
 		goto out_kfree_queues;
 
 	return ctrl;
 out_kfree_queues:
+	put_net(ctrl->net);
 	kfree(ctrl->queues);
 out_free_ctrl:
 	kfree(ctrl);
@@ -3053,13 +3171,15 @@ static int __init nvme_tcp_init_module(void)
 
 	if (wq_unbound)
 		wq_flags |= WQ_UNBOUND;
+	else
+		wq_flags |= WQ_PERCPU;
 
 	nvme_tcp_wq = alloc_workqueue("nvme_tcp_wq", wq_flags, 0);
 	if (!nvme_tcp_wq)
 		return -ENOMEM;
 
 	for_each_possible_cpu(cpu)
-		atomic_set(&nvme_tcp_cpu_queues[cpu], 0);
+		nvme_tcp_cpu_queues[cpu] = 0;
 
 	nvmf_register_transport(&nvme_tcp_transport);
 	return 0;

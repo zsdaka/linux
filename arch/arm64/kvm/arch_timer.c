@@ -39,10 +39,9 @@ static const u8 default_ppi[] = {
 	[TIMER_HVTIMER] = 28,
 };
 
-static bool kvm_timer_irq_can_fire(struct arch_timer_context *timer_ctx);
 static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level,
 				 struct arch_timer_context *timer_ctx);
-static bool kvm_timer_should_fire(struct arch_timer_context *timer_ctx);
+static bool kvm_timer_pending(struct arch_timer_context *timer_ctx);
 static void kvm_arm_timer_write(struct kvm_vcpu *vcpu,
 				struct arch_timer_context *timer,
 				enum kvm_arch_timer_regs treg,
@@ -52,11 +51,17 @@ static u64 kvm_arm_timer_read(struct kvm_vcpu *vcpu,
 			      enum kvm_arch_timer_regs treg);
 static bool kvm_arch_timer_get_input_level(int vintid);
 
-static struct irq_ops arch_timer_irq_ops = {
+static unsigned long kvm_arch_timer_get_irq_flags(void)
+{
+	return kvm_vgic_global_state.no_hw_deactivation ? VGIC_IRQ_SW_RESAMPLE : 0;
+}
+
+static const struct irq_ops arch_timer_irq_ops = {
+	.get_flags	 = kvm_arch_timer_get_irq_flags,
 	.get_input_level = kvm_arch_timer_get_input_level,
 };
 
-static struct irq_ops arch_timer_irq_ops_vgic_v5 = {
+static const struct irq_ops arch_timer_irq_ops_vgic_v5 = {
 	.get_input_level = kvm_arch_timer_get_input_level,
 	.queue_irq_unlock = vgic_v5_ppi_queue_irq_unlock,
 	.set_direct_injection = vgic_v5_set_ppi_dvi,
@@ -224,7 +229,7 @@ static irqreturn_t kvm_arch_timer_handler(int irq, void *dev_id)
 	else
 		ctx = map.direct_ptimer;
 
-	if (kvm_timer_should_fire(ctx))
+	if (kvm_timer_pending(ctx))
 		kvm_timer_update_irq(vcpu, true, ctx);
 
 	if (userspace_irqchip(vcpu->kvm) &&
@@ -257,7 +262,7 @@ static u64 kvm_timer_compute_delta(struct arch_timer_context *timer_ctx)
 	return kvm_counter_compute_delta(timer_ctx, timer_get_cval(timer_ctx));
 }
 
-static bool kvm_timer_irq_can_fire(struct arch_timer_context *timer_ctx)
+static bool kvm_timer_enabled(struct arch_timer_context *timer_ctx)
 {
 	WARN_ON(timer_ctx && timer_ctx->loaded);
 	return timer_ctx &&
@@ -294,7 +299,7 @@ static u64 kvm_timer_earliest_exp(struct kvm_vcpu *vcpu)
 		struct arch_timer_context *ctx = &vcpu->arch.timer_cpu.timers[i];
 
 		WARN(ctx->loaded, "timer %d loaded\n", i);
-		if (kvm_timer_irq_can_fire(ctx))
+		if (kvm_timer_enabled(ctx))
 			min_delta = min(min_delta, kvm_timer_compute_delta(ctx));
 	}
 
@@ -358,7 +363,7 @@ static enum hrtimer_restart kvm_hrtimer_expire(struct hrtimer *hrt)
 	return HRTIMER_NORESTART;
 }
 
-static bool kvm_timer_should_fire(struct arch_timer_context *timer_ctx)
+static bool kvm_timer_pending(struct arch_timer_context *timer_ctx)
 {
 	enum kvm_arch_timers index;
 	u64 cval, now;
@@ -391,7 +396,7 @@ static bool kvm_timer_should_fire(struct arch_timer_context *timer_ctx)
 		       !(cnt_ctl & ARCH_TIMER_CTRL_IT_MASK);
 	}
 
-	if (!kvm_timer_irq_can_fire(timer_ctx))
+	if (!kvm_timer_enabled(timer_ctx))
 		return false;
 
 	cval = timer_get_cval(timer_ctx);
@@ -405,22 +410,30 @@ int kvm_cpu_has_pending_timer(struct kvm_vcpu *vcpu)
 	return vcpu_has_wfit_active(vcpu) && wfit_delay_ns(vcpu) == 0;
 }
 
+static u64 kvm_timer_needs_notify(struct kvm_vcpu *vcpu)
+{
+	u64 v = vcpu->run->s.regs.device_irq_level;
+
+	v ^= kvm_timer_pending(vcpu_vtimer(vcpu)) ? KVM_ARM_DEV_EL1_VTIMER : 0;
+	v ^= kvm_timer_pending(vcpu_ptimer(vcpu)) ? KVM_ARM_DEV_EL1_PTIMER : 0;
+
+	return v & (KVM_ARM_DEV_EL1_VTIMER | KVM_ARM_DEV_EL1_PTIMER);
+}
+
+bool kvm_timer_should_notify_user(struct kvm_vcpu *vcpu)
+{
+	return !!kvm_timer_needs_notify(vcpu);
+}
+
 /*
  * Reflect the timer output level into the kvm_run structure
  */
-void kvm_timer_update_run(struct kvm_vcpu *vcpu)
+bool kvm_timer_update_run(struct kvm_vcpu *vcpu)
 {
-	struct arch_timer_context *vtimer = vcpu_vtimer(vcpu);
-	struct arch_timer_context *ptimer = vcpu_ptimer(vcpu);
-	struct kvm_sync_regs *regs = &vcpu->run->s.regs;
-
-	/* Populate the device bitmap with the timer states */
-	regs->device_irq_level &= ~(KVM_ARM_DEV_EL1_VTIMER |
-				    KVM_ARM_DEV_EL1_PTIMER);
-	if (kvm_timer_should_fire(vtimer))
-		regs->device_irq_level |= KVM_ARM_DEV_EL1_VTIMER;
-	if (kvm_timer_should_fire(ptimer))
-		regs->device_irq_level |= KVM_ARM_DEV_EL1_PTIMER;
+	u64 mask = kvm_timer_needs_notify(vcpu);
+	if (mask)
+		vcpu->run->s.regs.device_irq_level ^= mask;
+	return !!mask;
 }
 
 static void kvm_timer_update_status(struct arch_timer_context *ctx, bool level)
@@ -446,9 +459,8 @@ static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level,
 {
 	kvm_timer_update_status(timer_ctx, new_level);
 
-	timer_ctx->irq.level = new_level;
 	trace_kvm_timer_update_irq(vcpu->vcpu_id, timer_irq(timer_ctx),
-				   timer_ctx->irq.level);
+				   new_level);
 
 	if (userspace_irqchip(vcpu->kvm))
 		return;
@@ -466,28 +478,25 @@ static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level,
 
 	kvm_vgic_inject_irq(vcpu->kvm, vcpu,
 			    timer_irq(timer_ctx),
-			    timer_ctx->irq.level,
+			    new_level,
 			    timer_ctx);
 }
 
 /* Only called for a fully emulated timer */
 static void timer_emulate(struct arch_timer_context *ctx)
 {
-	bool should_fire = kvm_timer_should_fire(ctx);
+	bool pending = kvm_timer_pending(ctx);
 
-	trace_kvm_timer_emulate(ctx, should_fire);
+	trace_kvm_timer_emulate(ctx, pending);
 
-	if (should_fire != ctx->irq.level)
-		kvm_timer_update_irq(timer_context_to_vcpu(ctx), should_fire, ctx);
-
-	kvm_timer_update_status(ctx, should_fire);
+	kvm_timer_update_irq(timer_context_to_vcpu(ctx), pending, ctx);
 
 	/*
-	 * If the timer can fire now, we don't need to have a soft timer
-	 * scheduled for the future.  If the timer cannot fire at all,
-	 * then we also don't need a soft timer.
+	 * If the timer is pending, we don't need to have a soft timer
+	 * scheduled for the future.  If the timer is disabled, then
+	 * we don't need a soft timer either.
 	 */
-	if (should_fire || !kvm_timer_irq_can_fire(ctx))
+	if (pending || !kvm_timer_enabled(ctx))
 		return;
 
 	soft_timer_start(&ctx->hrtimer, kvm_timer_compute_delta(ctx));
@@ -519,17 +528,11 @@ static void timer_save_state(struct arch_timer_context *ctx)
 		goto out;
 
 	switch (index) {
-		u64 cval;
-
 	case TIMER_VTIMER:
 	case TIMER_HVTIMER:
 		timer_set_ctl(ctx, read_sysreg_el0(SYS_CNTV_CTL));
-		cval = read_sysreg_el0(SYS_CNTV_CVAL);
-
-		if (has_broken_cntvoff())
-			cval -= timer_get_offset(ctx);
-
-		timer_set_cval(ctx, cval);
+		if (!has_broken_cntvoff() || !timer_get_offset(ctx))
+			timer_set_cval(ctx, read_sysreg_el0(SYS_CNTV_CVAL));
 
 		/* Disable the timer */
 		write_sysreg_el0(0, SYS_CNTV_CTL);
@@ -555,11 +558,12 @@ static void timer_save_state(struct arch_timer_context *ctx)
 	case TIMER_PTIMER:
 	case TIMER_HPTIMER:
 		timer_set_ctl(ctx, read_sysreg_el0(SYS_CNTP_CTL));
-		cval = read_sysreg_el0(SYS_CNTP_CVAL);
-
-		cval -= timer_get_offset(ctx);
-
-		timer_set_cval(ctx, cval);
+		/*
+		 * With an offset, memory already holds the guest's CVAL (the
+		 * trap handler or __deactivate_traps() wrote it).
+		 */
+		if (!timer_get_offset(ctx))
+			timer_set_cval(ctx, read_sysreg_el0(SYS_CNTP_CVAL));
 
 		/* Disable the timer */
 		write_sysreg_el0(0, SYS_CNTP_CTL);
@@ -594,10 +598,10 @@ static void kvm_timer_blocking(struct kvm_vcpu *vcpu)
 	 * If no timers are capable of raising interrupts (disabled or
 	 * masked), then there's no more work for us to do.
 	 */
-	if (!kvm_timer_irq_can_fire(map.direct_vtimer) &&
-	    !kvm_timer_irq_can_fire(map.direct_ptimer) &&
-	    !kvm_timer_irq_can_fire(map.emul_vtimer) &&
-	    !kvm_timer_irq_can_fire(map.emul_ptimer) &&
+	if (!kvm_timer_enabled(map.direct_vtimer) &&
+	    !kvm_timer_enabled(map.direct_ptimer) &&
+	    !kvm_timer_enabled(map.emul_vtimer) &&
+	    !kvm_timer_enabled(map.emul_ptimer) &&
 	    !vcpu_has_wfit_active(vcpu))
 		return;
 
@@ -638,7 +642,8 @@ static void timer_restore_state(struct arch_timer_context *ctx)
 		offset = timer_get_offset(ctx);
 		if (has_broken_cntvoff()) {
 			set_cntvoff(0);
-			cval += offset;
+			if (offset)
+				cval = timer_apply_offset(cval, offset, kvm_phys_timer_read());
 		} else {
 			set_cntvoff(offset);
 		}
@@ -651,7 +656,8 @@ static void timer_restore_state(struct arch_timer_context *ctx)
 		cval = timer_get_cval(ctx);
 		offset = timer_get_offset(ctx);
 		set_cntpoff(offset);
-		cval += offset;
+		if (offset)
+			cval = timer_apply_offset(cval, offset, kvm_phys_timer_read());
 		write_sysreg_el0(cval, SYS_CNTP_CVAL);
 		isb();
 		write_sysreg_el0(timer_get_ctl(ctx), SYS_CNTP_CTL);
@@ -677,6 +683,7 @@ static inline void set_timer_irq_phys_active(struct arch_timer_context *ctx, boo
 static void kvm_timer_vcpu_load_gic(struct arch_timer_context *ctx)
 {
 	struct kvm_vcpu *vcpu = timer_context_to_vcpu(ctx);
+	bool pending = kvm_timer_pending(ctx);
 	bool phys_active = false;
 
 	/*
@@ -685,12 +692,12 @@ static void kvm_timer_vcpu_load_gic(struct arch_timer_context *ctx)
 	 * this point and the register restoration, we'll take the
 	 * interrupt anyway.
 	 */
-	kvm_timer_update_irq(vcpu, kvm_timer_should_fire(ctx), ctx);
+	kvm_timer_update_irq(vcpu, pending, ctx);
 
 	if (irqchip_in_kernel(vcpu->kvm))
 		phys_active = kvm_vgic_map_is_active(vcpu, timer_irq(ctx));
 
-	phys_active |= ctx->irq.level;
+	phys_active |= pending;
 	phys_active |= vgic_is_v5(vcpu->kvm);
 
 	set_timer_irq_phys_active(ctx, phys_active);
@@ -699,6 +706,7 @@ static void kvm_timer_vcpu_load_gic(struct arch_timer_context *ctx)
 static void kvm_timer_vcpu_load_nogic(struct kvm_vcpu *vcpu)
 {
 	struct arch_timer_context *vtimer = vcpu_vtimer(vcpu);
+	bool pending = kvm_timer_pending(vtimer);
 
 	/*
 	 * Update the timer output so that it is likely to match the
@@ -706,7 +714,7 @@ static void kvm_timer_vcpu_load_nogic(struct kvm_vcpu *vcpu)
 	 * this point and the register restoration, we'll take the
 	 * interrupt anyway.
 	 */
-	kvm_timer_update_irq(vcpu, kvm_timer_should_fire(vtimer), vtimer);
+	kvm_timer_update_irq(vcpu, pending, vtimer);
 
 	/*
 	 * When using a userspace irqchip with the architected timers and a
@@ -718,7 +726,7 @@ static void kvm_timer_vcpu_load_nogic(struct kvm_vcpu *vcpu)
 	 * being de-asserted, we unmask the interrupt again so that we exit
 	 * from the guest when the timer fires.
 	 */
-	if (vtimer->irq.level)
+	if (pending)
 		disable_percpu_irq(host_vtimer_irq);
 	else
 		enable_percpu_irq(host_vtimer_irq, host_vtimer_irq_flags);
@@ -865,8 +873,14 @@ static void timer_set_traps(struct kvm_vcpu *vcpu, struct timer_map *map)
 	assign_clear_set_bit(tvt02, CNTHCTL_EL1NVVCT, clr, set);
 	assign_clear_set_bit(tpt02, CNTHCTL_EL1NVPCT, clr, set);
 
-	/* This only happens on VHE, so use the CNTHCTL_EL2 accessor. */
-	sysreg_clear_set(cnthctl_el2, clr, set);
+	/*
+	 * This only happens on VHE, so use the CNTHCTL_EL2 accessor, unless
+	 * we are sure CNTKCTL_EL1 is completely stateful with FEAT_NV2p1.
+	 */
+	if (!cpus_have_final_cap(ARM64_HAS_NV2P1))
+		sysreg_clear_set(cnthctl_el2, clr, set);
+	else
+		sysreg_clear_set(cntkctl_el1, clr, set);
 }
 
 void kvm_timer_vcpu_load(struct kvm_vcpu *vcpu)
@@ -902,23 +916,6 @@ void kvm_timer_vcpu_load(struct kvm_vcpu *vcpu)
 		timer_emulate(map.emul_ptimer);
 
 	timer_set_traps(vcpu, &map);
-}
-
-bool kvm_timer_should_notify_user(struct kvm_vcpu *vcpu)
-{
-	struct arch_timer_context *vtimer = vcpu_vtimer(vcpu);
-	struct arch_timer_context *ptimer = vcpu_ptimer(vcpu);
-	struct kvm_sync_regs *sregs = &vcpu->run->s.regs;
-	bool vlevel, plevel;
-
-	if (likely(irqchip_in_kernel(vcpu->kvm)))
-		return false;
-
-	vlevel = sregs->device_irq_level & KVM_ARM_DEV_EL1_VTIMER;
-	plevel = sregs->device_irq_level & KVM_ARM_DEV_EL1_PTIMER;
-
-	return kvm_timer_should_fire(vtimer) != vlevel ||
-	       kvm_timer_should_fire(ptimer) != plevel;
 }
 
 void kvm_timer_vcpu_put(struct kvm_vcpu *vcpu)
@@ -1006,7 +1003,7 @@ static void unmask_vtimer_irq_user(struct kvm_vcpu *vcpu)
 {
 	struct arch_timer_context *vtimer = vcpu_vtimer(vcpu);
 
-	if (!kvm_timer_should_fire(vtimer)) {
+	if (!kvm_timer_pending(vtimer)) {
 		kvm_timer_update_irq(vcpu, false, vtimer);
 		if (static_branch_likely(&has_gic_active_state))
 			set_timer_irq_phys_active(vtimer, false);
@@ -1110,8 +1107,7 @@ void kvm_timer_vcpu_init(struct kvm_vcpu *vcpu)
 		timer_context_init(vcpu, i);
 
 	/* Synchronize offsets across timers of a VM if not already provided */
-	if (!vcpu_is_protected(vcpu) &&
-	    !test_bit(KVM_ARCH_FLAG_VM_COUNTER_OFFSET, &vcpu->kvm->arch.flags)) {
+	if (!test_bit(KVM_ARCH_FLAG_VM_COUNTER_OFFSET, &vcpu->kvm->arch.flags)) {
 		timer_set_offset(vcpu_vtimer(vcpu), kvm_phys_timer_read());
 		timer_set_offset(vcpu_ptimer(vcpu), 0);
 	}
@@ -1133,6 +1129,15 @@ void kvm_timer_init_vm(struct kvm *kvm)
 	 */
 	for (int i = 0; i < NR_KVM_TIMERS; i++)
 		kvm->arch.timer_data.ppi[i] = get_vgic_ppi(kvm, default_ppi[i]);
+
+	/*
+	 * Protected VMs don't allow the userspace to set counter offsets,
+	 * either set via counter register writes or the dedicated ioctls.
+	 * Pretend the offset has already been set and rely on the default
+	 * offset being 0.
+	 */
+	if (kvm_vm_is_protected(kvm))
+		set_bit(KVM_ARCH_FLAG_VM_COUNTER_OFFSET, &kvm->arch.flags);
 }
 
 void kvm_timer_cpu_up(void)
@@ -1288,7 +1293,12 @@ static int timer_irq_set_vcpu_affinity(struct irq_data *d, void *vcpu)
 static int timer_irq_set_irqchip_state(struct irq_data *d,
 				       enum irqchip_irq_state which, bool val)
 {
-	if (which != IRQCHIP_STATE_ACTIVE || !irqd_is_forwarded_to_vcpu(d))
+	bool passthrough = which != IRQCHIP_STATE_ACTIVE ||
+		!irqd_is_forwarded_to_vcpu(d) ||
+		(kvm_vgic_global_state.type == VGIC_V5 &&
+		 vgic_is_v3(kvm_get_running_vcpu()->kvm));
+
+	if (passthrough)
 		return irq_chip_set_parent_state(d, which, val);
 
 	if (val)
@@ -1301,15 +1311,7 @@ static int timer_irq_set_irqchip_state(struct irq_data *d,
 
 static void timer_irq_eoi(struct irq_data *d)
 {
-	/*
-	 * On a GICv5 host, we still need to call EOI on the parent for
-	 * PPIs. The host driver already handles irqs which are forwarded to
-	 * vcpus, and skips the GIC CDDI while still doing the GIC CDEOI. This
-	 * is required to emulate the EOIMode=1 on GICv5 hardware. Failure to
-	 * call EOI unsurprisingly results in *BAD* lock-ups.
-	 */
-	if (!irqd_is_forwarded_to_vcpu(d) ||
-	    kvm_vgic_global_state.type == VGIC_V5)
+	if (!irqd_is_forwarded_to_vcpu(d))
 		irq_chip_eoi_parent(d);
 }
 
@@ -1392,8 +1394,6 @@ static int kvm_irq_init(struct arch_timer_kvm_info *info)
 			return -ENOMEM;
 		}
 
-		if (kvm_vgic_global_state.no_hw_deactivation)
-			arch_timer_irq_ops.flags |= VGIC_IRQ_SW_RESAMPLE;
 		WARN_ON(irq_domain_push_irq(domain, host_vtimer_irq,
 					    (void *)TIMER_VTIMER));
 	}
@@ -1540,11 +1540,12 @@ static bool timer_irqs_are_valid(struct kvm_vcpu *vcpu)
 
 		ctx = vcpu_get_timer(vcpu, i);
 		irq = timer_irq(ctx);
-		if (kvm_vgic_set_owner(vcpu, irq, ctx))
-			break;
 
 		/* With GICv5, the default PPI is what you get -- nothing else */
 		if (vgic_is_v5(vcpu->kvm) && irq != get_vgic_ppi(vcpu->kvm, default_ppi[i]))
+			break;
+
+		if (kvm_vgic_set_owner(vcpu, irq, ctx))
 			break;
 
 		/*
@@ -1579,7 +1580,7 @@ static bool kvm_arch_timer_get_input_level(int vintid)
 
 		ctx = vcpu_get_timer(vcpu, i);
 		if (timer_irq(ctx) == vintid)
-			return kvm_timer_should_fire(ctx);
+			return kvm_timer_pending(ctx);
 	}
 
 	/* A timer IRQ has fired, but no matching timer was found? */
@@ -1591,8 +1592,8 @@ static bool kvm_arch_timer_get_input_level(int vintid)
 int kvm_timer_enable(struct kvm_vcpu *vcpu)
 {
 	struct arch_timer_cpu *timer = vcpu_timer(vcpu);
+	const struct irq_ops *ops;
 	struct timer_map map;
-	struct irq_ops *ops;
 	int ret;
 
 	if (timer->enabled)

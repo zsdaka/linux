@@ -17,7 +17,7 @@
 
 static const char *const known_fs[] = {
 	"9p", "adfs", "affs", "afs", "aio", "anon_inodefs", "apparmorfs",
-	"autofs", "bcachefs", "bdev", "befs", "bfs", "binder", "binfmt_misc",
+	"autofs", "bcachefs", "bdev", "befs", "binder", "binfmt_misc",
 	"bpf", "btrfs", "btrfs_test_fs", "ceph", "cgroup", "cgroup2", "cifs",
 	"coda", "configfs", "cpuset", "cramfs", "cxl", "dax", "debugfs",
 	"devpts", "devtmpfs", "dmabuf", "drm", "ecryptfs", "efivarfs", "efs",
@@ -81,6 +81,9 @@ static FILE *f_mountinfo;
 static void cleanup_namespace(void)
 {
 	int ret;
+
+	if (f_mountinfo)
+		fclose(f_mountinfo);
 
 	ret = fchdir(orig_root);
 	if (ret == -1)
@@ -515,7 +518,7 @@ static void test_statmount_mnt_opts(void)
 		return;
 	}
 
-	ksft_test_result_fail("didnt't find mount entry\n");
+	ksft_test_result_fail("didn't find mount entry\n");
 	free(sm);
 	free(line);
 }

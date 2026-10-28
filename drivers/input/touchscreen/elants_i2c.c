@@ -1360,9 +1360,9 @@ static void elants_i2c_power_off(void *_data)
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id i2c_hid_ids[] = {
-	{"ACPI0C50", 0 },
-	{"PNP0C50", 0 },
-	{ },
+	{ .id = "ACPI0C50" },
+	{ .id = "PNP0C50" },
+	{ }
 };
 
 static const guid_t i2c_hid_guid =
@@ -1615,16 +1615,16 @@ static DEFINE_SIMPLE_DEV_PM_OPS(elants_i2c_pm_ops,
 				elants_i2c_suspend, elants_i2c_resume);
 
 static const struct i2c_device_id elants_i2c_id[] = {
-	{ DEVICE_NAME, EKTH3500 },
-	{ "ekth3500", EKTH3500 },
-	{ "ektf3624", EKTF3624 },
+	{ .name = DEVICE_NAME, .driver_data = EKTH3500 },
+	{ .name = "ekth3500", .driver_data = EKTH3500 },
+	{ .name = "ektf3624", .driver_data = EKTF3624 },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, elants_i2c_id);
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id elants_acpi_id[] = {
-	{ "ELAN0001", EKTH3500 },
+	{ .id = "ELAN0001", .driver_data = EKTH3500 },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, elants_acpi_id);

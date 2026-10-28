@@ -43,6 +43,7 @@ Hardware Monitoring Kernel Drivers
    amc6821
    aps-379
    aquacomputer_d5next
+   arctic_fan_controller
    asb100
    asc7621
    aspeed-g6-pwm-tach
@@ -50,6 +51,8 @@ Hardware Monitoring Kernel Drivers
    asus_ec_sensors
    asus_rog_ryujin
    asus_wmi_sensors
+   axiado-pwm-fan
+   axiado-tsadc
    bcm54140
    bel-pfe
    bpa-rs600
@@ -60,6 +63,7 @@ Hardware Monitoring Kernel Drivers
    corsair-psu
    cros_ec_hwmon
    crps
+   d1u74t
    da9052
    da9055
    dell-smm-hwmon
@@ -68,7 +72,9 @@ Hardware Monitoring Kernel Drivers
    drivetemp
    ds1621
    ds620
+   e50sn12051
    emc1403
+   emc1812
    emc2103
    emc2305
    emc6w201
@@ -86,6 +92,7 @@ Hardware Monitoring Kernel Drivers
    gxp-fan-ctrl
    hac300s
    hih6130
+   honor-fmi
    hp-wmi-sensors
    hs3001
    htu31
@@ -108,6 +115,7 @@ Hardware Monitoring Kernel Drivers
    jc42
    k10temp
    k8temp
+   kb9002
    kbatt
    kfan
    lan966x
@@ -145,7 +153,9 @@ Hardware Monitoring Kernel Drivers
    ltc4260
    ltc4261
    ltc4282
+   ltc4283
    ltc4286
+   lx1308
    macsmc-hwmon
    max127
    max15301
@@ -158,6 +168,9 @@ Hardware Monitoring Kernel Drivers
    max197
    max20730
    max20751
+   max20826
+   max20830
+   max20860a
    max31722
    max31730
    max31760
@@ -177,6 +190,7 @@ Hardware Monitoring Kernel Drivers
    mcp3021
    mcp9982
    menf21bmc
+   minisforum-um780xtx
    mlxreg-fan
    mp2856
    mp2869
@@ -185,6 +199,7 @@ Hardware Monitoring Kernel Drivers
    mp2925
    mp29502
    mp2975
+   mp2985
    mp2993
    mp5023
    mp5920
@@ -192,6 +207,8 @@ Hardware Monitoring Kernel Drivers
    mp5990
    mp9941
    mp9945
+   mpq82d00
+   mpq8646
    mpq8785
    nct6683
    nct6775
@@ -216,6 +233,7 @@ Hardware Monitoring Kernel Drivers
    pmbus
    powerz
    powr1220
+   prom21-xhci
    pt5161l
    pxe1610
    pwm-fan
@@ -241,13 +259,16 @@ Hardware Monitoring Kernel Drivers
    smsc47b397
    smsc47m192
    smsc47m1
+   socfpga-hwmon
    sparx5-temp
    spd5118
+   sq24860
    stpddc60
    surface_fan
    sy7636a-hwmon
    tc654
    tc74
+   tda38740
    thmc50
    tmp102
    tmp103
@@ -262,12 +283,14 @@ Hardware Monitoring Kernel Drivers
    tps53679
    tps546d24
    tsc1641
+   tvs-mpfs
    twl4030-madc-hwmon
    ucd9000
    ucd9200
    vexpress
    via686a
    vt1211
+   vt7505
    w83627ehf
    w83627hf
    w83773g

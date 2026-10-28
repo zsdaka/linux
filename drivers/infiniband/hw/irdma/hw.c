@@ -235,8 +235,7 @@ static void irdma_complete_cqp_request(struct irdma_cqp *cqp,
 				       struct irdma_cqp_request *cqp_request)
 {
 	if (cqp_request->waiting) {
-		WRITE_ONCE(cqp_request->request_done, true);
-		wake_up(&cqp_request->waitq);
+		complete_all(&cqp_request->comp);
 	} else if (cqp_request->callback_fcn) {
 		cqp_request->callback_fcn(cqp_request);
 	}
@@ -266,6 +265,7 @@ static void irdma_process_ae_def_cmpl(struct irdma_pci_f *rf,
 		irdma_sc_cqp_def_cmpl_ae_handler(&rf->sc_dev, info, false,
 						 &scratch, &sw_def_info);
 	}
+	irdma_process_bh(&rf->sc_dev);
 }
 
 /**
@@ -1107,9 +1107,9 @@ static int irdma_create_cqp(struct irdma_pci_f *rf)
 	INIT_LIST_HEAD(&cqp->cqp_avail_reqs);
 	INIT_LIST_HEAD(&cqp->cqp_pending_reqs);
 
-	/* init the waitqueue of the cqp_requests and add them to the list */
+	/* init the completion of the cqp_requests and add them to the list */
 	for (i = 0; i < sqsize; i++) {
-		init_waitqueue_head(&cqp->cqp_requests[i].waitq);
+		init_completion(&cqp->cqp_requests[i].comp);
 		list_add_tail(&cqp->cqp_requests[i].list, &cqp->cqp_avail_reqs);
 	}
 	init_waitqueue_head(&cqp->remove_wq);
@@ -1253,12 +1253,21 @@ static int irdma_cfg_ceq_vector(struct irdma_pci_f *rf, struct irdma_ceq *iwceq,
 	}
 
 	msix_vec->ceq_id = ceq_id;
-	if (rf->sc_dev.privileged)
+	if (rf->sc_dev.privileged) {
 		rf->sc_dev.irq_ops->irdma_cfg_ceq(&rf->sc_dev, ceq_id,
 						  msix_vec->idx, true);
-	else
+	} else {
 		status = irdma_vchnl_req_ceq_vec_map(&rf->sc_dev, ceq_id,
 						     msix_vec->idx);
+		if (!status)
+			return 0;
+
+		if (rf->msix_shared && !ceq_id)
+			irdma_destroy_irq(rf, msix_vec, rf);
+		else
+			irdma_destroy_irq(rf, msix_vec, iwceq);
+	}
+
 	return status;
 }
 
@@ -2743,7 +2752,6 @@ int irdma_hw_flush_wqes(struct irdma_pci_f *rf, struct irdma_sc_qp *qp,
 	hw_info = &cqp_request->info.in.u.qp_flush_wqes.info;
 	memcpy(hw_info, info, sizeof(*hw_info));
 	cqp_info->cqp_cmd = IRDMA_OP_QP_FLUSH_WQES;
-	cqp_info->post_sq = 1;
 	cqp_info->in.u.qp_flush_wqes.qp = qp;
 	cqp_info->in.u.qp_flush_wqes.scratch = (uintptr_t)cqp_request;
 	status = irdma_handle_cqp_op(rf, cqp_request);
@@ -2790,7 +2798,6 @@ int irdma_hw_flush_wqes(struct irdma_pci_f *rf, struct irdma_sc_qp *qp,
 				hw_info = &new_req->info.in.u.qp_flush_wqes.info;
 				memcpy(hw_info, info, sizeof(*hw_info));
 				cqp_info->cqp_cmd = IRDMA_OP_QP_FLUSH_WQES;
-				cqp_info->post_sq = 1;
 				cqp_info->in.u.qp_flush_wqes.qp = qp;
 				cqp_info->in.u.qp_flush_wqes.scratch = (uintptr_t)new_req;
 

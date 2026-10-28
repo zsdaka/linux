@@ -112,8 +112,9 @@ static void test_increase_level(struct kunit *test)
 	if (IS_32BIT)
 		kunit_skip(test, "Unable to test on 32bit");
 
-	KUNIT_ASSERT_GT(test, common->max_vasz_lg2,
-			pt_top_range(common).max_vasz_lg2);
+	if (common->max_vasz_lg2 <= pt_top_range(common).max_vasz_lg2)
+		kunit_skip(test,
+			   "max_vasz_lg2 fits in starting level, no growth possible");
 
 	/* Add every possible level to the max */
 	while (common->max_vasz_lg2 != pt_top_range(common).max_vasz_lg2) {
@@ -402,7 +403,7 @@ static void test_pgsize_boundary(struct kunit *test)
 	    priv->smallest_pgsz != SZ_4K)
 		kunit_skip(test, "Format does not have the required range");
 
-	do_map(test, 0xfef80000, 0x208b95d000, 0xfef9ffff - 0xfef80000 + 1);
+	do_map(test, 0xfef80000, 0x8b95d000, 0xfef9ffff - 0xfef80000 + 1);
 }
 
 /* See https://lore.kernel.org/r/20250826143816.38686-1-eugkoira@amazon.com */

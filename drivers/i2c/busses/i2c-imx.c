@@ -349,7 +349,7 @@ static const struct of_device_id i2c_imx_dt_ids[] = {
 MODULE_DEVICE_TABLE(of, i2c_imx_dt_ids);
 
 static const struct acpi_device_id i2c_imx_acpi_ids[] = {
-	{"NXP0001", .driver_data = (kernel_ulong_t)&vf610_i2c_hwdata},
+	{ .id = "NXP0001", .driver_data = (kernel_ulong_t)&vf610_i2c_hwdata },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, i2c_imx_acpi_ids);
@@ -930,14 +930,16 @@ static int i2c_imx_reg_slave(struct i2c_client *client)
 	if (i2c_imx->slave)
 		return -EBUSY;
 
-	i2c_imx->slave = client;
-	i2c_imx->last_slave_event = I2C_SLAVE_STOP;
-
 	/* Resume */
 	ret = pm_runtime_resume_and_get(i2c_imx->adapter.dev.parent);
 	if (ret < 0) {
 		dev_err(&i2c_imx->adapter.dev, "failed to resume i2c controller");
 		return ret;
+	}
+
+	scoped_guard(spinlock_irqsave, &i2c_imx->slave_lock) {
+		i2c_imx->slave = client;
+		i2c_imx->last_slave_event = I2C_SLAVE_STOP;
 	}
 
 	i2c_imx_slave_init(i2c_imx);
@@ -958,6 +960,7 @@ static int i2c_imx_unreg_slave(struct i2c_client *client)
 
 	i2c_imx_reset_regs(i2c_imx);
 
+	hrtimer_cancel(&i2c_imx->slave_timer);
 	i2c_imx->slave = NULL;
 
 	/* Suspend */
@@ -997,16 +1000,10 @@ static inline int i2c_imx_isr_write(struct imx_i2c_struct *i2c_imx)
 	return 1;
 }
 
-static inline int i2c_imx_isr_read(struct imx_i2c_struct *i2c_imx)
+static inline void i2c_imx_setup_read(struct imx_i2c_struct *i2c_imx)
 {
-	int result;
 	unsigned int temp;
 
-	result = i2c_imx_isr_acked(i2c_imx);
-	if (result)
-		return result;
-
-	/* setup bus to read data */
 	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
 	temp &= ~I2CR_MTX;
 	if ((i2c_imx->msg->len - 1) || (i2c_imx->msg->flags & I2C_M_RECV_LEN))
@@ -1014,6 +1011,18 @@ static inline int i2c_imx_isr_read(struct imx_i2c_struct *i2c_imx)
 
 	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
 	imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR); /* dummy read */
+}
+
+static inline int i2c_imx_isr_read(struct imx_i2c_struct *i2c_imx)
+{
+	int result;
+
+	result = i2c_imx_isr_acked(i2c_imx);
+	if (result)
+		return result;
+
+	/* setup bus to read data */
+	i2c_imx_setup_read(i2c_imx);
 
 	return 0;
 }
@@ -1061,11 +1070,28 @@ static inline enum imx_i2c_state i2c_imx_isr_read_continue(struct imx_i2c_struct
 static inline void i2c_imx_isr_read_block_data_len(struct imx_i2c_struct *i2c_imx)
 {
 	u8 len = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR);
+	unsigned int temp;
 
 	if (len == 0 || len > I2C_SMBUS_BLOCK_MAX) {
+		/*
+		 * SMBus 3.1 6.5.7: support count byte of 0.
+		 * I2C_SMBUS_BLOCK_MAX case should not hold the SDA either.
+		 * So NACK it (TXAK) to not hold the bus.
+		 */
+		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+		temp |= I2CR_TXAK;
+		imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+
+		if (len == 0) {
+			i2c_imx->msg->buf[i2c_imx->msg_buf_idx++] = 0;
+			i2c_imx->msg->len = 2;
+			return;
+		}
+
 		i2c_imx->isr_result = -EPROTO;
 		i2c_imx->state = IMX_I2C_STATE_FAILED;
 		wake_up(&i2c_imx->queue);
+		return;
 	}
 	i2c_imx->msg->len += len;
 	i2c_imx->msg->buf[i2c_imx->msg_buf_idx++] = len;
@@ -1152,6 +1178,16 @@ static irqreturn_t i2c_imx_isr(int irq, void *dev_id)
 	return i2c_imx_master_isr(i2c_imx, status);
 }
 
+static u8 i2c_imx_addr_byte(struct i2c_msg *msg)
+{
+	u8 addr = i2c_8bit_addr_from_msg(msg);
+
+	if (msg->flags & I2C_M_REV_DIR_ADDR)
+		addr ^= 1;
+
+	return addr;
+}
+
 static int i2c_imx_dma_write(struct imx_i2c_struct *i2c_imx,
 					struct i2c_msg *msgs)
 {
@@ -1180,7 +1216,7 @@ static int i2c_imx_dma_write(struct imx_i2c_struct *i2c_imx,
 	 * Write slave address.
 	 * The first byte must be transmitted by the CPU.
 	 */
-	imx_i2c_write_reg(i2c_8bit_addr_from_msg(msgs), i2c_imx, IMX_I2C_I2DR);
+	imx_i2c_write_reg(i2c_imx_addr_byte(msgs), i2c_imx, IMX_I2C_I2DR);
 	time_left = wait_for_completion_timeout(
 				&i2c_imx->dma->cmd_complete,
 				msecs_to_jiffies(DMA_TIMEOUT));
@@ -1222,14 +1258,20 @@ static int i2c_imx_prepare_read(struct imx_i2c_struct *i2c_imx,
 	int result;
 	unsigned int temp = 0;
 
-	/* write slave address */
-	imx_i2c_write_reg(i2c_8bit_addr_from_msg(msgs), i2c_imx, IMX_I2C_I2DR);
-	result = i2c_imx_trx_complete(i2c_imx, !use_dma);
-	if (result)
-		return result;
-	result = i2c_imx_acked(i2c_imx);
-	if (result)
-		return result;
+	/*
+	 * I2C_M_NOSTART continues a frame that is already open, so there is
+	 * no address phase: go straight to turning the bus around.
+	 */
+	if (!(msgs->flags & I2C_M_NOSTART)) {
+		/* write slave address */
+		imx_i2c_write_reg(i2c_imx_addr_byte(msgs), i2c_imx, IMX_I2C_I2DR);
+		result = i2c_imx_trx_complete(i2c_imx, !use_dma);
+		if (result)
+			return result;
+		result = i2c_imx_acked(i2c_imx);
+		if (result)
+			return result;
+	}
 
 	dev_dbg(&i2c_imx->adapter.dev, "<%s> setup bus\n", __func__);
 
@@ -1351,16 +1393,18 @@ static int i2c_imx_atomic_write(struct imx_i2c_struct *i2c_imx,
 	int i, result;
 
 	dev_dbg(&i2c_imx->adapter.dev, "<%s> write slave address: addr=0x%x\n",
-		__func__, i2c_8bit_addr_from_msg(msgs));
+		__func__, i2c_imx_addr_byte(msgs));
 
-	/* write slave address */
-	imx_i2c_write_reg(i2c_8bit_addr_from_msg(msgs), i2c_imx, IMX_I2C_I2DR);
-	result = i2c_imx_trx_complete(i2c_imx, true);
-	if (result)
-		return result;
-	result = i2c_imx_acked(i2c_imx);
-	if (result)
-		return result;
+	if (!(msgs->flags & I2C_M_NOSTART)) {
+		/* write slave address */
+		imx_i2c_write_reg(i2c_imx_addr_byte(msgs), i2c_imx, IMX_I2C_I2DR);
+		result = i2c_imx_trx_complete(i2c_imx, true);
+		if (result)
+			return result;
+		result = i2c_imx_acked(i2c_imx);
+		if (result)
+			return result;
+	}
 	dev_dbg(&i2c_imx->adapter.dev, "<%s> write data\n", __func__);
 
 	/* write data */
@@ -1382,7 +1426,7 @@ static int i2c_imx_atomic_write(struct imx_i2c_struct *i2c_imx,
 static int i2c_imx_write(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs)
 {
 	dev_dbg(&i2c_imx->adapter.dev, "<%s> write slave address: addr=0x%x\n",
-		__func__, i2c_8bit_addr_from_msg(msgs));
+		__func__, i2c_imx_addr_byte(msgs));
 
 	i2c_imx->state = IMX_I2C_STATE_WRITE;
 	i2c_imx->msg = msgs;
@@ -1391,8 +1435,16 @@ static int i2c_imx_write(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs)
 	/*
 	 * By writing the device address we start the state machine in the ISR.
 	 * The ISR will report when it is done or when it fails.
+	 *
+	 * I2C_M_NOSTART continues a frame that is already open and so has no
+	 * address byte: push the first data byte instead. That raises the same
+	 * interrupt and the ISR carries on from the second byte.
 	 */
-	imx_i2c_write_reg(i2c_8bit_addr_from_msg(msgs), i2c_imx, IMX_I2C_I2DR);
+	if (msgs->flags & I2C_M_NOSTART)
+		imx_i2c_write_reg(msgs->buf[i2c_imx->msg_buf_idx++], i2c_imx,
+				  IMX_I2C_I2DR);
+	else
+		imx_i2c_write_reg(i2c_imx_addr_byte(msgs), i2c_imx, IMX_I2C_I2DR);
 	wait_event_timeout(i2c_imx->queue,
 			   i2c_imx->state == IMX_I2C_STATE_DONE ||
 			   i2c_imx->state == IMX_I2C_STATE_FAILED,
@@ -1415,6 +1467,7 @@ static int i2c_imx_atomic_read(struct imx_i2c_struct *i2c_imx,
 	int i, result;
 	unsigned int temp;
 	int block_data = msgs->flags & I2C_M_RECV_LEN;
+	int block_err = 0;
 
 	result = i2c_imx_prepare_read(i2c_imx, msgs, false);
 	if (result)
@@ -1436,8 +1489,20 @@ static int i2c_imx_atomic_read(struct imx_i2c_struct *i2c_imx,
 		 */
 		if ((!i) && block_data) {
 			len = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR);
-			if ((len == 0) || (len > I2C_SMBUS_BLOCK_MAX))
-				return -EPROTO;
+			if ((len == 0) || (len > I2C_SMBUS_BLOCK_MAX)) {
+				/*
+				 * SMBus 3.1 6.5.7: support count byte of 0.
+				 * I2C_SMBUS_BLOCK_MAX case should not hold the SDA either.
+				 */
+				if (len > I2C_SMBUS_BLOCK_MAX)
+					block_err = -EPROTO;
+				temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
+				temp |= I2CR_TXAK;
+				imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
+				msgs->buf[0] = 0;
+				msgs->len = 2;
+				continue;
+			}
 			dev_dbg(&i2c_imx->adapter.dev,
 				"<%s> read length: 0x%X\n",
 				__func__, len);
@@ -1485,7 +1550,7 @@ static int i2c_imx_atomic_read(struct imx_i2c_struct *i2c_imx,
 			"<%s> read byte: B%d=0x%X\n",
 			__func__, i, msgs->buf[i]);
 	}
-	return 0;
+	return block_err;
 }
 
 static int i2c_imx_read(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs,
@@ -1496,22 +1561,29 @@ static int i2c_imx_read(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs,
 
 	dev_dbg(&i2c_imx->adapter.dev,
 		"<%s> write slave address: addr=0x%x\n",
-		__func__, i2c_8bit_addr_from_msg(msgs));
+		__func__, i2c_imx_addr_byte(msgs));
 
 	i2c_imx->is_lastmsg = is_lastmsg;
 
-	if (block_data)
-		i2c_imx->state = IMX_I2C_STATE_READ_BLOCK_DATA;
-	else
-		i2c_imx->state = IMX_I2C_STATE_READ;
 	i2c_imx->msg = msgs;
 	i2c_imx->msg_buf_idx = 0;
 
-	/*
-	 * By writing the device address we start the state machine in the ISR.
-	 * The ISR will report when it is done or when it fails.
-	 */
-	imx_i2c_write_reg(i2c_8bit_addr_from_msg(msgs), i2c_imx, IMX_I2C_I2DR);
+	if (msgs->flags & I2C_M_NOSTART) {
+		i2c_imx->state = block_data ? IMX_I2C_STATE_READ_BLOCK_DATA_LEN
+					    : IMX_I2C_STATE_READ_CONTINUE;
+		i2c_imx_setup_read(i2c_imx);
+	} else {
+		if (block_data)
+			i2c_imx->state = IMX_I2C_STATE_READ_BLOCK_DATA;
+		else
+			i2c_imx->state = IMX_I2C_STATE_READ;
+
+		/*
+		 * By writing the device address we start the state machine in the ISR.
+		 * The ISR will report when it is done or when it fails.
+		 */
+		imx_i2c_write_reg(i2c_imx_addr_byte(msgs), i2c_imx, IMX_I2C_I2DR);
+	}
 	wait_event_timeout(i2c_imx->queue,
 			   i2c_imx->state == IMX_I2C_STATE_DONE ||
 			   i2c_imx->state == IMX_I2C_STATE_FAILED,
@@ -1541,6 +1613,37 @@ static int i2c_imx_read(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs,
 	return ret;
 }
 
+#define I2C_IMX_UNSUPPORTED_PROTOCOL_MANGLING_FLAGS \
+	(I2C_M_IGNORE_NAK | I2C_M_NO_RD_ACK | I2C_M_STOP)
+
+static int i2c_imx_check_msgs(struct i2c_msg *msgs, int num)
+{
+	int i;
+
+	for (i = 0; i < num; i++) {
+		/* Reject rather than silently transfer */
+		if (msgs[i].flags & I2C_IMX_UNSUPPORTED_PROTOCOL_MANGLING_FLAGS)
+			return -EOPNOTSUPP;
+
+		if (msgs[i].flags & I2C_M_NOSTART) {
+			/*
+			 * NOSTART continues an already open frame. The first
+			 * message has nothing to continue from,
+			 * a 0 length continuation leaves the controller with
+			 * no byte to clock.
+			 */
+			if (i == 0 || msgs[i].len == 0)
+				return -EOPNOTSUPP;
+
+			if ((msgs[i].flags & I2C_M_RD) &&
+			    (msgs[i - 1].flags & I2C_M_RD))
+				return -EOPNOTSUPP;
+		}
+	}
+
+	return 0;
+}
+
 static int i2c_imx_xfer_common(struct i2c_adapter *adapter,
 			       struct i2c_msg *msgs, int num, bool atomic)
 {
@@ -1549,6 +1652,10 @@ static int i2c_imx_xfer_common(struct i2c_adapter *adapter,
 	bool is_lastmsg = false;
 	struct imx_i2c_struct *i2c_imx = i2c_get_adapdata(adapter);
 	int use_dma = 0;
+
+	result = i2c_imx_check_msgs(msgs, num);
+	if (result)
+		return result;
 
 	/* Start I2C transfer */
 	result = i2c_imx_start(i2c_imx, atomic);
@@ -1571,7 +1678,7 @@ static int i2c_imx_xfer_common(struct i2c_adapter *adapter,
 		if (i == num - 1)
 			is_lastmsg = true;
 
-		if (i) {
+		if (i && !(msgs[i].flags & I2C_M_NOSTART)) {
 			dev_dbg(&i2c_imx->adapter.dev,
 				"<%s> repeated start\n", __func__);
 			temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
@@ -1603,7 +1710,8 @@ static int i2c_imx_xfer_common(struct i2c_adapter *adapter,
 #endif
 
 		use_dma = i2c_imx->dma && msgs[i].len >= DMA_THRESHOLD &&
-			msgs[i].flags & I2C_M_DMA_SAFE;
+			msgs[i].flags & I2C_M_DMA_SAFE &&
+			!(msgs[i].flags & I2C_M_NOSTART);
 		if (msgs[i].flags & I2C_M_RD) {
 			int block_data = msgs->flags & I2C_M_RECV_LEN;
 
@@ -1697,7 +1805,9 @@ static int i2c_imx_init_recovery_info(struct imx_i2c_struct *i2c_imx,
 static u32 i2c_imx_func(struct i2c_adapter *adapter)
 {
 	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL
-		| I2C_FUNC_SMBUS_READ_BLOCK_DATA;
+		| I2C_FUNC_SMBUS_READ_BLOCK_DATA
+		| I2C_FUNC_NOSTART
+		| I2C_FUNC_PROTOCOL_MANGLING;
 }
 
 static const struct i2c_algorithm i2c_imx_algo = {
@@ -1720,7 +1830,7 @@ static int i2c_imx_probe(struct platform_device *pdev)
 
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
-		return dev_err_probe(&pdev->dev, irq, "can't get IRQ\n");
+		return irq;
 
 	base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(base))
@@ -1847,6 +1957,8 @@ static int i2c_imx_probe(struct platform_device *pdev)
 
 clk_notifier_unregister:
 	clk_notifier_unregister(i2c_imx->clk, &i2c_imx->clk_change_nb);
+	if (i2c_imx->dma)
+		i2c_imx_dma_free(i2c_imx);
 	free_irq(irq, i2c_imx);
 rpm_disable:
 	pm_runtime_put_noidle(&pdev->dev);
@@ -1887,14 +1999,21 @@ static void i2c_imx_remove(struct platform_device *pdev)
 
 	pm_runtime_put_noidle(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
 }
 
 static int i2c_imx_runtime_suspend(struct device *dev)
 {
 	struct imx_i2c_struct *i2c_imx = dev_get_drvdata(dev);
+	int ret;
+
+	ret = pinctrl_pm_select_sleep_state(dev);
+	if (ret)
+		return ret;
 
 	clk_disable(i2c_imx->clk);
-	return pinctrl_pm_select_sleep_state(dev);
+
+	return 0;
 }
 
 static int i2c_imx_runtime_resume(struct device *dev)
@@ -1907,10 +2026,54 @@ static int i2c_imx_runtime_resume(struct device *dev)
 		return ret;
 
 	ret = clk_enable(i2c_imx->clk);
-	if (ret)
+	if (ret) {
 		dev_err(dev, "can't enable I2C clock, ret=%d\n", ret);
+		pinctrl_pm_select_sleep_state(dev);
+		return ret;
+	}
 
-	return ret;
+	return 0;
+}
+
+static int __maybe_unused i2c_imx_suspend_noirq(struct device *dev)
+{
+	struct imx_i2c_struct *i2c_imx = dev_get_drvdata(dev);
+	int ret;
+
+	i2c_mark_adapter_suspended(&i2c_imx->adapter);
+
+	/*
+	 * Cancel the slave timer before powering down to prevent
+	 * i2c_imx_slave_timeout() from accessing hardware registers
+	 * while the clock is disabled.
+	 */
+	hrtimer_cancel(&i2c_imx->slave_timer);
+
+	ret = pm_runtime_force_suspend(dev);
+	if (ret) {
+		i2c_mark_adapter_resumed(&i2c_imx->adapter);
+		if (i2c_imx->slave) {
+			hrtimer_forward_now(&i2c_imx->slave_timer, I2C_IMX_CHECK_DELAY);
+			hrtimer_restart(&i2c_imx->slave_timer);
+		}
+		return ret;
+	}
+
+	return 0;
+}
+
+static int __maybe_unused i2c_imx_resume_noirq(struct device *dev)
+{
+	struct imx_i2c_struct *i2c_imx = dev_get_drvdata(dev);
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (ret)
+		return ret;
+
+	i2c_mark_adapter_resumed(&i2c_imx->adapter);
+
+	return 0;
 }
 
 static int i2c_imx_suspend(struct device *dev)
@@ -1946,8 +2109,8 @@ static int i2c_imx_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops i2c_imx_pm_ops = {
-	NOIRQ_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				  pm_runtime_force_resume)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(i2c_imx_suspend_noirq,
+				  i2c_imx_resume_noirq)
 	SYSTEM_SLEEP_PM_OPS(i2c_imx_suspend, i2c_imx_resume)
 	RUNTIME_PM_OPS(i2c_imx_runtime_suspend, i2c_imx_runtime_resume, NULL)
 };

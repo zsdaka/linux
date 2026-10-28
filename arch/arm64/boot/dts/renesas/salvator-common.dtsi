@@ -211,19 +211,6 @@
 		regulator-always-on;
 	};
 
-	sound_card: sound {
-		compatible = "audio-graph-card";
-
-		label = "rcar-sound";
-
-		dais = <&rsnd_port0	/* ak4613 */
-			&rsnd_port1	/* HDMI0  */
-#ifdef SOC_HAS_HDMI1
-			&rsnd_port2	/* HDMI1  */
-#endif
-			>;
-	};
-
 	vbus0_usb2: regulator-vbus0-usb2 {
 		compatible = "regulator-fixed";
 
@@ -279,6 +266,19 @@
 		gpios = <&gpio3 14 GPIO_ACTIVE_HIGH>;
 		gpios-states = <1>;
 		states = <3300000 1>, <1800000 0>;
+	};
+
+	sound_card: sound {
+		compatible = "audio-graph-card";
+
+		label = "rcar-sound";
+
+		dais = <&rsnd_port0	/* ak4613 */
+			&rsnd_port1	/* HDMI0  */
+#ifdef SOC_HAS_HDMI1
+			&rsnd_port2	/* HDMI1  */
+#endif
+			>;
 	};
 
 	vga {
@@ -361,6 +361,8 @@
 		reg = <0>;
 		interrupts-extended = <&gpio2 11 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&gpio2 10 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <10000>;
+		reset-deassert-us = <300>;
 	};
 };
 
@@ -507,7 +509,7 @@
 		};
 	};
 
-	cs2000: clk-multiplier@4f {
+	cs2000: clock-controller@4f {
 		#clock-cells = <0>;
 		compatible = "cirrus,cs2000-cp";
 		reg = <0x4f>;
@@ -541,7 +543,7 @@
 		reg = <0x70 0x71 0x72 0x73 0x74 0x75
 		       0x60 0x61 0x62 0x63 0x64 0x65>;
 		reg-names = "main", "dpll", "cp", "hdmi", "edid", "repeater",
-			    "infoframe", "cbus", "cec", "sdp", "txa", "txb" ;
+			    "infoframe", "cbus", "cec", "sdp", "txa", "txb";
 
 		interrupts-extended = <&gpio6 30 IRQ_TYPE_LEVEL_LOW>,
 				      <&gpio6 31 IRQ_TYPE_LEVEL_LOW>;
@@ -684,12 +686,12 @@
 			function = "avb";
 		};
 
-		pins_mdio {
+		pins-mdio {
 			groups = "avb_mdio";
 			drive-strength = <24>;
 		};
 
-		pins_mii_tx {
+		pins-mii-tx {
 			pins = "PIN_AVB_TX_CTL", "PIN_AVB_TXC", "PIN_AVB_TD0",
 			       "PIN_AVB_TD1", "PIN_AVB_TD2", "PIN_AVB_TD3";
 			drive-strength = <12>;
@@ -736,7 +738,7 @@
 		function = "scif2";
 	};
 
-	scif_clk_pins: scif_clk {
+	scif_clk_pins: scif-clk {
 		groups = "scif_clk_a";
 		function = "scif_clk";
 	};
@@ -747,7 +749,7 @@
 		power-source = <3300>;
 	};
 
-	sdhi0_pins_uhs: sd0_uhs {
+	sdhi0_pins_uhs: sd0-uhs {
 		groups = "sdhi0_data4", "sdhi0_ctrl";
 		function = "sdhi0";
 		power-source = <1800>;
@@ -765,7 +767,7 @@
 		power-source = <3300>;
 	};
 
-	sdhi3_pins_uhs: sd3_uhs {
+	sdhi3_pins_uhs: sd3-uhs {
 		groups = "sdhi3_data4", "sdhi3_ctrl";
 		function = "sdhi3";
 		power-source = <1800>;
@@ -776,7 +778,7 @@
 		function = "ssi";
 	};
 
-	sound_clk_pins: sound_clk {
+	sound_clk_pins: sound-clk {
 		groups = "audio_clk_a_a", "audio_clk_b_a", "audio_clk_c_a",
 			 "audio_clkout_a", "audio_clkout3_a";
 		function = "audio_clk";

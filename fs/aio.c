@@ -35,7 +35,7 @@
 #include <linux/workqueue.h>
 #include <linux/security.h>
 #include <linux/eventfd.h>
-#include <linux/blkdev.h>
+#include <linux/blk_plug.h>
 #include <linux/compat.h>
 #include <linux/migrate.h>
 #include <linux/ramfs.h>
@@ -318,7 +318,6 @@ static int aio_init_fs_context(struct fs_context *fc)
 	pfc = init_pseudo(fc, AIO_RING_MAGIC);
 	if (!pfc)
 		return -ENOMEM;
-	fc->s_iflags |= SB_I_NOEXEC;
 	pfc->ops = &aio_super_operations;
 	return 0;
 }
@@ -605,7 +604,7 @@ static int aio_setup_ring(struct kioctx *ctx, unsigned int nr_events)
 
 	ctx->mmap_base = do_mmap(ctx->aio_ring_file, 0, ctx->mmap_size,
 				 PROT_READ | PROT_WRITE,
-				 MAP_SHARED, 0, 0, &unused, NULL);
+				 MAP_SHARED, EMPTY_VMA_FLAGS, 0, &unused, NULL);
 	mmap_write_unlock(mm);
 	if (IS_ERR((void *)ctx->mmap_base)) {
 		ctx->mmap_size = 0;
@@ -937,7 +936,7 @@ static int kill_ioctx(struct mm_struct *mm, struct kioctx *ctx,
 
 /*
  * exit_aio: called when the last user of mm goes away.  At this point, there is
- * no way for any new requests to be submited or any of the io_* syscalls to be
+ * no way for any new requests to be submitted or any of the io_* syscalls to be
  * called on the context.
  *
  * There may be outstanding kiocbs, but free_ioctx() will explicitly wait on
@@ -1281,7 +1280,7 @@ static long aio_read_events_ring(struct kioctx *ctx,
 	 * The mutex can block and wake us up and that will cause
 	 * wait_event_interruptible_hrtimeout() to schedule without sleeping
 	 * and repeat. This should be rare enough that it doesn't cause
-	 * peformance issues. See the comment in read_events() for more detail.
+	 * performance issues. See the comment in read_events() for more detail.
 	 */
 	sched_annotate_sleep();
 	mutex_lock(&ctx->ring_lock);
@@ -1403,7 +1402,7 @@ static long read_events(struct kioctx *ctx, long min_nr, long nr,
 		w.min_nr = min_nr - ret;
 
 		ret2 = prepare_to_wait_event(&ctx->wait, &w.w, TASK_INTERRUPTIBLE);
-		if (!ret2 && !t.task)
+		if (!ret2 && !hrtimer_sleeper_task_get(&t))
 			ret2 = -ETIME;
 
 		if (aio_read_events(ctx, min_nr, nr, event, &ret) || ret2)
@@ -1870,7 +1869,12 @@ static int aio_poll_wake(struct wait_queue_entry *wait, unsigned mode, int sync,
 		list_del_init(&req->wait.entry);
 		list_del(&iocb->ki_list);
 		iocb->ki_res.res = mangle_poll(mask);
-		if (iocb->ki_eventfd && !eventfd_signal_allowed()) {
+		/*
+		 * We hold an arbitrary provider waitqueue lock here.  Signaling a
+		 * result eventfd can feed back through epoll and try to take the same
+		 * lock again.  Defer all eventfd-backed poll completions.
+		 */
+		if (iocb->ki_eventfd) {
 			iocb = NULL;
 			INIT_WORK(&req->work, aio_poll_put_work);
 			schedule_work(&req->work);

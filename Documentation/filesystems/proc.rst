@@ -23,13 +23,13 @@ fixes/update part 1.1  Stefani Seibold <stefani@seibold.net>    June 9 2009
   1	Collecting System Information
   1.1	Process-Specific Subdirectories
   1.2	Kernel data
-  1.3	IDE devices in /proc/ide
-  1.4	Networking info in /proc/net
-  1.5	SCSI info
-  1.6	Parallel port info in /proc/parport
-  1.7	TTY info in /proc/tty
-  1.8	Miscellaneous kernel statistics in /proc/stat
-  1.9	Ext4 file system parameters
+  1.3	Networking info in /proc/net
+  1.4	SCSI info
+  1.5	Parallel port info in /proc/parport
+  1.6	TTY info in /proc/tty
+  1.7	Miscellaneous kernel statistics in /proc/stat
+  1.8	Ext4 file system parameters
+  1.9	/proc/consoles - Shows registered system consoles
 
   2	Modifying System Parameters
 
@@ -52,6 +52,7 @@ fixes/update part 1.1  Stefani Seibold <stefani@seibold.net>    June 9 2009
 
   4	Configuring procfs
   4.1	Mount options
+  4.2	Mount restrictions
 
   5	Filesystem behavior
 
@@ -118,7 +119,7 @@ PTRACE_MODE_ATTACH permissions; CAP_PERFMON capability does not grant access
 to /proc/PID/mem for other processes.
 
 Note that an open file descriptor to /proc/<pid> or to any of its
-contained files or subdirectories does not prevent <pid> being reused
+contained files or subdirectories does not prevent <pid> from being reused
 for some other process in the event that <pid> exits. Operations on
 open /proc/<pid> file descriptors corresponding to dead processes
 never act on any new process that the kernel may, through chance, have
@@ -439,7 +440,7 @@ ioctl()-based API that gives ability to flexibly and efficiently query and
 filter individual VMAs. This interface is binary and is meant for more
 efficient and easy programmatic use. `struct procmap_query`, defined in
 linux/fs.h UAPI header, serves as an input/output argument to the
-`PROCMAP_QUERY` ioctl() command. See comments in linus/fs.h UAPI header for
+`PROCMAP_QUERY` ioctl() command. See comments in linux/fs.h UAPI header for
 details on query semantics, supported flags, data returned, and general API
 usage information.
 
@@ -512,7 +513,7 @@ In some kernel configurations, the semantics of pages part of a larger
 allocation (e.g., THP) can differ: a page is accounted as "private" if all
 pages part of the corresponding large allocation are *certainly* mapped in the
 same process, even if the page is mapped multiple times in that process. A
-page is accounted as "shared" if any page page of the larger allocation
+page is accounted as "shared" if any page of the larger allocation
 is *maybe* mapped in a different process. In some cases, a large allocation
 might be treated as "maybe mapped by multiple processes" even though this
 is no longer the case.
@@ -575,14 +576,14 @@ encoded manner. The codes are the following:
 
     ==    =============================================================
     rd    readable
-    wr    writeable
+    wr    writable
     ex    executable
     sh    shared
     mr    may read
     mw    may write
     me    may execute
     ms    may share
-    gd    stack segment growns down
+    gd    stack segment grows down
     pf    pure PFN range
     lo    pages are locked in memory
     io    memory mapped I/O area
@@ -607,6 +608,7 @@ encoded manner. The codes are the following:
     um    userfaultfd missing tracking
     uw    userfaultfd wr-protect tracking
     ui    userfaultfd minor fault
+    ur    userfaultfd read-write-protect tracking
     ss    shadow/guarded control stack page
     sl    sealed
     lf    lock on fault pages
@@ -717,7 +719,7 @@ size, in KB, that is backing the mapping up.
 
 Note that some kernel configurations do not track the precise number of times
 a page part of a larger allocation (e.g., THP) is mapped. In these
-configurations, "mapmax" might corresponds to the average number of mappings
+configurations, "mapmax" might correspond to the average number of mappings
 per page in such a larger allocation instead.
 
 1.2 Kernel data
@@ -1961,6 +1963,10 @@ For example::
   $ echo 0x7 > /proc/self/coredump_filter
   $ ./some_program
 
+If the coredump socket protocol is used a coredump server can select memory
+types to include dynamically. See COREDUMP_MEMORY_TYPES in
+include/uapi/linux/coredump.h.
+
 3.5	/proc/<pid>/mountinfo - Information about mounts
 --------------------------------------------------------
 
@@ -2006,7 +2012,7 @@ For more information on mount propagation see:
 These files provide a method to access a task's comm value. It also allows for
 a task to set its own or one of its thread siblings comm value. The comm value
 is limited in size compared to the cmdline value, so writing anything longer
-then the kernel's TASK_COMM_LEN (currently 16 chars, including the NUL
+than the kernel's TASK_COMM_LEN (currently 16 chars, including the NUL
 terminator) will result in a truncated comm value.
 
 
@@ -2211,7 +2217,7 @@ the process is maintaining.  Example output::
      | lr-------- 1 root root 64 Jan 27 11:24 400000-41a000 -> /usr/bin/ls
 
 The name of a link represents the virtual memory bounds of a mapping, i.e.
-vm_area_struct::vm_start-vm_area_struct::vm_end.
+vm_area_struct::vm_start - vm_area_struct::vm_end.
 
 The main purpose of the map_files is to retrieve a set of memory mapped
 files in a fast way instead of parsing /proc/<pid>/maps or
@@ -2425,7 +2431,9 @@ prohibited by hidepid=.  If you use some daemon like identd which needs to learn
 information about processes information, just add identd to this group.
 
 subset=pid hides all top level files and directories in the procfs that
-are not related to tasks.
+are not related to tasks. This option cannot be changed on an existing
+procfs instance because overmounts that existed before the change could
+otherwise remain reachable after the top level procfs entries are hidden.
 
 pidns= specifies a pid namespace (either as a string path to something like
 `/proc/$pid/ns/pid`, or a file descriptor when using `FSCONFIG_SET_FD`) that
@@ -2433,6 +2441,20 @@ will be used by the procfs instance when translating pids. By default, procfs
 will use the calling process's active pid namespace. Note that the pid
 namespace of an existing procfs instance cannot be modified (attempting to do
 so will give an `-EBUSY` error).
+
+4.2	Mount restrictions
+--------------------------
+
+If user namespaces are in use, the kernel additionally checks the instances of
+procfs available to the mounter and will not allow procfs to be mounted if:
+
+  1. This mount is not fully visible unless the new procfs is going to be
+     mounted with subset=pid option.
+
+     a. Its root directory is not the root directory of the filesystem.
+     b. If any file or non-empty procfs directory is hidden by another mount.
+
+  2. A new mount overrides the readonly option or any option from atime family.
 
 Chapter 5: Filesystem behavior
 ==============================

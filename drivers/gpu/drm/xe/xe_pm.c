@@ -5,7 +5,7 @@
 
 #include "xe_pm.h"
 
-#include <linux/fault-inject.h>
+#include <linux/error-injection.h>
 #include <linux/pm_runtime.h>
 #include <linux/suspend.h>
 #include <linux/dmi.h>
@@ -24,8 +24,10 @@
 #include "xe_irq.h"
 #include "xe_late_bind_fw.h"
 #include "xe_pcode.h"
+#include "xe_printk.h"
 #include "xe_pxp.h"
 #include "xe_sriov_vf_ccs.h"
+#include "xe_sysctrl.h"
 #include "xe_trace.h"
 #include "xe_vm.h"
 #include "xe_wa.h"
@@ -75,6 +77,8 @@
  * This component is not responsible for GT idleness (RC6) nor GT frequency
  * management (RPS).
  */
+
+#define HAS_PM_PME_SUPPORT(xe) (GRAPHICS_VERx100(xe) >= 3500)
 
 #ifdef CONFIG_LOCKDEP
 static struct lockdep_map xe_pm_runtime_d3cold_map = {
@@ -259,6 +263,8 @@ int xe_pm_resume(struct xe_device *xe)
 
 	xe_i2c_pm_resume(xe, true);
 
+	xe_sysctrl_pm_resume(xe);
+
 	xe_irq_resume(xe);
 
 	for_each_gt(gt, xe, id) {
@@ -346,10 +352,22 @@ static void xe_pm_runtime_init(struct xe_device *xe)
 	pm_runtime_put(dev);
 }
 
+/**
+ * xe_pm_init_early() - Initialize Xe Power Management
+ * @xe: the &xe_device instance
+ *
+ * Initialize everything that is a "software-only" state that does not
+ * require access to any of the device's hardware data.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
 int xe_pm_init_early(struct xe_device *xe)
 {
 	int err;
 
+	init_completion(&xe->pm_block);
+	complete_all(&xe->pm_block);
+	INIT_LIST_HEAD(&xe->rebind_resume_list);
 	INIT_LIST_HEAD(&xe->mem_access.vram_userfault.list);
 
 	err = drmm_mutex_init(&xe->drm, &xe->mem_access.vram_userfault.lock);
@@ -360,10 +378,47 @@ int xe_pm_init_early(struct xe_device *xe)
 	if (err)
 		return err;
 
-	xe->d3cold.capable = xe_pm_pci_d3cold_capable(xe);
+	err = drmm_mutex_init(&xe->drm, &xe->rebind_resume_lock);
+	if (err)
+		return err;
+
 	return 0;
 }
 ALLOW_ERROR_INJECTION(xe_pm_init_early, ERRNO); /* See xe_pci_probe() */
+
+static bool xe_pm_pci_pme_capable(struct xe_device *xe)
+{
+	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
+
+	return HAS_PM_PME_SUPPORT(xe) ?
+		pci_pme_capable(pdev, PCI_D3hot) : false;
+}
+
+/**
+ * xe_pm_probe() - Initialize Xe Power Management
+ * @xe: the &xe_device instance
+ *
+ * Check d3cold capability.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int xe_pm_probe(struct xe_device *xe)
+{
+	xe->d3cold.capable = xe_pm_pci_d3cold_capable(xe);
+	xe_dbg(xe, "d3cold: capable=%s\n", str_yes_no(xe->d3cold.capable));
+
+	xe->pme.capable = xe_pm_pci_pme_capable(xe);
+	xe_dbg(xe, "pme: capable=%s\n", str_yes_no(xe->pme.capable));
+
+	if (xe->pme.capable) {
+		int err = devm_device_init_wakeup(xe->drm.dev);
+
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
 
 static u32 vram_threshold_value(struct xe_device *xe)
 {
@@ -455,14 +510,6 @@ int xe_pm_init(struct xe_device *xe)
 	err = register_pm_notifier(&xe->pm_notifier);
 	if (err)
 		return err;
-
-	err = drmm_mutex_init(&xe->drm, &xe->rebind_resume_lock);
-	if (err)
-		goto err_unregister;
-
-	init_completion(&xe->pm_block);
-	complete_all(&xe->pm_block);
-	INIT_LIST_HEAD(&xe->rebind_resume_list);
 
 	/* For now suspend/resume is only allowed with GuC */
 	if (!xe_device_uc_enabled(xe))
@@ -623,6 +670,7 @@ int xe_pm_runtime_suspend(struct xe_device *xe)
 	return 0;
 
 out_resume:
+	xe_pm_update_pme_enabled(xe, false);
 	xe_display_pm_runtime_resume(xe);
 	xe_pxp_pm_resume(xe->pxp);
 out:
@@ -669,6 +717,11 @@ int xe_pm_runtime_resume(struct xe_device *xe)
 	}
 
 	xe_i2c_pm_resume(xe, xe->d3cold.allowed);
+
+	if (xe->d3cold.allowed)
+		xe_sysctrl_pm_resume(xe);
+
+	xe_display_pm_runtime_resume_early(xe);
 
 	xe_irq_resume(xe);
 
@@ -873,6 +926,11 @@ static bool xe_pm_suspending_or_resuming(struct xe_device *xe)
  * break scope-based handling, or when the lifetime of the runtime PM reference
  * does not match a specific scope (e.g., runtime PM obtained in one function
  * and released in a different one).
+ *
+ * This helper assumes the caller already holds a runtime PM reference and
+ * only warns when it cannot see one. After hot-unplug runtime PM is disabled
+ * and the check fails even when a reference is held, so callers that may run
+ * after unplug must guard it with drm_dev_enter()/drm_dev_exit() instead.
  */
 void xe_pm_runtime_get_noresume(struct xe_device *xe)
 {
@@ -957,6 +1015,30 @@ int xe_pm_set_vram_threshold(struct xe_device *xe, u32 threshold)
 }
 
 /**
+ * xe_pm_pme_enabled - get the current status of PME enabled
+ * @xe: xe device instance
+ *
+ * Returns: True if PME is enabled, false otherwise.
+ */
+bool xe_pm_pme_enabled(struct xe_device *xe)
+{
+	return xe->pme.enabled;
+}
+
+/**
+ * xe_pm_update_pme_enabled - Update the PME enabled state
+ * @xe: xe device instance
+ * @status: New PME enabled status
+ *
+ * Called during runtime suspend / resume. Status is set to True if PME is
+ * enabled during runtime_suspend. Cleared on runtime_resume.
+ */
+void xe_pm_update_pme_enabled(struct xe_device *xe, bool status)
+{
+	xe->pme.enabled = status;
+}
+
+/**
  * xe_pm_d3cold_allowed_toggle - Check conditions to toggle d3cold.allowed
  * @xe: xe device instance
  *
@@ -991,6 +1073,24 @@ void xe_pm_d3cold_allowed_toggle(struct xe_device *xe)
 		xe->d3cold.allowed = false;
 
 	mutex_unlock(&xe->d3cold.lock);
+}
+
+/**
+ * xe_pm_wait_all_c6() - Wait for all GTs to enter C6.
+ * @xe: xe device instance
+ *
+ * Return: 0 on success, -EAGAIN on failure
+ */
+int xe_pm_wait_all_c6(struct xe_device *xe)
+{
+	struct xe_gt *gt;
+	u8 id;
+
+	for_each_gt(gt, xe, id)
+		if (xe_gt_idle_wait_for_c6(gt, 200))
+			return -EAGAIN;
+
+	return 0;
 }
 
 /**

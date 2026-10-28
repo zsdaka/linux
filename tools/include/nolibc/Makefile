@@ -17,9 +17,27 @@ endif
 # it defaults to this nolibc directory.
 OUTPUT ?= $(CURDIR)/
 
-architectures := arm arm64 loongarch m68k mips powerpc riscv s390 sh sparc x86
+architectures := \
+		alpha \
+		arm \
+		arm64 \
+		hexagon \
+		loongarch \
+		m68k \
+		mips \
+		openrisc \
+		parisc \
+		powerpc \
+		riscv \
+		s390 \
+		sh \
+		sparc \
+		x86 \
+
 arch_files := arch.h $(addsuffix .h, $(addprefix arch-, $(architectures)))
 all_files := \
+		alloca.h \
+		assert.h \
 		byteswap.h \
 		compiler.h \
 		crt.h \
@@ -57,6 +75,7 @@ all_files := \
 		sys/reboot.h \
 		sys/resource.h \
 		sys/select.h \
+		sys/sendfile.h \
 		sys/stat.h \
 		sys/syscall.h \
 		sys/sysmacros.h \

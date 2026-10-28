@@ -40,6 +40,7 @@ struct arm_vsmmu;
 #define IDR0_HTTU			GENMASK(7, 6)
 #define IDR0_HTTU_ACCESS		1
 #define IDR0_HTTU_ACCESS_DIRTY		2
+#define IDR0_HTTU_ACCESS_DIRTY_HAFT	3
 #define IDR0_COHACC			(1 << 4)
 #define IDR0_TTF			GENMASK(3, 2)
 #define IDR0_TTF_AARCH64		2
@@ -51,6 +52,7 @@ struct arm_vsmmu;
 #define IDR1_QUEUES_PRESET		(1 << 29)
 #define IDR1_REL			(1 << 28)
 #define IDR1_ATTR_TYPES_OVR		(1 << 27)
+#define IDR1_ATTR_PERMS_OVR		(1 << 26)
 #define IDR1_CMDQS			GENMASK(25, 21)
 #define IDR1_EVTQS			GENMASK(20, 16)
 #define IDR1_PRIQS			GENMASK(15, 11)
@@ -64,6 +66,7 @@ struct arm_vsmmu;
 
 #define ARM_SMMU_IDR5			0x14
 #define IDR5_STALL_MAX			GENMASK(31, 16)
+#define IDR5_DS				(1 << 7)
 #define IDR5_GRAN64K			(1 << 6)
 #define IDR5_GRAN16K			(1 << 5)
 #define IDR5_GRAN4K			(1 << 4)
@@ -185,6 +188,8 @@ struct arm_vsmmu;
 
 #define Q_IDX(llq, p)			((p) & ((1 << (llq)->max_n_shift) - 1))
 #define Q_WRP(llq, p)			((p) & (1 << (llq)->max_n_shift))
+/* A position is Q_WRP | Q_IDX, wrapping at twice the queue capacity */
+#define Q_POS(llq, p)			(Q_WRP(llq, p) | Q_IDX(llq, p))
 #define Q_OVERFLOW_FLAG			(1U << 31)
 #define Q_OVF(p)			((p) & Q_OVERFLOW_FLAG)
 #define Q_ENT(q, p)			((q)->base +			\
@@ -283,6 +288,10 @@ static inline u32 arm_smmu_strtab_l2_idx(u32 sid)
 #define STRTAB_STE_1_SHCFG		GENMASK_ULL(45, 44)
 #define STRTAB_STE_1_SHCFG_INCOMING	1UL
 
+#define STRTAB_STE_1_INSTCFG		GENMASK_ULL(51, 50)
+#define STRTAB_STE_1_INSTCFG_INCOMING	0UL
+#define STRTAB_STE_1_INSTCFG_DATA	2UL
+
 #define STRTAB_STE_2_S2VMID		GENMASK_ULL(15, 0)
 #define STRTAB_STE_2_VTCR		GENMASK_ULL(50, 32)
 #define STRTAB_STE_2_VTCR_S2T0SZ	GENMASK_ULL(5, 0)
@@ -369,6 +378,7 @@ static inline unsigned int arm_smmu_cdtab_l2_idx(unsigned int ssid)
 #define CTXDESC_CD_0_ASET		(1UL << 47)
 #define CTXDESC_CD_0_ASID		GENMASK_ULL(63, 48)
 
+#define CTXDESC_CD_1_HAFT		(1UL << 3)
 #define CTXDESC_CD_1_TTB0_MASK		GENMASK_ULL(51, 4)
 
 /*
@@ -389,6 +399,10 @@ static inline unsigned int arm_smmu_cdtab_l2_idx(unsigned int ssid)
 #define CMDQ_ERR_CERROR_ATC_INV_IDX	3
 
 #define CMDQ_PROD_OWNED_FLAG		Q_OVERFLOW_FLAG
+
+struct arm_smmu_cmd {
+	u64 data[CMDQ_ENT_DWORDS];
+};
 
 /*
  * This is used to size the command queue and therefore must be at least
@@ -411,7 +425,7 @@ static inline unsigned int arm_smmu_cdtab_l2_idx(unsigned int ssid)
 
 #define CMDQ_TLBI_0_NUM			GENMASK_ULL(16, 12)
 #define CMDQ_TLBI_RANGE_NUM_MAX		31
-#define CMDQ_TLBI_0_SCALE		GENMASK_ULL(24, 20)
+#define CMDQ_TLBI_0_SCALE		GENMASK_ULL(25, 20)
 #define CMDQ_TLBI_0_VMID		GENMASK_ULL(47, 32)
 #define CMDQ_TLBI_0_ASID		GENMASK_ULL(63, 48)
 #define CMDQ_TLBI_1_LEAF		(1UL << 0)
@@ -426,10 +440,18 @@ static inline unsigned int arm_smmu_cdtab_l2_idx(unsigned int ssid)
 #define CMDQ_ATC_1_SIZE			GENMASK_ULL(5, 0)
 #define CMDQ_ATC_1_ADDR_MASK		GENMASK_ULL(63, 12)
 
+#define ATC_INV_SIZE_ALL 52
+
 #define CMDQ_PRI_0_SSID			GENMASK_ULL(31, 12)
 #define CMDQ_PRI_0_SID			GENMASK_ULL(63, 32)
 #define CMDQ_PRI_1_GRPID		GENMASK_ULL(8, 0)
 #define CMDQ_PRI_1_RESP			GENMASK_ULL(13, 12)
+
+enum pri_resp {
+	PRI_RESP_DENY = 0,
+	PRI_RESP_FAIL = 1,
+	PRI_RESP_SUCC = 2,
+};
 
 #define CMDQ_RESUME_0_RESP_TERM		0UL
 #define CMDQ_RESUME_0_RESP_RETRY	1UL
@@ -446,6 +468,145 @@ static inline unsigned int arm_smmu_cdtab_l2_idx(unsigned int ssid)
 #define CMDQ_SYNC_0_MSIATTR		GENMASK_ULL(27, 24)
 #define CMDQ_SYNC_0_MSIDATA		GENMASK_ULL(63, 32)
 #define CMDQ_SYNC_1_MSIADDR_MASK	GENMASK_ULL(51, 2)
+
+enum arm_smmu_cmdq_opcode {
+	CMDQ_OP_PREFETCH_CFG = 0x1,
+	CMDQ_OP_CFGI_STE = 0x3,
+	CMDQ_OP_CFGI_ALL = 0x4,
+	CMDQ_OP_CFGI_CD = 0x5,
+	CMDQ_OP_CFGI_CD_ALL = 0x6,
+	CMDQ_OP_TLBI_NH_ALL = 0x10,
+	CMDQ_OP_TLBI_NH_ASID = 0x11,
+	CMDQ_OP_TLBI_NH_VA = 0x12,
+	CMDQ_OP_TLBI_NH_VAA = 0x13,
+	CMDQ_OP_TLBI_EL2_ALL = 0x20,
+	CMDQ_OP_TLBI_EL2_ASID = 0x21,
+	CMDQ_OP_TLBI_EL2_VA = 0x22,
+	CMDQ_OP_TLBI_S12_VMALL = 0x28,
+	CMDQ_OP_TLBI_S2_IPA = 0x2a,
+	CMDQ_OP_TLBI_NSNH_ALL = 0x30,
+	CMDQ_OP_ATC_INV = 0x40,
+	CMDQ_OP_PRI_RESP = 0x41,
+	CMDQ_OP_RESUME = 0x44,
+	CMDQ_OP_CMD_SYNC = 0x46,
+};
+
+static inline struct arm_smmu_cmd
+arm_smmu_make_cmd_op(enum arm_smmu_cmdq_opcode op)
+{
+	struct arm_smmu_cmd cmd = {};
+
+	cmd.data[0] = FIELD_PREP(CMDQ_0_OP, op);
+	return cmd;
+}
+
+static inline struct arm_smmu_cmd arm_smmu_make_cmd_cfgi_all(void)
+{
+	struct arm_smmu_cmd cmd = arm_smmu_make_cmd_op(CMDQ_OP_CFGI_ALL);
+
+	cmd.data[1] |= FIELD_PREP(CMDQ_CFGI_1_RANGE, 31);
+	return cmd;
+}
+
+static inline struct arm_smmu_cmd arm_smmu_make_cmd_prefetch_cfg(u32 sid)
+{
+	struct arm_smmu_cmd cmd = arm_smmu_make_cmd_op(CMDQ_OP_PREFETCH_CFG);
+
+	cmd.data[0] |= FIELD_PREP(CMDQ_PREFETCH_0_SID, sid);
+	return cmd;
+}
+
+static inline struct arm_smmu_cmd arm_smmu_make_cmd_cfgi_ste(u32 sid, bool leaf)
+{
+	struct arm_smmu_cmd cmd = arm_smmu_make_cmd_op(CMDQ_OP_CFGI_STE);
+
+	cmd.data[0] |= FIELD_PREP(CMDQ_CFGI_0_SID, sid);
+	cmd.data[1] |= FIELD_PREP(CMDQ_CFGI_1_LEAF, leaf);
+	return cmd;
+}
+
+static inline struct arm_smmu_cmd arm_smmu_make_cmd_cfgi_cd(u32 sid, u32 ssid,
+							    bool leaf)
+{
+	struct arm_smmu_cmd cmd = arm_smmu_make_cmd_op(CMDQ_OP_CFGI_CD);
+
+	cmd.data[0] |= FIELD_PREP(CMDQ_CFGI_0_SID, sid) |
+		       FIELD_PREP(CMDQ_CFGI_0_SSID, ssid);
+	cmd.data[1] |= FIELD_PREP(CMDQ_CFGI_1_LEAF, leaf);
+	return cmd;
+}
+
+static inline struct arm_smmu_cmd arm_smmu_make_cmd_resume(u32 sid, u16 stag,
+							   u8 resp)
+{
+	struct arm_smmu_cmd cmd = arm_smmu_make_cmd_op(CMDQ_OP_RESUME);
+
+	cmd.data[0] |= FIELD_PREP(CMDQ_RESUME_0_SID, sid) |
+		       FIELD_PREP(CMDQ_RESUME_0_RESP, resp);
+	cmd.data[1] |= FIELD_PREP(CMDQ_RESUME_1_STAG, stag);
+	return cmd;
+}
+
+static inline struct arm_smmu_cmd arm_smmu_make_cmd_pri_resp(u32 sid, u32 ssid,
+							     bool ssv,
+							     u16 grpid,
+							     enum pri_resp resp)
+{
+	struct arm_smmu_cmd cmd = arm_smmu_make_cmd_op(CMDQ_OP_PRI_RESP);
+
+	cmd.data[0] |= FIELD_PREP(CMDQ_0_SSV, ssv) |
+		       FIELD_PREP(CMDQ_PRI_0_SID, sid) |
+		       FIELD_PREP(CMDQ_PRI_0_SSID, ssid);
+	cmd.data[1] |= FIELD_PREP(CMDQ_PRI_1_GRPID, grpid) |
+		       FIELD_PREP(CMDQ_PRI_1_RESP, resp);
+	return cmd;
+}
+
+static inline struct arm_smmu_cmd arm_smmu_make_cmd_atc_inv(u32 sid, u32 ssid,
+							    u64 addr, u8 size)
+{
+	struct arm_smmu_cmd cmd = arm_smmu_make_cmd_op(CMDQ_OP_ATC_INV);
+
+	cmd.data[0] |= FIELD_PREP(CMDQ_0_SSV, ssid != IOMMU_NO_PASID) |
+		       FIELD_PREP(CMDQ_ATC_0_SSID, ssid) |
+		       FIELD_PREP(CMDQ_ATC_0_SID, sid);
+	cmd.data[1] |= FIELD_PREP(CMDQ_ATC_1_SIZE, size) |
+		       (addr & CMDQ_ATC_1_ADDR_MASK);
+	return cmd;
+}
+
+static inline struct arm_smmu_cmd arm_smmu_make_cmd_atc_inv_all(u32 sid,
+								u32 ssid)
+{
+	return arm_smmu_make_cmd_atc_inv(sid, ssid, 0, ATC_INV_SIZE_ALL);
+}
+
+static inline struct arm_smmu_cmd arm_smmu_make_cmd_sync(unsigned int cs,
+							 u64 msiaddr)
+{
+	struct arm_smmu_cmd cmd = arm_smmu_make_cmd_op(CMDQ_OP_CMD_SYNC);
+
+	cmd.data[0] |= FIELD_PREP(CMDQ_SYNC_0_CS, cs) |
+		       FIELD_PREP(CMDQ_SYNC_0_MSH, ARM_SMMU_SH_ISH) |
+		       FIELD_PREP(CMDQ_SYNC_0_MSIATTR, ARM_SMMU_MEMATTR_OIWB);
+	cmd.data[1] |= msiaddr & CMDQ_SYNC_1_MSIADDR_MASK;
+	return cmd;
+}
+
+/*
+ * TLBI commands - the non-sized variants just need opcode + asid/vmid.
+ * For sized variants the caller sets up data[0] with the immutable fields
+ * (opcode + asid/vmid) and the range loop fills in per-iteration fields.
+ */
+static inline struct arm_smmu_cmd
+arm_smmu_make_cmd_tlbi(enum arm_smmu_cmdq_opcode op, u16 asid, u16 vmid)
+{
+	struct arm_smmu_cmd cmd = arm_smmu_make_cmd_op(op);
+
+	cmd.data[0] |= FIELD_PREP(CMDQ_TLBI_0_ASID, asid) |
+		       FIELD_PREP(CMDQ_TLBI_0_VMID, vmid);
+	return cmd;
+}
 
 /* Event queue */
 #define EVTQ_ENT_SZ_SHIFT		5
@@ -507,90 +668,6 @@ static inline unsigned int arm_smmu_cdtab_l2_idx(unsigned int ssid)
 #define MSI_IOVA_BASE			0x8000000
 #define MSI_IOVA_LENGTH			0x100000
 
-enum pri_resp {
-	PRI_RESP_DENY = 0,
-	PRI_RESP_FAIL = 1,
-	PRI_RESP_SUCC = 2,
-};
-
-struct arm_smmu_cmdq_ent {
-	/* Common fields */
-	u8				opcode;
-	bool				substream_valid;
-
-	/* Command-specific fields */
-	union {
-		#define CMDQ_OP_PREFETCH_CFG	0x1
-		struct {
-			u32			sid;
-		} prefetch;
-
-		#define CMDQ_OP_CFGI_STE	0x3
-		#define CMDQ_OP_CFGI_ALL	0x4
-		#define CMDQ_OP_CFGI_CD		0x5
-		#define CMDQ_OP_CFGI_CD_ALL	0x6
-		struct {
-			u32			sid;
-			u32			ssid;
-			union {
-				bool		leaf;
-				u8		span;
-			};
-		} cfgi;
-
-		#define CMDQ_OP_TLBI_NH_ALL     0x10
-		#define CMDQ_OP_TLBI_NH_ASID	0x11
-		#define CMDQ_OP_TLBI_NH_VA	0x12
-		#define CMDQ_OP_TLBI_NH_VAA	0x13
-		#define CMDQ_OP_TLBI_EL2_ALL	0x20
-		#define CMDQ_OP_TLBI_EL2_ASID	0x21
-		#define CMDQ_OP_TLBI_EL2_VA	0x22
-		#define CMDQ_OP_TLBI_S12_VMALL	0x28
-		#define CMDQ_OP_TLBI_S2_IPA	0x2a
-		#define CMDQ_OP_TLBI_NSNH_ALL	0x30
-		struct {
-			u8			num;
-			u8			scale;
-			u16			asid;
-			u16			vmid;
-			bool			leaf;
-			u8			ttl;
-			u8			tg;
-			u64			addr;
-		} tlbi;
-
-		#define CMDQ_OP_ATC_INV		0x40
-		#define ATC_INV_SIZE_ALL	52
-		struct {
-			u32			sid;
-			u32			ssid;
-			u64			addr;
-			u8			size;
-			bool			global;
-		} atc;
-
-		#define CMDQ_OP_PRI_RESP	0x41
-		struct {
-			u32			sid;
-			u32			ssid;
-			u16			grpid;
-			enum pri_resp		resp;
-		} pri;
-
-		#define CMDQ_OP_RESUME		0x44
-		struct {
-			u32			sid;
-			u16			stag;
-			u8			resp;
-		} resume;
-
-		#define CMDQ_OP_CMD_SYNC	0x46
-		struct {
-			u64			msiaddr;
-		} sync;
-	};
-};
-
 struct arm_smmu_ll_queue {
 	union {
 		u64			val;
@@ -633,17 +710,17 @@ struct arm_smmu_cmdq {
 	atomic_long_t			*valid_map;
 	atomic_t			owner_prod;
 	atomic_t			lock;
-	bool				(*supports_cmd)(struct arm_smmu_cmdq_ent *ent);
+	bool				(*supports_cmd)(struct arm_smmu_cmd *cmd);
 };
 
 static inline bool arm_smmu_cmdq_supports_cmd(struct arm_smmu_cmdq *cmdq,
-					      struct arm_smmu_cmdq_ent *ent)
+					      struct arm_smmu_cmd *cmd)
 {
-	return cmdq->supports_cmd ? cmdq->supports_cmd(ent) : true;
+	return cmdq->supports_cmd ? cmdq->supports_cmd(cmd) : true;
 }
 
 struct arm_smmu_cmdq_batch {
-	u64				cmds[CMDQ_BATCH_ENTRIES * CMDQ_ENT_DWORDS];
+	struct arm_smmu_cmd		cmds[CMDQ_BATCH_ENTRIES];
 	struct arm_smmu_cmdq		*cmdq;
 	int				num;
 };
@@ -666,10 +743,9 @@ struct arm_smmu_inv {
 	u8 size_opcode;
 	u8 nsize_opcode;
 	u32 id; /* ASID or VMID or SID */
-	union {
-		size_t pgsize; /* ARM_SMMU_FEAT_RANGE_INV */
-		u32 ssid; /* INV_TYPE_ATS */
-	};
+
+	/* Only used by INV_TYPE_ATS */
+	u32 ssid;
 
 	int users; /* users=0 to mark as a trash to be purged */
 };
@@ -689,6 +765,9 @@ static inline bool arm_smmu_inv_is_ats(const struct arm_smmu_inv *inv)
  *               Must not be greater than @num_invs
  * @rwlock: optional rwlock to fence ATS operations
  * @has_ats: flag if the array contains an INV_TYPE_ATS or INV_TYPE_ATS_FULL
+ * @has_range_inv: flag if any entry's SMMU supports range invalidation
+ * @has_full_cont_range_inv: flag if any entry's SMMU requires the CONT range
+ *                           invalidation workaround
  * @rcu: rcu head for kfree_rcu()
  * @inv: flexible invalidation array
  *
@@ -718,6 +797,8 @@ struct arm_smmu_invs {
 	size_t num_trashes;
 	rwlock_t rwlock;
 	bool has_ats;
+	bool has_range_inv;
+	bool has_full_cont_range_inv;
 	struct rcu_head rcu;
 	struct arm_smmu_inv inv[] __counted_by(max_invs);
 };
@@ -726,7 +807,7 @@ static inline struct arm_smmu_invs *arm_smmu_invs_alloc(size_t num_invs)
 {
 	struct arm_smmu_invs *new_invs;
 
-	new_invs = kzalloc(struct_size(new_invs, inv, num_invs), GFP_KERNEL);
+	new_invs = kzalloc_flex(*new_invs, inv, num_invs);
 	if (!new_invs)
 		return NULL;
 	new_invs->max_invs = num_invs;
@@ -734,6 +815,40 @@ static inline struct arm_smmu_invs *arm_smmu_invs_alloc(size_t num_invs)
 	rwlock_init(&new_invs->rwlock);
 	return new_invs;
 }
+
+/* Generic page-table level 0 is the leaf-only level. */
+static inline unsigned int arm_smmu_pt_level_to_lg2sz(unsigned int tgsz_lg2,
+						      unsigned int level)
+{
+	return tgsz_lg2 + (tgsz_lg2 - ilog2(sizeof(u64))) * level;
+}
+
+static inline unsigned int arm_smmu_pt_lg2sz_to_level(unsigned int tgsz_lg2,
+						      unsigned int lg2sz)
+{
+	return (lg2sz - tgsz_lg2) / (tgsz_lg2 - ilog2(sizeof(u64)));
+}
+
+struct arm_smmu_tlbi {
+	unsigned long iova;
+	size_t size;
+	/* page or block size of the leaf iopte */
+	unsigned int iopte_size;
+	/* Base Translation Granule of the page table */
+	u8 tgsz_lg2;
+	bool leaf_only;
+
+	struct {
+		bool use_full_inv;
+		u16 num;
+	} single;
+
+	struct {
+		bool use_full_inv;
+		u8 num_cmds;
+		struct arm_smmu_cmd cmds[2];
+	} range;
+};
 
 struct arm_smmu_evtq {
 	struct arm_smmu_queue		q;
@@ -804,10 +919,11 @@ struct arm_smmu_strtab_cfg {
 
 struct arm_smmu_impl_ops {
 	int (*device_reset)(struct arm_smmu_device *smmu);
+	void (*device_disable)(struct arm_smmu_device *smmu);
 	void (*device_remove)(struct arm_smmu_device *smmu);
 	int (*init_structures)(struct arm_smmu_device *smmu);
 	struct arm_smmu_cmdq *(*get_secondary_cmdq)(
-		struct arm_smmu_device *smmu, struct arm_smmu_cmdq_ent *ent);
+		struct arm_smmu_device *smmu, struct arm_smmu_cmd *cmd);
 	/*
 	 * An implementation should define its own type other than the default
 	 * IOMMU_HW_INFO_TYPE_ARM_SMMUV3. And it must validate the input @type
@@ -854,6 +970,8 @@ struct arm_smmu_device {
 #define ARM_SMMU_FEAT_HD		(1 << 22)
 #define ARM_SMMU_FEAT_S2FWB		(1 << 23)
 #define ARM_SMMU_FEAT_BBML2		(1 << 24)
+#define ARM_SMMU_FEAT_HAFT		(1 << 25)
+#define ARM_SMMU_FEAT_DS		(1 << 26)
 	u32				features;
 
 #define ARM_SMMU_OPT_SKIP_PREFETCH	(1 << 0)
@@ -861,6 +979,12 @@ struct arm_smmu_device {
 #define ARM_SMMU_OPT_MSIPOLL		(1 << 2)
 #define ARM_SMMU_OPT_CMDQ_FORCE_SYNC	(1 << 3)
 #define ARM_SMMU_OPT_TEGRA241_CMDQV	(1 << 4)
+#define ARM_SMMU_OPT_OVR_INSTCFG_DATA	(1 << 5)
+/*
+ * Range invalidation is mandatory and one range invalidation must fully span an
+ * invalidated CONT
+ */
+#define ARM_SMMU_OPT_FULL_CONT_RANGE_INV (1 << 6)
 	u32				options;
 
 	struct arm_smmu_cmdq		cmdq;
@@ -943,6 +1067,7 @@ struct arm_smmu_master {
 	bool				ats_enabled : 1;
 	bool				ste_ats_enabled : 1;
 	bool				stall_enabled;
+	bool				ats_always_on;
 	unsigned int			ssid_bits;
 	unsigned int			iopf_refcount;
 };
@@ -975,6 +1100,7 @@ struct arm_smmu_domain {
 	spinlock_t			devices_lock;
 	bool				enforce_cache_coherency : 1;
 	bool				nest_parent : 1;
+	u8				tgsz_lg2;
 
 	struct mmu_notifier		mmu_notifier;
 };
@@ -1080,17 +1206,24 @@ int arm_smmu_set_pasid(struct arm_smmu_master *master,
 		       struct arm_smmu_domain *smmu_domain, ioasid_t pasid,
 		       struct arm_smmu_cd *cd, struct iommu_domain *old);
 
-void arm_smmu_domain_inv_range(struct arm_smmu_domain *smmu_domain,
-			       unsigned long iova, size_t size,
-			       unsigned int granule, bool leaf);
+void arm_smmu_domain_tlbi(struct arm_smmu_tlbi *tlbi,
+			  struct arm_smmu_domain *smmu_domain);
 
 static inline void arm_smmu_domain_inv(struct arm_smmu_domain *smmu_domain)
 {
-	arm_smmu_domain_inv_range(smmu_domain, 0, 0, 0, false);
+	/* Prefilled for invalidate all */
+	struct arm_smmu_tlbi tlbi = {
+		.tgsz_lg2 = smmu_domain->tgsz_lg2,
+		.single.use_full_inv = true,
+		.range.use_full_inv = true,
+	};
+
+	arm_smmu_domain_tlbi(&tlbi, smmu_domain);
 }
 
 void __arm_smmu_cmdq_skip_err(struct arm_smmu_device *smmu,
 			      struct arm_smmu_cmdq *cmdq);
+u32 arm_smmu_cmdq_max_n_shift(u32 hw_max_n_shift);
 int arm_smmu_init_one_queue(struct arm_smmu_device *smmu,
 			    struct arm_smmu_queue *q, void __iomem *page,
 			    unsigned long prod_off, unsigned long cons_off,
@@ -1130,18 +1263,26 @@ struct arm_smmu_attach_state {
 	struct arm_smmu_vmaster *vmaster;
 	struct arm_smmu_inv_state old_domain_invst;
 	struct arm_smmu_inv_state new_domain_invst;
+	struct arm_smmu_master_domain *old_master_domain;
 	bool ats_enabled;
 };
 
 int arm_smmu_attach_prepare(struct arm_smmu_attach_state *state,
 			    struct iommu_domain *new_domain);
 void arm_smmu_attach_commit(struct arm_smmu_attach_state *state);
+void arm_smmu_attach_release(struct arm_smmu_attach_state *state);
 void arm_smmu_install_ste_for_dev(struct arm_smmu_master *master,
 				  const struct arm_smmu_ste *target);
 
+int __arm_smmu_cmdq_issue_cmdlist(struct arm_smmu_device *smmu,
+				  struct arm_smmu_cmdq *cmdq,
+				  struct arm_smmu_cmd *cmds, int n,
+				  bool sync);
 int arm_smmu_cmdq_issue_cmdlist(struct arm_smmu_device *smmu,
-				struct arm_smmu_cmdq *cmdq, u64 *cmds, int n,
+				struct arm_smmu_cmdq *cmdq,
+				struct arm_smmu_cmd *cmds, int n,
 				bool sync);
+bool arm_smmu_erratum_repeat_tlbi_cfgi(void);
 
 #ifdef CONFIG_ARM_SMMU_V3_SVA
 bool arm_smmu_sva_supported(struct arm_smmu_device *smmu);

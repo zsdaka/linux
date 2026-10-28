@@ -7,7 +7,7 @@
 #include <linux/etherdevice.h>
 #include <linux/crc32.h>
 #include <net/mac80211.h>
-#include "iwl-io.h"
+#include "iwl-trans.h"
 #include "iwl-prph.h"
 #include "fw-api.h"
 #include "mvm.h"
@@ -644,11 +644,12 @@ __le32 iwl_mvm_mac_ctxt_cmd_p2p_sta_get_oppps_ctwin(struct iwl_mvm *mvm,
 u32 iwl_mvm_mac_ctxt_cmd_sta_get_twt_policy(struct iwl_mvm *mvm,
 					    struct ieee80211_vif *vif)
 {
+	struct iwl_mvm_vif *mvmvif = iwl_mvm_vif_from_mac80211(vif);
 	u32 twt_policy = 0;
 
 	if (vif->bss_conf.twt_requester && IWL_MVM_USE_TWT)
 		twt_policy |= TWT_SUPPORTED;
-	if (vif->bss_conf.twt_protected)
+	if (mvmvif->ap_sta && mvmvif->ap_sta->twt_protected)
 		twt_policy |= PROTECTED_TWT_SUPPORTED;
 	if (vif->bss_conf.twt_broadcast)
 		twt_policy |= BROADCAST_TWT_SUPPORTED;
@@ -931,13 +932,13 @@ u16 iwl_mvm_mac_ctxt_get_beacon_flags(const struct iwl_fw *fw, u8 rate_idx)
 	u16 flags = 0;
 
 	if (rate_idx <= IWL_LAST_CCK_RATE)
-		flags |= is_new_rate ? IWL_MAC_BEACON_CCK
-			  : IWL_MAC_BEACON_CCK_V1;
+		flags |= is_new_rate ? (u16)IWL_MAC_BEACON_CCK
+			  : (u16)IWL_MAC_BEACON_CCK_V1;
 
 	if (iwl_fw_lookup_cmd_ver(fw, TX_CMD, 0) > 8)
-		flags |= iwl_mvm_mac80211_idx_to_hwrate(fw, rate_idx);
+		flags |= iwl_mvm_rate_idx_to_fw_idx(fw, rate_idx);
 	else
-		flags |= iwl_fw_rate_idx_to_plcp(rate_idx);
+		flags |= iwl_mvm_rate_idx_to_plcp(rate_idx);
 
 	return flags;
 }
@@ -998,7 +999,7 @@ static void iwl_mvm_mac_ctxt_set_tx(struct iwl_mvm *mvm,
 	else
 		rate_n_flags |= RATE_MCS_MOD_TYPE_LEGACY_OFDM;
 
-	rate_n_flags |= iwl_mvm_mac80211_idx_to_hwrate(mvm->fw, rate);
+	rate_n_flags |= iwl_mvm_rate_idx_to_fw_idx(mvm->fw, rate);
 
 	tx_params->rate_n_flags = iwl_mvm_v3_rate_to_fw(rate_n_flags,
 							mvm->fw_rates_ver);
@@ -1108,8 +1109,8 @@ static int iwl_mvm_mac_ctxt_send_beacon_v9(struct iwl_mvm *mvm,
 	if (iwl_mvm_enable_fils(mvm, vif, ctx)) {
 		flags |= iwl_fw_lookup_cmd_ver(mvm->fw, BEACON_TEMPLATE_CMD,
 					       0) > 10 ?
-			IWL_MAC_BEACON_FILS :
-			IWL_MAC_BEACON_FILS_V1;
+			(u16)IWL_MAC_BEACON_FILS :
+			(u16)IWL_MAC_BEACON_FILS_V1;
 		beacon_cmd.short_ssid =
 			cpu_to_le32(~crc32_le(~0, vif->cfg.ssid,
 					      vif->cfg.ssid_len));
@@ -1493,49 +1494,54 @@ void iwl_mvm_rx_beacon_notif(struct iwl_mvm *mvm,
 {
 	struct iwl_rx_packet *pkt = rxb_addr(rxb);
 	unsigned int pkt_len = iwl_rx_packet_payload_len(pkt);
-	struct iwl_extended_beacon_notif *beacon = (void *)pkt->data;
-	struct iwl_extended_beacon_notif_v5 *beacon_v5 = (void *)pkt->data;
 	struct ieee80211_vif *csa_vif;
 	struct ieee80211_vif *tx_blocked_vif;
 	struct agg_tx_status *agg_status;
+	u32 beacon_gp2;
 	u16 status;
 
 	lockdep_assert_held(&mvm->mutex);
 
-	mvm->ap_last_beacon_gp2 = le32_to_cpu(beacon->gp2);
-
 	if (!iwl_mvm_is_short_beacon_notif_supported(mvm)) {
+		struct iwl_extended_beacon_notif_v5 *beacon = (void *)pkt->data;
 		struct iwl_tx_resp *beacon_notify_hdr =
-			&beacon_v5->beacon_notify_hdr;
+			&beacon->beacon_notify_hdr;
 
-		if (unlikely(pkt_len < sizeof(*beacon_v5)))
+		if (unlikely(pkt_len < sizeof(*beacon)))
 			return;
 
-		mvm->ibss_manager = beacon_v5->ibss_mgr_status != 0;
+		beacon_gp2 = le32_to_cpu(beacon->gp2);
+
+		mvm->ibss_manager = beacon->ibss_mgr_status != 0;
 		agg_status = iwl_mvm_get_agg_status(mvm, beacon_notify_hdr);
 		status = le16_to_cpu(agg_status->status) & TX_STATUS_MSK;
 		IWL_DEBUG_RX(mvm,
 			     "beacon status %#x retries:%d tsf:0x%016llX gp2:0x%X rate:%d\n",
 			     status, beacon_notify_hdr->failure_frame,
 			     le64_to_cpu(beacon->tsf),
-			     mvm->ap_last_beacon_gp2,
+			     beacon_gp2,
 			     le32_to_cpu(beacon_notify_hdr->initial_rate));
 	} else {
+		const struct iwl_extended_beacon_notif *beacon =
+			(void *)pkt->data;
+
 		if (unlikely(pkt_len < sizeof(*beacon)))
 			return;
+
+		beacon_gp2 = le32_to_cpu(beacon->gp2);
 
 		mvm->ibss_manager = beacon->ibss_mgr_status != 0;
 		status = le32_to_cpu(beacon->status) & TX_STATUS_MSK;
 		IWL_DEBUG_RX(mvm,
 			     "beacon status %#x tsf:0x%016llX gp2:0x%X\n",
 			     status, le64_to_cpu(beacon->tsf),
-			     mvm->ap_last_beacon_gp2);
+			     beacon_gp2);
 	}
 
 	csa_vif = rcu_dereference_protected(mvm->csa_vif,
 					    lockdep_is_held(&mvm->mutex));
 	if (unlikely(csa_vif && csa_vif->bss_conf.csa_active))
-		iwl_mvm_csa_count_down(mvm, csa_vif, mvm->ap_last_beacon_gp2,
+		iwl_mvm_csa_count_down(mvm, csa_vif, beacon_gp2,
 				       (status == TX_STATUS_SUCCESS));
 
 	tx_blocked_vif = rcu_dereference_protected(mvm->csa_tx_blocked_vif,

@@ -159,7 +159,23 @@ struct drm_crtc_commit {
 
 struct __drm_colorops_state {
 	struct drm_colorop *ptr;
-	struct drm_colorop_state *state, *old_state, *new_state;
+
+	/**
+	 * @state_to_destroy:
+	 *
+	 * Used to track the @drm_colorop_state we will need to free
+	 * when tearing down the associated &drm_atomic_commit in
+	 * $drm_mode_config_funcs.atomic_state_clear or
+	 * drm_atomic_commit_default_clear().
+	 *
+	 * Before a commit, and the call to
+	 * drm_atomic_helper_swap_state() in particular, it points to
+	 * the same state than @new_state. After a commit, it points to
+	 * the same state than @old_state.
+	 */
+	struct drm_colorop_state *state_to_destroy;
+
+	struct drm_colorop_state *old_state, *new_state;
 };
 
 struct __drm_planes_state {
@@ -169,9 +185,9 @@ struct __drm_planes_state {
 	 * @state_to_destroy:
 	 *
 	 * Used to track the @drm_plane_state we will need to free when
-	 * tearing down the associated &drm_atomic_state in
+	 * tearing down the associated &drm_atomic_commit in
 	 * $drm_mode_config_funcs.atomic_state_clear or
-	 * drm_atomic_state_default_clear().
+	 * drm_atomic_commit_default_clear().
 	 *
 	 * Before a commit, and the call to
 	 * drm_atomic_helper_swap_state() in particular, it points to
@@ -190,9 +206,9 @@ struct __drm_crtcs_state {
 	 * @state_to_destroy:
 	 *
 	 * Used to track the @drm_crtc_state we will need to free when
-	 * tearing down the associated &drm_atomic_state in
+	 * tearing down the associated &drm_atomic_commit in
 	 * $drm_mode_config_funcs.atomic_state_clear or
-	 * drm_atomic_state_default_clear().
+	 * drm_atomic_commit_default_clear().
 	 *
 	 * Before a commit, and the call to
 	 * drm_atomic_helper_swap_state() in particular, it points to
@@ -224,9 +240,9 @@ struct __drm_connnectors_state {
 	 * @state_to_destroy:
 	 *
 	 * Used to track the @drm_connector_state we will need to free
-	 * when tearing down the associated &drm_atomic_state in
+	 * when tearing down the associated &drm_atomic_commit in
 	 * $drm_mode_config_funcs.atomic_state_clear or
-	 * drm_atomic_state_default_clear().
+	 * drm_atomic_commit_default_clear().
 	 *
 	 * Before a commit, and the call to
 	 * drm_atomic_helper_swap_state() in particular, it points to
@@ -265,7 +281,10 @@ struct drm_private_state_funcs {
 	 * @atomic_create_state:
 	 *
 	 * Allocates a pristine, initialized, state for the private
-	 * object and returns it.
+	 * object and returns it. This callback must have no side
+	 * effects: in particular, the returned state must not be
+	 * assigned to the object's state pointer and it must not affect
+	 * the hardware state.
 	 *
 	 * RETURNS:
 	 *
@@ -402,9 +421,9 @@ struct drm_private_obj {
  */
 struct drm_private_state {
 	/**
-	 * @state: backpointer to global drm_atomic_state
+	 * @state: backpointer to global drm_atomic_commit
 	 */
-	struct drm_atomic_state *state;
+	struct drm_atomic_commit *state;
 
 	/**
 	 * @obj: backpointer to the private object
@@ -419,9 +438,9 @@ struct __drm_private_objs_state {
 	 * @state_to_destroy:
 	 *
 	 * Used to track the @drm_private_state we will need to free
-	 * when tearing down the associated &drm_atomic_state in
+	 * when tearing down the associated &drm_atomic_commit in
 	 * $drm_mode_config_funcs.atomic_state_clear or
-	 * drm_atomic_state_default_clear().
+	 * drm_atomic_commit_default_clear().
 	 *
 	 * Before a commit, and the call to
 	 * drm_atomic_helper_swap_state() in particular, it points to
@@ -434,7 +453,7 @@ struct __drm_private_objs_state {
 };
 
 /**
- * struct drm_atomic_state - Atomic commit structure
+ * struct drm_atomic_commit - Atomic commit structure
  *
  * This structure is the kernel counterpart of @drm_mode_atomic and represents
  * an atomic commit that transitions from an old to a new display state. It
@@ -446,25 +465,25 @@ struct __drm_private_objs_state {
  * drm_atomic_get_plane_state(), drm_atomic_get_connector_state(), or for
  * private state structures, drm_atomic_get_private_obj_state().
  *
- * NOTE: struct drm_atomic_state first started as a single collection of
+ * NOTE: struct drm_atomic_commit first started as a single collection of
  * entities state pointers (drm_plane_state, drm_crtc_state, etc.).
  *
  * At atomic_check time, you could get the state about to be committed
- * from drm_atomic_state, and the one currently running from the
+ * from drm_atomic_commit, and the one currently running from the
  * entities state pointer (drm_crtc.state, for example). After the call
  * to drm_atomic_helper_swap_state(), the entities state pointer would
- * contain the state previously checked, and the drm_atomic_state
+ * contain the state previously checked, and the drm_atomic_commit
  * structure the old state.
  *
- * Over time, and in order to avoid confusion, drm_atomic_state has
+ * Over time, and in order to avoid confusion, drm_atomic_commit has
  * grown to have both the old state (ie, the state we replace) and the
  * new state (ie, the state we want to apply). Those names are stable
  * during the commit process, which makes it easier to reason about.
  *
  * You can still find some traces of that evolution through some hooks
- * or callbacks taking a drm_atomic_state parameter called names like
+ * or callbacks taking a drm_atomic_commit parameter called names like
  * "old_state". This doesn't necessarily mean that the previous
- * drm_atomic_state is passed, but rather that this used to be the state
+ * drm_atomic_commit is passed, but rather that this used to be the state
  * collection we were replacing after drm_atomic_helper_swap_state(),
  * but the variable name was never updated.
  *
@@ -472,12 +491,12 @@ struct __drm_private_objs_state {
  * first started to pass the entity state only. However, it was pretty
  * cumbersome for drivers, and especially CRTCs, to retrieve the states
  * of other components. Thus, we switched to passing the whole
- * drm_atomic_state as a parameter to those operations. Similarly, the
+ * drm_atomic_commit as a parameter to those operations. Similarly, the
  * transition isn't complete yet, and one might still find atomic
- * operations taking a drm_atomic_state pointer, or a component state
+ * operations taking a drm_atomic_commit pointer, or a component state
  * pointer. The former is the preferred form.
  */
-struct drm_atomic_state {
+struct drm_atomic_commit {
 	/**
 	 * @ref:
 	 *
@@ -679,61 +698,61 @@ static inline void drm_crtc_commit_put(struct drm_crtc_commit *commit)
 
 int drm_crtc_commit_wait(struct drm_crtc_commit *commit);
 
-struct drm_atomic_state * __must_check
-drm_atomic_state_alloc(struct drm_device *dev);
-void drm_atomic_state_clear(struct drm_atomic_state *state);
+struct drm_atomic_commit * __must_check
+drm_atomic_commit_alloc(struct drm_device *dev);
+void drm_atomic_commit_clear(struct drm_atomic_commit *state);
 
 /**
- * drm_atomic_state_get - acquire a reference to the atomic state
+ * drm_atomic_commit_get - acquire a reference to the atomic state
  * @state: The atomic state
  *
  * Returns a new reference to the @state
  */
-static inline struct drm_atomic_state *
-drm_atomic_state_get(struct drm_atomic_state *state)
+static inline struct drm_atomic_commit *
+drm_atomic_commit_get(struct drm_atomic_commit *state)
 {
 	kref_get(&state->ref);
 	return state;
 }
 
-void __drm_atomic_state_free(struct kref *ref);
+void __drm_atomic_commit_free(struct kref *ref);
 
 /**
- * drm_atomic_state_put - release a reference to the atomic state
+ * drm_atomic_commit_put - release a reference to the atomic state
  * @state: The atomic state
  *
  * This releases a reference to @state which is freed after removing the
  * final reference. No locking required and callable from any context.
  */
-static inline void drm_atomic_state_put(struct drm_atomic_state *state)
+static inline void drm_atomic_commit_put(struct drm_atomic_commit *state)
 {
-	kref_put(&state->ref, __drm_atomic_state_free);
+	kref_put(&state->ref, __drm_atomic_commit_free);
 }
 
 int  __must_check
-drm_atomic_state_init(struct drm_device *dev, struct drm_atomic_state *state);
-void drm_atomic_state_default_clear(struct drm_atomic_state *state);
-void drm_atomic_state_default_release(struct drm_atomic_state *state);
+drm_atomic_commit_init(struct drm_device *dev, struct drm_atomic_commit *state);
+void drm_atomic_commit_default_clear(struct drm_atomic_commit *state);
+void drm_atomic_commit_default_release(struct drm_atomic_commit *state);
 
 struct drm_crtc_state * __must_check
-drm_atomic_get_crtc_state(struct drm_atomic_state *state,
+drm_atomic_get_crtc_state(struct drm_atomic_commit *state,
 			  struct drm_crtc *crtc);
 struct drm_plane_state * __must_check
-drm_atomic_get_plane_state(struct drm_atomic_state *state,
+drm_atomic_get_plane_state(struct drm_atomic_commit *state,
 			   struct drm_plane *plane);
 struct drm_colorop_state *
-drm_atomic_get_colorop_state(struct drm_atomic_state *state,
+drm_atomic_get_colorop_state(struct drm_atomic_commit *state,
 			     struct drm_colorop *colorop);
 
 struct drm_colorop_state *
-drm_atomic_get_old_colorop_state(struct drm_atomic_state *state,
+drm_atomic_get_old_colorop_state(struct drm_atomic_commit *state,
 				 struct drm_colorop *colorop);
 struct drm_colorop_state *
-drm_atomic_get_new_colorop_state(struct drm_atomic_state *state,
+drm_atomic_get_new_colorop_state(struct drm_atomic_commit *state,
 				 struct drm_colorop *colorop);
 
 struct drm_connector_state * __must_check
-drm_atomic_get_connector_state(struct drm_atomic_state *state,
+drm_atomic_get_connector_state(struct drm_atomic_commit *state,
 			       struct drm_connector *connector);
 
 int drm_atomic_private_obj_init(struct drm_device *dev,
@@ -742,30 +761,30 @@ int drm_atomic_private_obj_init(struct drm_device *dev,
 void drm_atomic_private_obj_fini(struct drm_private_obj *obj);
 
 struct drm_private_state * __must_check
-drm_atomic_get_private_obj_state(struct drm_atomic_state *state,
+drm_atomic_get_private_obj_state(struct drm_atomic_commit *state,
 				 struct drm_private_obj *obj);
 struct drm_private_state *
-drm_atomic_get_old_private_obj_state(const struct drm_atomic_state *state,
+drm_atomic_get_old_private_obj_state(const struct drm_atomic_commit *state,
 				     struct drm_private_obj *obj);
 struct drm_private_state *
-drm_atomic_get_new_private_obj_state(const struct drm_atomic_state *state,
+drm_atomic_get_new_private_obj_state(const struct drm_atomic_commit *state,
 				     struct drm_private_obj *obj);
 
 struct drm_connector *
-drm_atomic_get_old_connector_for_encoder(const struct drm_atomic_state *state,
+drm_atomic_get_old_connector_for_encoder(const struct drm_atomic_commit *state,
 					 struct drm_encoder *encoder);
 struct drm_connector *
-drm_atomic_get_new_connector_for_encoder(const struct drm_atomic_state *state,
+drm_atomic_get_new_connector_for_encoder(const struct drm_atomic_commit *state,
 					 struct drm_encoder *encoder);
 struct drm_connector *
 drm_atomic_get_connector_for_encoder(const struct drm_encoder *encoder,
 				     struct drm_modeset_acquire_ctx *ctx);
 
 struct drm_crtc *
-drm_atomic_get_old_crtc_for_encoder(struct drm_atomic_state *state,
+drm_atomic_get_old_crtc_for_encoder(struct drm_atomic_commit *state,
 					 struct drm_encoder *encoder);
 struct drm_crtc *
-drm_atomic_get_new_crtc_for_encoder(struct drm_atomic_state *state,
+drm_atomic_get_new_crtc_for_encoder(struct drm_atomic_commit *state,
 					 struct drm_encoder *encoder);
 
 /**
@@ -777,7 +796,7 @@ drm_atomic_get_new_crtc_for_encoder(struct drm_atomic_state *state,
  * NULL if the CRTC is not part of the global atomic state.
  */
 static inline struct drm_crtc_state *
-drm_atomic_get_old_crtc_state(const struct drm_atomic_state *state,
+drm_atomic_get_old_crtc_state(const struct drm_atomic_commit *state,
 			      struct drm_crtc *crtc)
 {
 	return state->crtcs[drm_crtc_index(crtc)].old_state;
@@ -791,7 +810,7 @@ drm_atomic_get_old_crtc_state(const struct drm_atomic_state *state,
  * NULL if the CRTC is not part of the global atomic state.
  */
 static inline struct drm_crtc_state *
-drm_atomic_get_new_crtc_state(const struct drm_atomic_state *state,
+drm_atomic_get_new_crtc_state(const struct drm_atomic_commit *state,
 			      struct drm_crtc *crtc)
 {
 	return state->crtcs[drm_crtc_index(crtc)].new_state;
@@ -806,7 +825,7 @@ drm_atomic_get_new_crtc_state(const struct drm_atomic_state *state,
  * NULL if the plane is not part of the global atomic state.
  */
 static inline struct drm_plane_state *
-drm_atomic_get_old_plane_state(const struct drm_atomic_state *state,
+drm_atomic_get_old_plane_state(const struct drm_atomic_commit *state,
 			       struct drm_plane *plane)
 {
 	return state->planes[drm_plane_index(plane)].old_state;
@@ -821,7 +840,7 @@ drm_atomic_get_old_plane_state(const struct drm_atomic_state *state,
  * NULL if the plane is not part of the global atomic state.
  */
 static inline struct drm_plane_state *
-drm_atomic_get_new_plane_state(const struct drm_atomic_state *state,
+drm_atomic_get_new_plane_state(const struct drm_atomic_commit *state,
 			       struct drm_plane *plane)
 {
 	return state->planes[drm_plane_index(plane)].new_state;
@@ -836,7 +855,7 @@ drm_atomic_get_new_plane_state(const struct drm_atomic_state *state,
  * or NULL if the connector is not part of the global atomic state.
  */
 static inline struct drm_connector_state *
-drm_atomic_get_old_connector_state(const struct drm_atomic_state *state,
+drm_atomic_get_old_connector_state(const struct drm_atomic_commit *state,
 				   struct drm_connector *connector)
 {
 	int index = drm_connector_index(connector);
@@ -856,7 +875,7 @@ drm_atomic_get_old_connector_state(const struct drm_atomic_state *state,
  * or NULL if the connector is not part of the global atomic state.
  */
 static inline struct drm_connector_state *
-drm_atomic_get_new_connector_state(const struct drm_atomic_state *state,
+drm_atomic_get_new_connector_state(const struct drm_atomic_commit *state,
 				   struct drm_connector *connector)
 {
 	int index = drm_connector_index(connector);
@@ -894,7 +913,7 @@ drm_atomic_get_new_connector_state(const struct drm_atomic_state *state,
  * Read-only pointer to the current plane state.
  */
 static inline const struct drm_plane_state *
-__drm_atomic_get_current_plane_state(const struct drm_atomic_state *state,
+__drm_atomic_get_current_plane_state(const struct drm_atomic_commit *state,
 				     struct drm_plane *plane)
 {
 	struct drm_plane_state *plane_state;
@@ -910,27 +929,27 @@ __drm_atomic_get_current_plane_state(const struct drm_atomic_state *state,
 }
 
 int __must_check
-drm_atomic_add_encoder_bridges(struct drm_atomic_state *state,
+drm_atomic_add_encoder_bridges(struct drm_atomic_commit *state,
 			       struct drm_encoder *encoder);
 int __must_check
-drm_atomic_add_affected_connectors(struct drm_atomic_state *state,
+drm_atomic_add_affected_connectors(struct drm_atomic_commit *state,
 				   struct drm_crtc *crtc);
 int __must_check
-drm_atomic_add_affected_planes(struct drm_atomic_state *state,
+drm_atomic_add_affected_planes(struct drm_atomic_commit *state,
 			       struct drm_crtc *crtc);
 int __must_check
-drm_atomic_add_affected_colorops(struct drm_atomic_state *state,
+drm_atomic_add_affected_colorops(struct drm_atomic_commit *state,
 				 struct drm_plane *plane);
 
-int __must_check drm_atomic_check_only(struct drm_atomic_state *state);
-int __must_check drm_atomic_commit(struct drm_atomic_state *state);
-int __must_check drm_atomic_nonblocking_commit(struct drm_atomic_state *state);
+int __must_check drm_atomic_check_only(struct drm_atomic_commit *state);
+int __must_check drm_atomic_commit(struct drm_atomic_commit *state);
+int __must_check drm_atomic_nonblocking_commit(struct drm_atomic_commit *state);
 
 void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 
 /**
  * for_each_oldnew_connector_in_state - iterate over all connectors in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @connector: &struct drm_connector iteration cursor
  * @old_connector_state: &struct drm_connector_state iteration cursor for the
  * 	old state
@@ -948,13 +967,15 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 	     (__i)++)								\
 		for_each_if ((__state)->connectors[__i].ptr &&			\
 			     ((connector) = (__state)->connectors[__i].ptr,	\
-			     (void)(connector) /* Only to avoid unused-but-set-variable warning */, \
-			     (old_connector_state) = (__state)->connectors[__i].old_state,	\
-			     (new_connector_state) = (__state)->connectors[__i].new_state, 1))
+			      (void)(connector) /* Only to avoid unused-but-set-variable warning */, \
+			      (old_connector_state) = (__state)->connectors[__i].old_state,	\
+			      (void)(old_connector_state) /* Only to avoid unused-but-set-variable warning */, \
+			      (new_connector_state) = (__state)->connectors[__i].new_state,	\
+			      (void)(new_connector_state) /* Only to avoid unused-but-set-variable warning */, 1))
 
 /**
  * for_each_old_connector_in_state - iterate over all connectors in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @connector: &struct drm_connector iteration cursor
  * @old_connector_state: &struct drm_connector_state iteration cursor for the
  * 	old state
@@ -970,12 +991,13 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 	     (__i)++)								\
 		for_each_if ((__state)->connectors[__i].ptr &&			\
 			     ((connector) = (__state)->connectors[__i].ptr,	\
-			     (void)(connector) /* Only to avoid unused-but-set-variable warning */, \
-			     (old_connector_state) = (__state)->connectors[__i].old_state, 1))
+			      (void)(connector) /* Only to avoid unused-but-set-variable warning */, \
+			      (old_connector_state) = (__state)->connectors[__i].old_state, \
+			      (void)(old_connector_state) /* Only to avoid unused-but-set-variable warning */, 1))
 
 /**
  * for_each_new_connector_in_state - iterate over all connectors in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @connector: &struct drm_connector iteration cursor
  * @new_connector_state: &struct drm_connector_state iteration cursor for the
  * 	new state
@@ -991,13 +1013,13 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 	     (__i)++)								\
 		for_each_if ((__state)->connectors[__i].ptr &&			\
 			     ((connector) = (__state)->connectors[__i].ptr,	\
-			     (void)(connector) /* Only to avoid unused-but-set-variable warning */, \
-			     (new_connector_state) = (__state)->connectors[__i].new_state, \
-			     (void)(new_connector_state) /* Only to avoid unused-but-set-variable warning */, 1))
+			      (void)(connector) /* Only to avoid unused-but-set-variable warning */, \
+			      (new_connector_state) = (__state)->connectors[__i].new_state, \
+			      (void)(new_connector_state) /* Only to avoid unused-but-set-variable warning */, 1))
 
 /**
  * for_each_oldnew_crtc_in_state - iterate over all CRTCs in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @crtc: &struct drm_crtc iteration cursor
  * @old_crtc_state: &struct drm_crtc_state iteration cursor for the old state
  * @new_crtc_state: &struct drm_crtc_state iteration cursor for the new state
@@ -1014,14 +1036,14 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 		for_each_if ((__state)->crtcs[__i].ptr &&		\
 			     ((crtc) = (__state)->crtcs[__i].ptr,	\
 			      (void)(crtc) /* Only to avoid unused-but-set-variable warning */, \
-			     (old_crtc_state) = (__state)->crtcs[__i].old_state, \
-			     (void)(old_crtc_state) /* Only to avoid unused-but-set-variable warning */, \
-			     (new_crtc_state) = (__state)->crtcs[__i].new_state, \
-			     (void)(new_crtc_state) /* Only to avoid unused-but-set-variable warning */, 1))
+			      (old_crtc_state) = (__state)->crtcs[__i].old_state, \
+			      (void)(old_crtc_state) /* Only to avoid unused-but-set-variable warning */, \
+			      (new_crtc_state) = (__state)->crtcs[__i].new_state, \
+			      (void)(new_crtc_state) /* Only to avoid unused-but-set-variable warning */, 1))
 
 /**
  * for_each_old_crtc_in_state - iterate over all CRTCs in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @crtc: &struct drm_crtc iteration cursor
  * @old_crtc_state: &struct drm_crtc_state iteration cursor for the old state
  * @__i: int iteration cursor, for macro-internal use
@@ -1037,11 +1059,12 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 		for_each_if ((__state)->crtcs[__i].ptr &&		\
 			     ((crtc) = (__state)->crtcs[__i].ptr,	\
 			     (void)(crtc) /* Only to avoid unused-but-set-variable warning */, \
-			     (old_crtc_state) = (__state)->crtcs[__i].old_state, 1))
+			     (old_crtc_state) = (__state)->crtcs[__i].old_state, \
+			     (void)(old_crtc_state) /* Only to avoid unused-but-set-variable warning */, 1))
 
 /**
  * for_each_new_crtc_in_state - iterate over all CRTCs in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @crtc: &struct drm_crtc iteration cursor
  * @new_crtc_state: &struct drm_crtc_state iteration cursor for the new state
  * @__i: int iteration cursor, for macro-internal use
@@ -1062,7 +1085,7 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 
 /**
  * for_each_oldnew_colorop_in_state - iterate over all colorops in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @colorop: &struct drm_colorop iteration cursor
  * @old_colorop_state: &struct drm_colorop_state iteration cursor for the old state
  * @new_colorop_state: &struct drm_colorop_state iteration cursor for the new state
@@ -1085,7 +1108,7 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 
 /**
  * for_each_new_colorop_in_state - iterate over all colorops in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @colorop: &struct drm_colorop iteration cursor
  * @new_colorop_state: &struct drm_colorop_state iteration cursor for the new state
  * @__i: int iteration cursor, for macro-internal use
@@ -1106,7 +1129,7 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 
 /**
  * for_each_oldnew_plane_in_state - iterate over all planes in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @plane: &struct drm_plane iteration cursor
  * @old_plane_state: &struct drm_plane_state iteration cursor for the old state
  * @new_plane_state: &struct drm_plane_state iteration cursor for the new state
@@ -1123,13 +1146,15 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 		for_each_if ((__state)->planes[__i].ptr &&		\
 			     ((plane) = (__state)->planes[__i].ptr,	\
 			      (void)(plane) /* Only to avoid unused-but-set-variable warning */, \
-			      (old_plane_state) = (__state)->planes[__i].old_state,\
-			      (new_plane_state) = (__state)->planes[__i].new_state, 1))
+			      (old_plane_state) = (__state)->planes[__i].old_state, \
+			      (void)(old_plane_state) /* Only to avoid unused-but-set-variable warning */, \
+			      (new_plane_state) = (__state)->planes[__i].new_state, \
+			      (void)(new_plane_state) /* Only to avoid unused-but-set-variable warning */, 1))
 
 /**
  * for_each_oldnew_plane_in_state_reverse - iterate over all planes in an atomic
  * update in reverse order
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @plane: &struct drm_plane iteration cursor
  * @old_plane_state: &struct drm_plane_state iteration cursor for the old state
  * @new_plane_state: &struct drm_plane_state iteration cursor for the new state
@@ -1145,13 +1170,16 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 	     (__i)--)							\
 		for_each_if ((__state)->planes[__i].ptr &&		\
 			     ((plane) = (__state)->planes[__i].ptr,	\
-			      (old_plane_state) = (__state)->planes[__i].old_state,\
-			      (new_plane_state) = (__state)->planes[__i].new_state, 1))
+			      (void)(plane) /* Only to avoid unused-but-set-variable warning */, \
+			      (old_plane_state) = (__state)->planes[__i].old_state, \
+			      (void)(old_plane_state) /* Only to avoid unused-but-set-variable warning */, \
+			      (new_plane_state) = (__state)->planes[__i].new_state, \
+			      (void)(new_plane_state) /* Only to avoid unused-but-set-variable warning */, 1))
 
 /**
  * for_each_new_plane_in_state_reverse - other than only tracking new state,
  * it's the same as for_each_oldnew_plane_in_state_reverse
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @plane: &struct drm_plane iteration cursor
  * @new_plane_state: &struct drm_plane_state iteration cursor for the new state
  * @__i: int iteration cursor, for macro-internal use
@@ -1162,11 +1190,13 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 	     (__i)--)							\
 		for_each_if ((__state)->planes[__i].ptr &&		\
 			     ((plane) = (__state)->planes[__i].ptr,	\
-			      (new_plane_state) = (__state)->planes[__i].new_state, 1))
+			      (void)(plane) /* Only to avoid unused-but-set-variable warning */, \
+			      (new_plane_state) = (__state)->planes[__i].new_state, \
+			      (void)(new_plane_state) /* Only to avoid unused-but-set-variable warning */, 1))
 
 /**
  * for_each_old_plane_in_state - iterate over all planes in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @plane: &struct drm_plane iteration cursor
  * @old_plane_state: &struct drm_plane_state iteration cursor for the old state
  * @__i: int iteration cursor, for macro-internal use
@@ -1181,10 +1211,13 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 	     (__i)++)							\
 		for_each_if ((__state)->planes[__i].ptr &&		\
 			     ((plane) = (__state)->planes[__i].ptr,	\
-			      (old_plane_state) = (__state)->planes[__i].old_state, 1))
+			      (void)(plane) /* Only to avoid unused-but-set-variable warning */, \
+			      (old_plane_state) = (__state)->planes[__i].old_state, \
+			      (void)(old_plane_state) /* Only to avoid unused-but-set-variable warning */, 1))
+
 /**
  * for_each_new_plane_in_state - iterate over all planes in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @plane: &struct drm_plane iteration cursor
  * @new_plane_state: &struct drm_plane_state iteration cursor for the new state
  * @__i: int iteration cursor, for macro-internal use
@@ -1205,7 +1238,7 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 
 /**
  * for_each_oldnew_private_obj_in_state - iterate over all private objects in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @obj: &struct drm_private_obj iteration cursor
  * @old_obj_state: &struct drm_private_state iteration cursor for the old state
  * @new_obj_state: &struct drm_private_state iteration cursor for the new state
@@ -1219,13 +1252,16 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 	for ((__i) = 0; \
 	     (__i) < (__state)->num_private_objs && \
 		     ((obj) = (__state)->private_objs[__i].ptr, \
+		      (void)(obj) /* Only to avoid unused-but-set-variable warning */, \
 		      (old_obj_state) = (__state)->private_objs[__i].old_state,	\
-		      (new_obj_state) = (__state)->private_objs[__i].new_state, 1); \
+		      (void)(old_obj_state) /* Only to avoid unused-but-set-variable warning */, \
+		      (new_obj_state) = (__state)->private_objs[__i].new_state, \
+		      (void)(new_obj_state) /* Only to avoid unused-but-set-variable warning */, 1); \
 	     (__i)++)
 
 /**
  * for_each_old_private_obj_in_state - iterate over all private objects in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @obj: &struct drm_private_obj iteration cursor
  * @old_obj_state: &struct drm_private_state iteration cursor for the old state
  * @__i: int iteration cursor, for macro-internal use
@@ -1238,12 +1274,14 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 	for ((__i) = 0; \
 	     (__i) < (__state)->num_private_objs && \
 		     ((obj) = (__state)->private_objs[__i].ptr, \
-		      (old_obj_state) = (__state)->private_objs[__i].old_state, 1); \
+		      (void)(obj) /* Only to avoid unused-but-set-variable warning */, \
+		      (old_obj_state) = (__state)->private_objs[__i].old_state, \
+		      (void)(old_obj_state) /* Only to avoid unused-but-set-variable warning */, 1); \
 	     (__i)++)
 
 /**
  * for_each_new_private_obj_in_state - iterate over all private objects in an atomic update
- * @__state: &struct drm_atomic_state pointer
+ * @__state: &struct drm_atomic_commit pointer
  * @obj: &struct drm_private_obj iteration cursor
  * @new_obj_state: &struct drm_private_state iteration cursor for the new state
  * @__i: int iteration cursor, for macro-internal use
@@ -1257,7 +1295,8 @@ void drm_state_dump(struct drm_device *dev, struct drm_printer *p);
 	     (__i) < (__state)->num_private_objs && \
 		     ((obj) = (__state)->private_objs[__i].ptr, \
 		      (void)(obj) /* Only to avoid unused-but-set-variable warning */, \
-		      (new_obj_state) = (__state)->private_objs[__i].new_state, 1); \
+		      (new_obj_state) = (__state)->private_objs[__i].new_state, \
+		      (void)(new_obj_state) /* Only to avoid unused-but-set-variable warning */, 1); \
 	     (__i)++)
 
 /**
@@ -1358,20 +1397,17 @@ struct drm_bridge_state {
 	struct drm_bus_cfg output_bus_cfg;
 };
 
-static inline struct drm_bridge_state *
-drm_priv_to_bridge_state(struct drm_private_state *priv)
-{
-	return container_of(priv, struct drm_bridge_state, base);
-}
+#define drm_priv_to_bridge_state(priv)		\
+	container_of_const(priv, struct drm_bridge_state, base)
 
 struct drm_bridge_state *
-drm_atomic_get_bridge_state(struct drm_atomic_state *state,
+drm_atomic_get_bridge_state(struct drm_atomic_commit *state,
 			    struct drm_bridge *bridge);
 struct drm_bridge_state *
-drm_atomic_get_old_bridge_state(const struct drm_atomic_state *state,
+drm_atomic_get_old_bridge_state(const struct drm_atomic_commit *state,
 				struct drm_bridge *bridge);
 struct drm_bridge_state *
-drm_atomic_get_new_bridge_state(const struct drm_atomic_state *state,
+drm_atomic_get_new_bridge_state(const struct drm_atomic_commit *state,
 				struct drm_bridge *bridge);
 
 #endif /* DRM_ATOMIC_H_ */

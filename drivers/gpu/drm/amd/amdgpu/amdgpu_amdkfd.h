@@ -38,6 +38,8 @@
 #include "amdgpu_vm.h"
 #include "amdgpu_xcp.h"
 #include "kfd_topology.h"
+#include "amdgpu_ptl.h"
+
 extern uint64_t amdgpu_amdkfd_total_mem_size;
 
 enum TLB_FLUSH_TYPE {
@@ -97,7 +99,6 @@ struct amdgpu_amdkfd_fence {
 	struct mm_struct *mm;
 	spinlock_t lock;
 	char timeline_name[TASK_COMM_LEN];
-	struct svm_range_bo *svm_bo;
 	uint16_t context_id;
 };
 
@@ -169,8 +170,7 @@ void amdgpu_amdkfd_interrupt(struct amdgpu_device *adev,
 void amdgpu_amdkfd_device_probe(struct amdgpu_device *adev);
 void amdgpu_amdkfd_device_init(struct amdgpu_device *adev);
 void amdgpu_amdkfd_device_fini_sw(struct amdgpu_device *adev);
-int amdgpu_amdkfd_check_and_lock_kfd(struct amdgpu_device *adev);
-void amdgpu_amdkfd_unlock_kfd(struct amdgpu_device *adev);
+int amdgpu_amdkfd_prepare_partition_switch(struct amdgpu_device *adev);
 int amdgpu_amdkfd_submit_ib(struct amdgpu_device *adev,
 				enum kgd_engine_type engine,
 				uint32_t vmid, uint64_t gpu_addr,
@@ -192,7 +192,6 @@ int amdgpu_queue_mask_bit_to_set_resource_bit(struct amdgpu_device *adev,
 
 struct amdgpu_amdkfd_fence *amdgpu_amdkfd_fence_create(u64 context,
 				struct mm_struct *mm,
-				struct svm_range_bo *svm_bo,
 				u16 context_id);
 
 int amdgpu_amdkfd_drm_client_create(struct amdgpu_device *adev);
@@ -208,6 +207,7 @@ int amdgpu_amdkfd_evict_userptr(struct mmu_interval_notifier *mni,
 int amdgpu_amdkfd_bo_validate_and_fence(struct amdgpu_bo *bo,
 					uint32_t domain,
 					struct dma_fence *fence);
+int amdgpu_amdkfd_set_sigbus_delay(struct task_struct *task, u32 ms);
 #else
 static inline
 bool amdkfd_fence_check_mm(struct dma_fence *f, struct mm_struct *mm)
@@ -239,6 +239,11 @@ int amdgpu_amdkfd_bo_validate_and_fence(struct amdgpu_bo *bo,
 {
 	return 0;
 }
+static inline
+int amdgpu_amdkfd_set_sigbus_delay(struct task_struct *task, u32 ms)
+{
+	return -EOPNOTSUPP;
+}
 #endif
 /* Shared API */
 int amdgpu_amdkfd_alloc_kernel_mem(struct amdgpu_device *adev, size_t size,
@@ -260,7 +265,7 @@ uint64_t amdgpu_amdkfd_get_gpu_clock_counter(struct amdgpu_device *adev);
 uint32_t amdgpu_amdkfd_get_max_engine_clock_in_mhz(struct amdgpu_device *adev);
 int amdgpu_amdkfd_get_dmabuf_info(struct amdgpu_device *adev, int dma_buf_fd,
 				  struct amdgpu_device **dmabuf_adev,
-				  uint64_t *bo_size, void *metadata_buffer,
+				  uint64_t *bo_size, void **metadata_buffer,
 				  size_t buffer_size, uint32_t *metadata_size,
 				  uint32_t *flags, int8_t *xcp_id);
 int amdgpu_amdkfd_get_pcie_bandwidth_mbytes(struct amdgpu_device *adev, bool is_min);
@@ -273,7 +278,11 @@ int amdgpu_amdkfd_stop_sched(struct amdgpu_device *adev, uint32_t node_id);
 int amdgpu_amdkfd_config_sq_perfmon(struct amdgpu_device *adev, uint32_t xcp_id,
 	bool core_override_enable, bool reg_override_enable, bool perfmon_override_enable);
 bool amdgpu_amdkfd_compute_active(struct amdgpu_device *adev, uint32_t node_id);
-
+int amdgpu_amdkfd_reset_mes_queue(struct amdgpu_device *adev,
+				  uint32_t node_id,
+				  int queue_type,
+				  int pipe, int queue,
+				  unsigned int db);
 
 /* Read user wptr from a specified user address space with page fault
  * disabled. The memory must be pinned and mapped to the hardware when
@@ -324,9 +333,9 @@ int amdgpu_amdkfd_gpuvm_unmap_memory_from_gpu(
 int amdgpu_amdkfd_gpuvm_dmaunmap_mem(struct kgd_mem *mem, void *drm_priv);
 int amdgpu_amdkfd_gpuvm_sync_memory(
 		struct amdgpu_device *adev, struct kgd_mem *mem, bool intr);
-int amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(struct kgd_mem *mem,
-					     void **kptr, uint64_t *size);
-void amdgpu_amdkfd_gpuvm_unmap_gtt_bo_from_kernel(struct kgd_mem *mem);
+int amdgpu_amdkfd_gpuvm_map_bo_to_kernel(struct kgd_mem *mem, void **kptr,
+					 u64 *size, u32 domain);
+void amdgpu_amdkfd_gpuvm_unmap_bo_from_kernel(struct kgd_mem *mem);
 
 int amdgpu_amdkfd_map_gtt_bo_to_gart(struct amdgpu_bo *bo, struct amdgpu_bo **bo_gart);
 
@@ -421,6 +430,7 @@ struct kfd_dev *kgd2kfd_probe(struct amdgpu_device *adev, bool vf);
 bool kgd2kfd_device_init(struct kfd_dev *kfd,
 			 const struct kgd2kfd_shared_resources *gpu_resources);
 void kgd2kfd_device_exit(struct kfd_dev *kfd);
+void kgd2kfd_device_fini(struct kfd_dev *kfd);
 void kgd2kfd_suspend(struct kfd_dev *kfd, bool suspend_proc);
 int kgd2kfd_resume(struct kfd_dev *kfd, bool resume_proc);
 void kgd2kfd_suspend_process(struct kfd_dev *kfd);
@@ -435,13 +445,18 @@ int kgd2kfd_check_and_lock_kfd(struct kfd_dev *kfd);
 void kgd2kfd_unlock_kfd(struct kfd_dev *kfd);
 int kgd2kfd_start_sched(struct kfd_dev *kfd, uint32_t node_id);
 int kgd2kfd_start_sched_all_nodes(struct kfd_dev *kfd);
+int amdgpu_amdkfd_start_sched_all(struct amdgpu_device *adev);
 int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id);
 int kgd2kfd_stop_sched_all_nodes(struct kfd_dev *kfd);
+int amdgpu_amdkfd_stop_sched_all(struct amdgpu_device *adev);
 bool kgd2kfd_compute_active(struct kfd_dev *kfd, uint32_t node_id);
 bool kgd2kfd_vmfault_fast_path(struct amdgpu_device *adev, struct amdgpu_iv_entry *entry,
 			       bool retry_fault);
 void kgd2kfd_lock_kfd(void);
 void kgd2kfd_teardown_processes(struct amdgpu_device *adev);
+int kgd2kfd_reset_mes_queue(struct kfd_dev *kfd, uint32_t node_id,
+			    int queue_type, int pipe, int queue,
+			    unsigned int db);
 
 #else
 static inline int kgd2kfd_init(void)
@@ -467,6 +482,10 @@ bool kgd2kfd_device_init(struct kfd_dev *kfd,
 }
 
 static inline void kgd2kfd_device_exit(struct kfd_dev *kfd)
+{
+}
+
+static inline void kgd2kfd_device_fini(struct kfd_dev *kfd)
 {
 }
 
@@ -533,12 +552,22 @@ static inline int kgd2kfd_start_sched_all_nodes(struct kfd_dev *kfd)
 	return 0;
 }
 
+static inline int amdgpu_amdkfd_start_sched_all(struct amdgpu_device *adev)
+{
+	return 0;
+}
+
 static inline int kgd2kfd_stop_sched(struct kfd_dev *kfd, uint32_t node_id)
 {
 	return 0;
 }
 
 static inline int kgd2kfd_stop_sched_all_nodes(struct kfd_dev *kfd)
+{
+	return 0;
+}
+
+static inline int amdgpu_amdkfd_stop_sched_all(struct amdgpu_device *adev)
 {
 	return 0;
 }
@@ -560,6 +589,13 @@ static inline void kgd2kfd_lock_kfd(void)
 
 static inline void kgd2kfd_teardown_processes(struct amdgpu_device *adev)
 {
+}
+
+static inline int kgd2kfd_reset_mes_queue(struct kfd_dev *kfd, uint32_t node_id,
+					  int queue_type, int pipe, int queue,
+					  unsigned int db)
+{
+	return 0;
 }
 
 #endif

@@ -16,9 +16,11 @@
 #include <linux/msi.h>
 #include <linux/of_address.h>
 #include <linux/of_pci.h>
+#include <linux/pci.h>
 #include <linux/pci_regs.h>
 #include <linux/platform_device.h>
 
+#include "../pci-host-common.h"
 #include "../../pci.h"
 #include "pcie-designware.h"
 
@@ -80,7 +82,7 @@ void dw_handle_msi_irq(struct dw_pcie_rp *pp)
 			continue;
 
 		for_each_set_bit(pos, &status, MAX_MSI_IRQS_PER_CTRL)
-			generic_handle_demux_domain_irq(pp->irq_domain, irq_off + pos);
+			generic_handle_demux_domain_irq(pp->msi_irq_domain, irq_off + pos);
 	}
 }
 
@@ -205,7 +207,7 @@ static const struct irq_domain_ops dw_pcie_msi_domain_ops = {
 	.free	= dw_pcie_irq_domain_free,
 };
 
-int dw_pcie_allocate_domains(struct dw_pcie_rp *pp)
+int dw_pcie_allocate_msi_domains(struct dw_pcie_rp *pp)
 {
 	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
 	struct irq_domain_info info = {
@@ -215,15 +217,15 @@ int dw_pcie_allocate_domains(struct dw_pcie_rp *pp)
 		.host_data	= pp,
 	};
 
-	pp->irq_domain = msi_create_parent_irq_domain(&info, &dw_pcie_msi_parent_ops);
-	if (!pp->irq_domain) {
+	pp->msi_irq_domain = msi_create_parent_irq_domain(&info, &dw_pcie_msi_parent_ops);
+	if (!pp->msi_irq_domain) {
 		dev_err(pci->dev, "Failed to create IRQ domain\n");
 		return -ENOMEM;
 	}
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(dw_pcie_allocate_domains);
+EXPORT_SYMBOL_GPL(dw_pcie_allocate_msi_domains);
 
 void dw_pcie_free_msi(struct dw_pcie_rp *pp)
 {
@@ -234,7 +236,7 @@ void dw_pcie_free_msi(struct dw_pcie_rp *pp)
 			irq_set_chained_handler_and_data(pp->msi_irq[ctrl], NULL, NULL);
 	}
 
-	irq_domain_remove(pp->irq_domain);
+	irq_domain_remove(pp->msi_irq_domain);
 }
 EXPORT_SYMBOL_GPL(dw_pcie_free_msi);
 
@@ -340,7 +342,7 @@ int dw_pcie_msi_host_init(struct dw_pcie_rp *pp)
 
 	pp->msi_irq_chip = &dw_pci_msi_bottom_irq_chip;
 
-	ret = dw_pcie_allocate_domains(pp);
+	ret = dw_pcie_allocate_msi_domains(pp);
 	if (ret)
 		return ret;
 
@@ -434,11 +436,11 @@ static int dw_pcie_config_ecam_iatu(struct dw_pcie_rp *pp)
 	 * remaining buses need type 1 iATU configuration.
 	 */
 	atu.index = 0;
-	atu.type = PCIE_ATU_TYPE_CFG0;
+	atu.type = PCIE_TLP_TYPE_CFG0_RDWR;
 	atu.parent_bus_addr = pp->cfg0_base + SZ_1M;
 	/* 1MiB is to cover 1 (bus) * 32 (devices) * 8 (functions) */
 	atu.size = SZ_1M;
-	atu.ctrl2 = PCIE_ATU_CFG_SHIFT_MODE_ENABLE;
+	atu.ctrl2 = ATU_CFG_SHIFT_MODE_ENABLE;
 	ret = dw_pcie_prog_outbound_atu(pci, &atu);
 	if (ret)
 		return ret;
@@ -450,10 +452,10 @@ static int dw_pcie_config_ecam_iatu(struct dw_pcie_rp *pp)
 
 	/* Configure remaining buses in type 1 iATU configuration */
 	atu.index = 1;
-	atu.type = PCIE_ATU_TYPE_CFG1;
+	atu.type = PCIE_TLP_TYPE_CFG1_RDWR;
 	atu.parent_bus_addr = pp->cfg0_base + SZ_2M;
 	atu.size = (SZ_1M * bus_range_max) - SZ_2M;
-	atu.ctrl2 = PCIE_ATU_CFG_SHIFT_MODE_ENABLE;
+	atu.ctrl2 = ATU_CFG_SHIFT_MODE_ENABLE;
 
 	return dw_pcie_prog_outbound_atu(pci, &atu);
 }
@@ -585,6 +587,12 @@ int dw_pcie_host_init(struct dw_pcie_rp *pp)
 	if (ret)
 		return ret;
 
+	if (pci_msi_enabled()) {
+		pp->use_imsi_rx = !(pp->ops->msi_init ||
+				    of_property_present(np, "msi-parent") ||
+				    of_property_present(np, "msi-map"));
+	}
+
 	if (pp->ops->init) {
 		ret = pp->ops->init(pp);
 		if (ret)
@@ -592,10 +600,6 @@ int dw_pcie_host_init(struct dw_pcie_rp *pp)
 	}
 
 	if (pci_msi_enabled()) {
-		pp->use_imsi_rx = !(pp->ops->msi_init ||
-				     of_property_present(np, "msi-parent") ||
-				     of_property_present(np, "msi-map"));
-
 		/*
 		 * For the use_imsi_rx case the default assignment is handled
 		 * in the dw_pcie_msi_host_init().
@@ -703,8 +707,10 @@ void dw_pcie_host_deinit(struct dw_pcie_rp *pp)
 
 	dwc_pcie_debugfs_deinit(pci);
 
+	pci_lock_rescan_remove();
 	pci_stop_root_bus(pp->bridge->bus);
 	pci_remove_root_bus(pp->bridge->bus);
+	pci_unlock_rescan_remove();
 
 	dw_pcie_stop_link(pci);
 
@@ -741,13 +747,13 @@ static void __iomem *dw_pcie_other_conf_map_bus(struct pci_bus *bus,
 	if (!dw_pcie_link_up(pci))
 		return NULL;
 
-	busdev = PCIE_ATU_BUS(bus->number) | PCIE_ATU_DEV(PCI_SLOT(devfn)) |
-		 PCIE_ATU_FUNC(PCI_FUNC(devfn));
+	busdev = ATU_BUS(bus->number) | ATU_DEV(PCI_SLOT(devfn)) |
+		 ATU_FUNC(PCI_FUNC(devfn));
 
 	if (pci_is_root_bus(bus->parent))
-		type = PCIE_ATU_TYPE_CFG0;
+		type = PCIE_TLP_TYPE_CFG0_RDWR;
 	else
-		type = PCIE_ATU_TYPE_CFG1;
+		type = PCIE_TLP_TYPE_CFG1_RDWR;
 
 	atu.type = type;
 	atu.parent_bus_addr = pp->cfg0_base - pci->parent_bus_offset;
@@ -774,7 +780,7 @@ static int dw_pcie_rd_other_conf(struct pci_bus *bus, unsigned int devfn,
 		return ret;
 
 	if (pp->cfg0_io_shared) {
-		atu.type = PCIE_ATU_TYPE_IO;
+		atu.type = PCIE_TLP_TYPE_IO_RDWR;
 		atu.parent_bus_addr = pp->io_base - pci->parent_bus_offset;
 		atu.pci_addr = pp->io_bus_addr;
 		atu.size = pp->io_size;
@@ -800,7 +806,7 @@ static int dw_pcie_wr_other_conf(struct pci_bus *bus, unsigned int devfn,
 		return ret;
 
 	if (pp->cfg0_io_shared) {
-		atu.type = PCIE_ATU_TYPE_IO;
+		atu.type = PCIE_TLP_TYPE_IO_RDWR;
 		atu.parent_bus_addr = pp->io_base - pci->parent_bus_offset;
 		atu.pci_addr = pp->io_bus_addr;
 		atu.size = pp->io_size;
@@ -878,10 +884,10 @@ static int dw_pcie_iatu_setup(struct dw_pcie_rp *pp)
 	 * the MEM/IO (dma-)ranges setups.
 	 */
 	for (i = 0; i < pci->num_ob_windows; i++)
-		dw_pcie_disable_atu(pci, PCIE_ATU_REGION_DIR_OB, i);
+		dw_pcie_disable_atu(pci, ATU_REGION_DIR_OB, i);
 
 	for (i = 0; i < pci->num_ib_windows; i++)
-		dw_pcie_disable_atu(pci, PCIE_ATU_REGION_DIR_IB, i);
+		dw_pcie_disable_atu(pci, ATU_REGION_DIR_IB, i);
 
 	/*
 	 * NOTE: For outbound address translation, outbound iATU at index 0 is
@@ -908,9 +914,23 @@ static int dw_pcie_iatu_setup(struct dw_pcie_rp *pp)
 		if (resource_type(entry->res) != IORESOURCE_MEM)
 			continue;
 
-		atu.type = PCIE_ATU_TYPE_MEM;
+		atu.type = PCIE_TLP_TYPE_MEM_RDWR;
 		atu.parent_bus_addr = entry->res->start - pci->parent_bus_offset;
 		atu.pci_addr = entry->res->start - entry->offset;
+
+		if (pp->bypass_ob_mem_iatu) {
+			/*
+			 * The no-match pass-through path preserves the correct
+			 * PCI address only for identity-mapped MEM ranges.
+			 */
+			if (atu.parent_bus_addr != atu.pci_addr) {
+				dev_err(pci->dev,
+					"Cannot bypass outbound iATU for non-identity MEM range %pr\n",
+					entry->res);
+				return -EINVAL;
+			}
+			continue;
+		}
 
 		/* Adjust iATU size if MSG TLP region was allocated before */
 		if (pp->msg_res && pp->msg_res->parent == entry->res)
@@ -951,15 +971,14 @@ static int dw_pcie_iatu_setup(struct dw_pcie_rp *pp)
 	if (pp->io_size) {
 		if (ob_iatu_index < pci->num_ob_windows) {
 			atu.index = ob_iatu_index;
-			atu.type = PCIE_ATU_TYPE_IO;
+			atu.type = PCIE_TLP_TYPE_IO_RDWR;
 			atu.parent_bus_addr = pp->io_base - pci->parent_bus_offset;
 			atu.pci_addr = pp->io_bus_addr;
 			atu.size = pp->io_size;
 
 			ret = dw_pcie_prog_outbound_atu(pci, &atu);
 			if (ret) {
-				dev_err(pci->dev, "Failed to set IO range %pr\n",
-					entry->res);
+				dev_err(pci->dev, "Failed to set IO range\n");
 				return ret;
 			}
 			ob_iatu_index++;
@@ -1013,7 +1032,7 @@ static int dw_pcie_iatu_setup(struct dw_pcie_rp *pp)
 
 			window_size = MIN(pci->region_limit + 1, res_size);
 			ret = dw_pcie_prog_inbound_atu(pci, ib_iatu_index,
-						       PCIE_ATU_TYPE_MEM, res_start,
+						       PCIE_TLP_TYPE_MEM_RDWR, res_start,
 						       res_start - entry->offset, window_size);
 			if (ret) {
 				dev_err(pci->dev, "Failed to set DMA range %pr\n",
@@ -1159,9 +1178,9 @@ int dw_pcie_setup_rc(struct dw_pcie_rp *pp)
 	/* Program correct class for RC */
 	dw_pcie_writew_dbi(pci, PCI_CLASS_DEVICE, PCI_CLASS_BRIDGE_PCI);
 
-	val = dw_pcie_readl_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL);
-	val |= PORT_LOGIC_SPEED_CHANGE;
-	dw_pcie_writel_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL, val);
+	val = dw_pcie_readl_dbi(pci, LINK_WIDTH_SPEED_CTRL);
+	val |= SPEED_CHANGE;
+	dw_pcie_writel_dbi(pci, LINK_WIDTH_SPEED_CTRL, val);
 
 	dw_pcie_dbi_ro_wr_dis(pci);
 
@@ -1194,7 +1213,7 @@ static int dw_pcie_pme_turn_off(struct dw_pcie *pci)
 
 	atu.code = PCIE_MSG_CODE_PME_TURN_OFF;
 	atu.routing = PCIE_MSG_TYPE_R_BC;
-	atu.type = PCIE_ATU_TYPE_MSG;
+	atu.type = PCIE_TLP_TYPE_MSG;
 	atu.size = resource_size(pci->pp.msg_res);
 	atu.index = pci->pp.msg_atu_index;
 
@@ -1218,18 +1237,21 @@ static int dw_pcie_pme_turn_off(struct dw_pcie *pci)
 
 int dw_pcie_suspend_noirq(struct dw_pcie *pci)
 {
-	u8 offset = dw_pcie_find_capability(pci, PCI_CAP_ID_EXP);
+	bool d3cold, pme_capable = false;
 	int ret = 0;
 	u32 val;
 
 	if (!dw_pcie_link_up(pci))
 		goto stop_link;
 
+	d3cold = pci_host_common_d3cold_possible(pci->pp.bridge, &pme_capable);
+
 	/*
-	 * If L1SS is supported, then do not put the link into L2 as some
-	 * devices such as NVMe expect low resume latency.
+	 * Enter L2 if D3cold is possible, or if the platform loses RC power
+	 * during suspend (in which case L2 entry is required to notify
+	 * endpoints before power loss, regardless of D3cold support).
 	 */
-	if (dw_pcie_readw_dbi(pci, offset + PCI_EXP_LNKCTL) & PCI_EXP_LNKCTL_ASPM_L1)
+	if (!d3cold && !pci->pp.suspend_poweroff)
 		return 0;
 
 	if (pci->pp.ops->pme_turn_off) {
@@ -1273,6 +1295,15 @@ int dw_pcie_suspend_noirq(struct dw_pcie *pci)
 	udelay(1);
 
 stop_link:
+	/*
+	 * TODO: "pme_capable" means some downstream device is wakeup-
+	 * enabled and is capable of generating PME from D3cold, which
+	 * requires auxiliary power.  Instead of always skipping power off
+	 * if PME is supported from D3cold, query the pwrctrl core and skip
+	 * power off only if device supports PME from D3cold and Vaux is
+	 * not supported.
+	 */
+	pci->pp.skip_pwrctrl_off = pme_capable;
 	dw_pcie_stop_link(pci);
 	if (pci->pp.ops->deinit)
 		pci->pp.ops->deinit(&pci->pp);
@@ -1289,8 +1320,6 @@ int dw_pcie_resume_noirq(struct dw_pcie *pci)
 
 	if (!pci->suspended)
 		return 0;
-
-	pci->suspended = false;
 
 	if (pci->pp.ops->init) {
 		ret = pci->pp.ops->init(&pci->pp);
@@ -1312,6 +1341,8 @@ int dw_pcie_resume_noirq(struct dw_pcie *pci)
 
 	if (pci->pp.ops->post_init)
 		pci->pp.ops->post_init(&pci->pp);
+
+	pci->suspended = false;
 
 	return 0;
 

@@ -27,6 +27,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/random.h>
+#include <linux/regulator/consumer.h>
 #include <linux/reset.h>
 #include <linux/resource.h>
 #include <linux/types.h>
@@ -272,6 +273,7 @@ struct tegra_pcie_dw {
 	u32 aspm_cmrt;
 	u32 aspm_pwr_on_t;
 	u32 aspm_l0s_enter_lat;
+	u32 aspm_l1_enter_lat;
 
 	struct regulator *pex_ctl_supply;
 	struct regulator *slot_ctl_3v3;
@@ -384,9 +386,9 @@ static irqreturn_t tegra_pcie_rp_irq_handler(int irq, void *arg)
 			val |= APPL_CAR_RESET_OVRD_CYA_OVERRIDE_CORE_RST_N;
 			appl_writel(pcie, val, APPL_CAR_RESET_OVRD);
 
-			val = dw_pcie_readl_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL);
-			val |= PORT_LOGIC_SPEED_CHANGE;
-			dw_pcie_writel_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL, val);
+			val = dw_pcie_readl_dbi(pci, LINK_WIDTH_SPEED_CTRL);
+			val |= SPEED_CHANGE;
+			dw_pcie_writel_dbi(pci, LINK_WIDTH_SPEED_CTRL, val);
 		}
 	}
 
@@ -620,15 +622,15 @@ static inline u32 event_counter_prog(struct tegra_pcie_dw *pcie, u32 event)
 	u32 val;
 
 	val = dw_pcie_readl_dbi(&pcie->pci, pcie->ras_des_cap +
-				PCIE_RAS_DES_EVENT_COUNTER_CONTROL);
-	val &= ~(EVENT_COUNTER_EVENT_SEL_MASK << EVENT_COUNTER_EVENT_SEL_SHIFT);
-	val |= EVENT_COUNTER_GROUP_5 << EVENT_COUNTER_GROUP_SEL_SHIFT;
-	val |= event << EVENT_COUNTER_EVENT_SEL_SHIFT;
-	val |= EVENT_COUNTER_ENABLE_ALL << EVENT_COUNTER_ENABLE_SHIFT;
+				RAS_DES_EVENT_COUNTER_CONTROL);
+	val &= ~EVENT_COUNTER_EVENT_SEL_MASK;
+	val |= FIELD_PREP(EVENT_COUNTER_GROUP_SEL_MASK, EVENT_COUNTER_GROUP_5);
+	val |= FIELD_PREP(EVENT_COUNTER_EVENT_SEL_MASK, event);
+	val |= FIELD_PREP(EVENT_COUNTER_ENABLE_MASK, EVENT_COUNTER_ENABLE_ALL);
 	dw_pcie_writel_dbi(&pcie->pci, pcie->ras_des_cap +
-			   PCIE_RAS_DES_EVENT_COUNTER_CONTROL, val);
+			   RAS_DES_EVENT_COUNTER_CONTROL, val);
 	val = dw_pcie_readl_dbi(&pcie->pci, pcie->ras_des_cap +
-				PCIE_RAS_DES_EVENT_COUNTER_DATA);
+				RAS_DES_EVENT_COUNTER_DATA);
 
 	return val;
 }
@@ -656,14 +658,14 @@ static int aspm_state_cnt(struct seq_file *s, void *data)
 
 	/* Clear all counters */
 	dw_pcie_writel_dbi(&pcie->pci, pcie->ras_des_cap +
-			   PCIE_RAS_DES_EVENT_COUNTER_CONTROL,
+			   RAS_DES_EVENT_COUNTER_CONTROL,
 			   EVENT_COUNTER_ALL_CLEAR);
 
 	/* Re-enable counting */
-	val = EVENT_COUNTER_ENABLE_ALL << EVENT_COUNTER_ENABLE_SHIFT;
-	val |= EVENT_COUNTER_GROUP_5 << EVENT_COUNTER_GROUP_SEL_SHIFT;
+	val = FIELD_PREP(EVENT_COUNTER_ENABLE_MASK, EVENT_COUNTER_ENABLE_ALL);
+	val |= FIELD_PREP(EVENT_COUNTER_GROUP_SEL_MASK, EVENT_COUNTER_GROUP_5);
 	dw_pcie_writel_dbi(&pcie->pci, pcie->ras_des_cap +
-			   PCIE_RAS_DES_EVENT_COUNTER_CONTROL, val);
+			   RAS_DES_EVENT_COUNTER_CONTROL, val);
 
 	return 0;
 }
@@ -679,10 +681,10 @@ static void init_host_aspm(struct tegra_pcie_dw *pcie)
 							PCI_EXT_CAP_ID_VNDR);
 
 	/* Enable ASPM counters */
-	val = EVENT_COUNTER_ENABLE_ALL << EVENT_COUNTER_ENABLE_SHIFT;
-	val |= EVENT_COUNTER_GROUP_5 << EVENT_COUNTER_GROUP_SEL_SHIFT;
+	val = FIELD_PREP(EVENT_COUNTER_ENABLE_MASK, EVENT_COUNTER_ENABLE_ALL);
+	val |= FIELD_PREP(EVENT_COUNTER_GROUP_SEL_MASK, EVENT_COUNTER_GROUP_5);
 	dw_pcie_writel_dbi(pci, pcie->ras_des_cap +
-			   PCIE_RAS_DES_EVENT_COUNTER_CONTROL, val);
+			   RAS_DES_EVENT_COUNTER_CONTROL, val);
 
 	/* Program T_cmrt and T_pwr_on values */
 	val = dw_pcie_readl_dbi(pci, l1ss + PCI_L1SS_CAP);
@@ -712,11 +714,13 @@ static void init_host_aspm(struct tegra_pcie_dw *pcie)
 	}
 
 	/* Program L0s and L1 entrance latencies */
-	val = dw_pcie_readl_dbi(pci, PCIE_PORT_AFR);
-	val &= ~PORT_AFR_L0S_ENTRANCE_LAT_MASK;
-	val |= (pcie->aspm_l0s_enter_lat << PORT_AFR_L0S_ENTRANCE_LAT_SHIFT);
-	val |= PORT_AFR_ENTER_ASPM;
-	dw_pcie_writel_dbi(pci, PCIE_PORT_AFR, val);
+	val = dw_pcie_readl_dbi(pci, PORT_AFAC);
+	val &= ~PORT_AFAC_L0S_ELM;
+	val |= FIELD_PREP(PORT_AFAC_L0S_ELM, pcie->aspm_l0s_enter_lat);
+	val &= ~PORT_AFAC_L1_ELM;
+	val |= FIELD_PREP(PORT_AFAC_L1_ELM, pcie->aspm_l1_enter_lat);
+	val |= PORT_AFAC_ENTER_ASPM;
+	dw_pcie_writel_dbi(pci, PORT_AFAC, val);
 }
 
 static void init_debugfs(struct tegra_pcie_dw *pcie)
@@ -867,31 +871,29 @@ static void config_gen3_gen4_eq_presets(struct tegra_pcie_dw *pcie)
 		dw_pcie_writeb_dbi(pci, offset + i, val);
 	}
 
-	val = dw_pcie_readl_dbi(pci, GEN3_RELATED_OFF);
-	val &= ~GEN3_RELATED_OFF_RATE_SHADOW_SEL_MASK;
-	dw_pcie_writel_dbi(pci, GEN3_RELATED_OFF, val);
+	val = dw_pcie_readl_dbi(pci, GEN3_CTRL);
+	val &= ~GEN3_CTRL_RATE_SHADOW_SEL_MASK;
+	dw_pcie_writel_dbi(pci, GEN3_CTRL, val);
 
-	val = dw_pcie_readl_dbi(pci, GEN3_EQ_CONTROL_OFF);
-	val &= ~GEN3_EQ_CONTROL_OFF_PSET_REQ_VEC;
-	val |= FIELD_PREP(GEN3_EQ_CONTROL_OFF_PSET_REQ_VEC, 0x3ff);
-	val &= ~GEN3_EQ_CONTROL_OFF_FB_MODE;
-	dw_pcie_writel_dbi(pci, GEN3_EQ_CONTROL_OFF, val);
+	val = dw_pcie_readl_dbi(pci, GEN3_EQ_CTRL);
+	FIELD_MODIFY(GEN3_EQ_CTRL_PSET_REQ_VEC, &val, 0x3ff);
+	val &= ~GEN3_EQ_CTRL_FB_MODE;
+	dw_pcie_writel_dbi(pci, GEN3_EQ_CTRL, val);
 
-	val = dw_pcie_readl_dbi(pci, GEN3_RELATED_OFF);
-	val &= ~GEN3_RELATED_OFF_RATE_SHADOW_SEL_MASK;
-	val |= (0x1 << GEN3_RELATED_OFF_RATE_SHADOW_SEL_SHIFT);
-	dw_pcie_writel_dbi(pci, GEN3_RELATED_OFF, val);
+	val = dw_pcie_readl_dbi(pci, GEN3_CTRL);
+	val &= ~GEN3_CTRL_RATE_SHADOW_SEL_MASK;
+	val |= FIELD_PREP(GEN3_CTRL_RATE_SHADOW_SEL_MASK, 0x1);
+	dw_pcie_writel_dbi(pci, GEN3_CTRL, val);
 
-	val = dw_pcie_readl_dbi(pci, GEN3_EQ_CONTROL_OFF);
-	val &= ~GEN3_EQ_CONTROL_OFF_PSET_REQ_VEC;
-	val |= FIELD_PREP(GEN3_EQ_CONTROL_OFF_PSET_REQ_VEC,
-			  pcie->of_data->gen4_preset_vec);
-	val &= ~GEN3_EQ_CONTROL_OFF_FB_MODE;
-	dw_pcie_writel_dbi(pci, GEN3_EQ_CONTROL_OFF, val);
+	val = dw_pcie_readl_dbi(pci, GEN3_EQ_CTRL);
+	FIELD_MODIFY(GEN3_EQ_CTRL_PSET_REQ_VEC, &val,
+		     pcie->of_data->gen4_preset_vec);
+	val &= ~GEN3_EQ_CTRL_FB_MODE;
+	dw_pcie_writel_dbi(pci, GEN3_EQ_CTRL, val);
 
-	val = dw_pcie_readl_dbi(pci, GEN3_RELATED_OFF);
-	val &= ~GEN3_RELATED_OFF_RATE_SHADOW_SEL_MASK;
-	dw_pcie_writel_dbi(pci, GEN3_RELATED_OFF, val);
+	val = dw_pcie_readl_dbi(pci, GEN3_CTRL);
+	val &= ~GEN3_CTRL_RATE_SHADOW_SEL_MASK;
+	dw_pcie_writel_dbi(pci, GEN3_CTRL, val);
 }
 
 static int tegra_pcie_dw_host_init(struct dw_pcie_rp *pp)
@@ -939,9 +941,9 @@ static int tegra_pcie_dw_host_init(struct dw_pcie_rp *pp)
 	init_host_aspm(pcie);
 
 	if (!pcie->of_data->has_l1ss_exit_fix) {
-		val = dw_pcie_readl_dbi(pci, GEN3_RELATED_OFF);
-		val &= ~GEN3_RELATED_OFF_GEN3_ZRXDC_NONCOMPL;
-		dw_pcie_writel_dbi(pci, GEN3_RELATED_OFF, val);
+		val = dw_pcie_readl_dbi(pci, GEN3_CTRL);
+		val &= ~GEN3_CTRL_GEN3_ZRXDC_NONCOMPL;
+		dw_pcie_writel_dbi(pci, GEN3_CTRL, val);
 	}
 
 	if (pcie->update_fc_fixup) {
@@ -1115,6 +1117,7 @@ static int tegra_pcie_dw_parse_dt(struct tegra_pcie_dw *pcie)
 {
 	struct platform_device *pdev = to_platform_device(pcie->dev);
 	struct device_node *np = pcie->dev->of_node;
+	u32 val;
 	int ret;
 
 	pcie->dbi_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dbi");
@@ -1140,6 +1143,15 @@ static int tegra_pcie_dw_parse_dt(struct tegra_pcie_dw *pcie)
 	if (ret < 0)
 		dev_info(pcie->dev,
 			 "Failed to read ASPM L0s Entrance latency: %d\n", ret);
+
+	/* Default to max latency of 7. */
+	pcie->aspm_l1_enter_lat = 7;
+	ret = of_property_read_u32(np, "aspm-l1-entry-delay-ns", &val);
+	if (!ret) {
+		u32 us = DIV_ROUND_UP(val, 1000);
+
+		pcie->aspm_l1_enter_lat = min_t(u32, order_base_2(us), 7);
+	}
 
 	ret = of_property_read_u32(np, "num-lanes", &pcie->num_lanes);
 	if (ret < 0) {
@@ -1858,9 +1870,9 @@ static void pex_ep_event_pex_rst_deassert(struct tegra_pcie_dw *pcie)
 	pci_epc_deinit_notify(pcie->pci.ep.epc);
 	dw_pcie_ep_cleanup(&pcie->pci.ep);
 
-	val = dw_pcie_readl_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL);
-	val &= ~PORT_LOGIC_SPEED_CHANGE;
-	dw_pcie_writel_dbi(pci, PCIE_LINK_WIDTH_SPEED_CONTROL, val);
+	val = dw_pcie_readl_dbi(pci, LINK_WIDTH_SPEED_CTRL);
+	val &= ~SPEED_CHANGE;
+	dw_pcie_writel_dbi(pci, LINK_WIDTH_SPEED_CTRL, val);
 
 	if (pcie->update_fc_fixup) {
 		val = dw_pcie_readl_dbi(pci, CFG_TIMER_CTRL_MAX_FUNC_NUM_OFF);
@@ -1873,9 +1885,9 @@ static void pex_ep_event_pex_rst_deassert(struct tegra_pcie_dw *pcie)
 	init_host_aspm(pcie);
 
 	if (!pcie->of_data->has_l1ss_exit_fix) {
-		val = dw_pcie_readl_dbi(pci, GEN3_RELATED_OFF);
-		val &= ~GEN3_RELATED_OFF_GEN3_ZRXDC_NONCOMPL;
-		dw_pcie_writel_dbi(pci, GEN3_RELATED_OFF, val);
+		val = dw_pcie_readl_dbi(pci, GEN3_CTRL);
+		val &= ~GEN3_CTRL_GEN3_ZRXDC_NONCOMPL;
+		dw_pcie_writel_dbi(pci, GEN3_CTRL, val);
 	}
 
 	pcie->pcie_cap_base = dw_pcie_find_capability(&pcie->pci,
@@ -2185,15 +2197,15 @@ static int tegra_pcie_dw_probe(struct platform_device *pdev)
 	if (IS_ERR(pcie->pex_ctl_supply)) {
 		ret = PTR_ERR(pcie->pex_ctl_supply);
 		if (ret != -EPROBE_DEFER)
-			dev_err(dev, "Failed to get regulator: %ld\n",
-				PTR_ERR(pcie->pex_ctl_supply));
+			dev_err(dev, "Failed to get regulator: %pe\n",
+				pcie->pex_ctl_supply);
 		return ret;
 	}
 
 	pcie->core_clk = devm_clk_get(dev, "core");
 	if (IS_ERR(pcie->core_clk)) {
-		dev_err(dev, "Failed to get core clock: %ld\n",
-			PTR_ERR(pcie->core_clk));
+		dev_err(dev, "Failed to get core clock: %pe\n",
+			pcie->core_clk);
 		return PTR_ERR(pcie->core_clk);
 	}
 
@@ -2215,8 +2227,8 @@ static int tegra_pcie_dw_probe(struct platform_device *pdev)
 
 	pcie->core_apb_rst = devm_reset_control_get(dev, "apb");
 	if (IS_ERR(pcie->core_apb_rst)) {
-		dev_err(dev, "Failed to get APB reset: %ld\n",
-			PTR_ERR(pcie->core_apb_rst));
+		dev_err(dev, "Failed to get APB reset: %pe\n",
+			pcie->core_apb_rst);
 		return PTR_ERR(pcie->core_apb_rst);
 	}
 
@@ -2257,8 +2269,8 @@ static int tegra_pcie_dw_probe(struct platform_device *pdev)
 
 	pcie->core_rst = devm_reset_control_get(dev, "core");
 	if (IS_ERR(pcie->core_rst)) {
-		dev_err(dev, "Failed to get core reset: %ld\n",
-			PTR_ERR(pcie->core_rst));
+		dev_err(dev, "Failed to get core reset: %pe\n",
+			pcie->core_rst);
 		return PTR_ERR(pcie->core_rst);
 	}
 

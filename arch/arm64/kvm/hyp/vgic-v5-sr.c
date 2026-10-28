@@ -7,6 +7,41 @@
 
 #include <asm/kvm_hyp.h>
 
+void __vgic_v5_make_resident(struct vgic_v5_cpu_if *cpu_if)
+{
+	write_sysreg_s(cpu_if->vgic_contextr, SYS_ICH_CONTEXTR_EL2);
+	isb();
+
+	/* Catch any faults */
+	cpu_if->vgic_contextr = read_sysreg_s(SYS_ICH_CONTEXTR_EL2);
+	if (!!FIELD_GET(ICH_CONTEXTR_EL2_F, cpu_if->vgic_contextr))
+		return;
+
+	cpu_if->gicv5_vpe.resident = true;
+}
+
+void __vgic_v5_make_non_resident(struct vgic_v5_cpu_if *cpu_if)
+{
+	/*
+	 * Clear the db_fired state to ensure that we're ready for the next
+	 * doorbell when it is requested. If a doorbell firing caused us to
+	 * enter the guest, then we've already consumed that state at this
+	 * point, so this is safe to clear. Use WRITE_ONCE() to ensure we're not
+	 * racing with the doorbell firing and setting the state true again.
+	 */
+	WRITE_ONCE(cpu_if->gicv5_vpe.db_fired, false);
+
+	/*
+	 * Make as non-resident before actually making non-resident. Avoids race
+	 * with doorbell arriving.
+	 */
+	cpu_if->gicv5_vpe.resident = false;
+	dsb(st);
+
+	write_sysreg_s(cpu_if->vgic_contextr, SYS_ICH_CONTEXTR_EL2);
+	isb();
+}
+
 void __vgic_v5_save_apr(struct vgic_v5_cpu_if *cpu_if)
 {
 	cpu_if->vgic_apr = read_sysreg_s(SYS_ICH_APR_EL2);
@@ -30,10 +65,9 @@ void __vgic_v5_save_ppi_state(struct vgic_v5_cpu_if *cpu_if)
 {
 	/*
 	 * The following code assumes that the bitmap storage that we have for
-	 * PPIs is either 64 (architected PPIs, only) or 128 bits (architected &
-	 * impdef PPIs).
+	 * PPIs is either 64 (architected PPIs, only).
 	 */
-	BUILD_BUG_ON(VGIC_V5_NR_PRIVATE_IRQS % 64);
+	BUILD_BUG_ON(VGIC_V5_NR_PRIVATE_IRQS != 64);
 
 	bitmap_write(host_data_ptr(vgic_v5_ppi_state)->activer_exit,
 		     read_sysreg_s(SYS_ICH_PPI_ACTIVER0_EL2), 0, 64);
@@ -49,22 +83,6 @@ void __vgic_v5_save_ppi_state(struct vgic_v5_cpu_if *cpu_if)
 	cpu_if->vgic_ppi_priorityr[6] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR6_EL2);
 	cpu_if->vgic_ppi_priorityr[7] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR7_EL2);
 
-	if (VGIC_V5_NR_PRIVATE_IRQS == 128) {
-		bitmap_write(host_data_ptr(vgic_v5_ppi_state)->activer_exit,
-			     read_sysreg_s(SYS_ICH_PPI_ACTIVER1_EL2), 64, 64);
-		bitmap_write(host_data_ptr(vgic_v5_ppi_state)->pendr,
-			     read_sysreg_s(SYS_ICH_PPI_PENDR1_EL2), 64, 64);
-
-		cpu_if->vgic_ppi_priorityr[8] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR8_EL2);
-		cpu_if->vgic_ppi_priorityr[9] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR9_EL2);
-		cpu_if->vgic_ppi_priorityr[10] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR10_EL2);
-		cpu_if->vgic_ppi_priorityr[11] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR11_EL2);
-		cpu_if->vgic_ppi_priorityr[12] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR12_EL2);
-		cpu_if->vgic_ppi_priorityr[13] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR13_EL2);
-		cpu_if->vgic_ppi_priorityr[14] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR14_EL2);
-		cpu_if->vgic_ppi_priorityr[15] = read_sysreg_s(SYS_ICH_PPI_PRIORITYR15_EL2);
-	}
-
 	/* Now that we are done, disable DVI */
 	write_sysreg_s(0, SYS_ICH_PPI_DVIR0_EL2);
 	write_sysreg_s(0, SYS_ICH_PPI_DVIR1_EL2);
@@ -73,9 +91,6 @@ void __vgic_v5_save_ppi_state(struct vgic_v5_cpu_if *cpu_if)
 void __vgic_v5_restore_ppi_state(struct vgic_v5_cpu_if *cpu_if)
 {
 	DECLARE_BITMAP(pendr, VGIC_V5_NR_PRIVATE_IRQS);
-
-	/* We assume 64 or 128 PPIs - see above comment */
-	BUILD_BUG_ON(VGIC_V5_NR_PRIVATE_IRQS % 64);
 
 	/* Enable DVI so that the guest's interrupt config takes over */
 	write_sysreg_s(bitmap_read(cpu_if->vgic_ppi_dvir, 0, 64),
@@ -108,50 +123,20 @@ void __vgic_v5_restore_ppi_state(struct vgic_v5_cpu_if *cpu_if)
 	write_sysreg_s(cpu_if->vgic_ppi_priorityr[7],
 		       SYS_ICH_PPI_PRIORITYR7_EL2);
 
-	if (VGIC_V5_NR_PRIVATE_IRQS == 128) {
-		/* Enable DVI so that the guest's interrupt config takes over */
-		write_sysreg_s(bitmap_read(cpu_if->vgic_ppi_dvir, 64, 64),
-			       SYS_ICH_PPI_DVIR1_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_DVIR1_EL2);
 
-		write_sysreg_s(bitmap_read(cpu_if->vgic_ppi_activer, 64, 64),
-			       SYS_ICH_PPI_ACTIVER1_EL2);
-		write_sysreg_s(bitmap_read(cpu_if->vgic_ppi_enabler, 64, 64),
-			       SYS_ICH_PPI_ENABLER1_EL2);
-		write_sysreg_s(bitmap_read(pendr, 64, 64),
-			       SYS_ICH_PPI_PENDR1_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_ACTIVER1_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_ENABLER1_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_PENDR1_EL2);
 
-		write_sysreg_s(cpu_if->vgic_ppi_priorityr[8],
-			       SYS_ICH_PPI_PRIORITYR8_EL2);
-		write_sysreg_s(cpu_if->vgic_ppi_priorityr[9],
-			       SYS_ICH_PPI_PRIORITYR9_EL2);
-		write_sysreg_s(cpu_if->vgic_ppi_priorityr[10],
-			       SYS_ICH_PPI_PRIORITYR10_EL2);
-		write_sysreg_s(cpu_if->vgic_ppi_priorityr[11],
-			       SYS_ICH_PPI_PRIORITYR11_EL2);
-		write_sysreg_s(cpu_if->vgic_ppi_priorityr[12],
-			       SYS_ICH_PPI_PRIORITYR12_EL2);
-		write_sysreg_s(cpu_if->vgic_ppi_priorityr[13],
-			       SYS_ICH_PPI_PRIORITYR13_EL2);
-		write_sysreg_s(cpu_if->vgic_ppi_priorityr[14],
-			       SYS_ICH_PPI_PRIORITYR14_EL2);
-		write_sysreg_s(cpu_if->vgic_ppi_priorityr[15],
-			       SYS_ICH_PPI_PRIORITYR15_EL2);
-	} else {
-		write_sysreg_s(0, SYS_ICH_PPI_DVIR1_EL2);
-
-		write_sysreg_s(0, SYS_ICH_PPI_ACTIVER1_EL2);
-		write_sysreg_s(0, SYS_ICH_PPI_ENABLER1_EL2);
-		write_sysreg_s(0, SYS_ICH_PPI_PENDR1_EL2);
-
-		write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR8_EL2);
-		write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR9_EL2);
-		write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR10_EL2);
-		write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR11_EL2);
-		write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR12_EL2);
-		write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR13_EL2);
-		write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR14_EL2);
-		write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR15_EL2);
-	}
+	write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR8_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR9_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR10_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR11_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR12_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR13_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR14_EL2);
+	write_sysreg_s(0, SYS_ICH_PPI_PRIORITYR15_EL2);
 }
 
 void __vgic_v5_save_state(struct vgic_v5_cpu_if *cpu_if)
@@ -163,4 +148,14 @@ void __vgic_v5_save_state(struct vgic_v5_cpu_if *cpu_if)
 void __vgic_v5_restore_state(struct vgic_v5_cpu_if *cpu_if)
 {
 	write_sysreg_s(cpu_if->vgic_icsr, SYS_ICC_ICSR_EL1);
+}
+
+void __vgic_v5_vdpend(u32 intid, bool pending, u16 vm)
+{
+	u64 value;
+
+	value = intid & (GICV5_GIC_VDPEND_ID_MASK | GICV5_GIC_VDPEND_TYPE_MASK);
+	value |= FIELD_PREP(GICV5_GIC_VDPEND_PENDING_MASK, pending);
+	value |= FIELD_PREP(GICV5_GIC_VDPEND_VM_MASK, vm);
+	gic_insn(value, VDPEND);
 }

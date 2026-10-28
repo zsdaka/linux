@@ -27,8 +27,8 @@ static int maxqlen = SNDRV_SEQ_OSS_MAX_QLEN;
 module_param(maxqlen, int, 0444);
 MODULE_PARM_DESC(maxqlen, "maximum queue length");
 
-static int system_client = -1; /* ALSA sequencer client number */
-static int system_port = -1;
+static int system_client __ro_after_init = -1; /* ALSA sequencer client number */
+static int system_port __ro_after_init = -1;
 
 static int num_clients;
 static struct seq_oss_devinfo *client_table[SNDRV_SEQ_OSS_MAX_CLIENTS];
@@ -258,6 +258,7 @@ snd_seq_oss_open(struct file *file, int level)
 
 	client_table[dp->index] = dp;
 	num_clients++;
+	smp_store_release(&dp->initialized, true);
 
 	return 0;
 
@@ -376,7 +377,7 @@ delete_seq_queue(int queue)
 
 
 /*
- * free device informations - private_free callback of port
+ * free device information - private_free callback of port
  */
 static void
 free_devinfo(void *private)
@@ -403,6 +404,7 @@ snd_seq_oss_release(struct seq_oss_devinfo *dp)
 
 	client_table[dp->index] = NULL;
 	num_clients--;
+	smp_store_release(&dp->initialized, false);
 
 	snd_seq_oss_reset(dp);
 

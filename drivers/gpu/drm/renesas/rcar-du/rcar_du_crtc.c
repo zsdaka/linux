@@ -689,7 +689,7 @@ static void rcar_du_crtc_stop(struct rcar_du_crtc *rcrtc)
  */
 
 static int rcar_du_crtc_atomic_check(struct drm_crtc *crtc,
-				     struct drm_atomic_state *state)
+				     struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state,
 									  crtc);
@@ -720,7 +720,7 @@ static int rcar_du_crtc_atomic_check(struct drm_crtc *crtc,
 }
 
 static void rcar_du_crtc_atomic_enable(struct drm_crtc *crtc,
-				       struct drm_atomic_state *state)
+				       struct drm_atomic_commit *state)
 {
 	struct rcar_du_crtc *rcrtc = to_rcar_crtc(crtc);
 	struct rcar_du_crtc_state *rstate = to_rcar_crtc_state(crtc->state);
@@ -768,7 +768,7 @@ static void rcar_du_crtc_atomic_enable(struct drm_crtc *crtc,
 }
 
 static void rcar_du_crtc_atomic_disable(struct drm_crtc *crtc,
-					struct drm_atomic_state *state)
+					struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *old_state = drm_atomic_get_old_crtc_state(state,
 									 crtc);
@@ -812,7 +812,7 @@ static void rcar_du_crtc_atomic_disable(struct drm_crtc *crtc,
 }
 
 static void rcar_du_crtc_atomic_begin(struct drm_crtc *crtc,
-				      struct drm_atomic_state *state)
+				      struct drm_atomic_commit *state)
 {
 	struct rcar_du_crtc *rcrtc = to_rcar_crtc(crtc);
 
@@ -841,7 +841,7 @@ static void rcar_du_crtc_atomic_begin(struct drm_crtc *crtc,
 }
 
 static void rcar_du_crtc_atomic_flush(struct drm_crtc *crtc,
-				      struct drm_atomic_state *state)
+				      struct drm_atomic_commit *state)
 {
 	struct rcar_du_crtc *rcrtc = to_rcar_crtc(crtc);
 	struct drm_device *dev = rcrtc->crtc.dev;
@@ -997,23 +997,20 @@ static void rcar_du_crtc_cleanup(struct drm_crtc *crtc)
 	drm_crtc_cleanup(crtc);
 }
 
-static void rcar_du_crtc_reset(struct drm_crtc *crtc)
+static struct drm_crtc_state *rcar_du_crtc_create_state(struct drm_crtc *crtc)
 {
 	struct rcar_du_crtc_state *state;
 
-	if (crtc->state) {
-		rcar_du_crtc_atomic_destroy_state(crtc, crtc->state);
-		crtc->state = NULL;
-	}
-
 	state = kzalloc_obj(*state);
 	if (state == NULL)
-		return;
+		return ERR_PTR(-ENOMEM);
 
 	state->crc.source = VSP1_DU_CRC_NONE;
 	state->crc.index = 0;
 
-	__drm_atomic_helper_crtc_reset(crtc, &state->state);
+	__drm_atomic_helper_crtc_state_init(&state->state, crtc);
+
+	return &state->state;
 }
 
 static int rcar_du_crtc_enable_vblank(struct drm_crtc *crtc)
@@ -1103,7 +1100,7 @@ static int rcar_du_crtc_set_crc_source(struct drm_crtc *crtc,
 	struct rcar_du_crtc *rcrtc = to_rcar_crtc(crtc);
 	struct drm_modeset_acquire_ctx ctx;
 	struct drm_crtc_state *crtc_state;
-	struct drm_atomic_state *state;
+	struct drm_atomic_commit *state;
 	enum vsp1_du_crc_source source;
 	unsigned int index;
 	int ret;
@@ -1117,7 +1114,7 @@ static int rcar_du_crtc_set_crc_source(struct drm_crtc *crtc,
 	/* Perform an atomic commit to set the CRC source. */
 	drm_modeset_acquire_init(&ctx, 0);
 
-	state = drm_atomic_state_alloc(crtc->dev);
+	state = drm_atomic_commit_alloc(crtc->dev);
 	if (!state) {
 		ret = -ENOMEM;
 		goto unlock;
@@ -1140,12 +1137,12 @@ retry:
 	}
 
 	if (ret == -EDEADLK) {
-		drm_atomic_state_clear(state);
+		drm_atomic_commit_clear(state);
 		drm_modeset_backoff(&ctx);
 		goto retry;
 	}
 
-	drm_atomic_state_put(state);
+	drm_atomic_commit_put(state);
 
 unlock:
 	drm_modeset_drop_locks(&ctx);
@@ -1155,7 +1152,7 @@ unlock:
 }
 
 static const struct drm_crtc_funcs crtc_funcs_gen2 = {
-	.reset = rcar_du_crtc_reset,
+	.atomic_create_state = rcar_du_crtc_create_state,
 	.destroy = drm_crtc_cleanup,
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
@@ -1166,7 +1163,7 @@ static const struct drm_crtc_funcs crtc_funcs_gen2 = {
 };
 
 static const struct drm_crtc_funcs crtc_funcs_gen3 = {
-	.reset = rcar_du_crtc_reset,
+	.atomic_create_state = rcar_du_crtc_create_state,
 	.destroy = rcar_du_crtc_cleanup,
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,

@@ -75,8 +75,6 @@
 #define GMAC_PACKET_FILTER_IPFE		BIT(20)
 #define GMAC_PACKET_FILTER_RA		BIT(31)
 
-#define GMAC_MAX_PERFECT_ADDRESSES	128
-
 /* MAC RX Queue Enable */
 #define GMAC_RX_QUEUE_CLEAR(queue)	~(GENMASK(1, 0) << ((queue) * 2))
 #define GMAC_RX_AV_QUEUE_ENABLE(queue)	BIT((queue) * 2)
@@ -176,7 +174,9 @@ enum power_event {
 
 /* MAC HW features0 bitmap */
 #define GMAC_HW_FEAT_SAVLANINS		BIT(27)
-#define GMAC_HW_FEAT_ADDMAC		BIT(18)
+#define GMAC_HW_FEAT_MACADR64SEL	BIT(24)
+#define GMAC_HW_FEAT_MACADR32SEL	BIT(23)
+#define GMAC_HW_FEAT_ADDMAC		GENMASK(22, 18)
 #define GMAC_HW_FEAT_RXCOESEL		BIT(16)
 #define GMAC_HW_FEAT_TXCOSEL		BIT(14)
 #define GMAC_HW_FEAT_EEESEL		BIT(13)
@@ -198,6 +198,7 @@ enum power_event {
 #define GMAC_HW_FEAT_AVSEL		BIT(20)
 #define GMAC_HW_TSOEN			BIT(18)
 #define GMAC_HW_FEAT_SPHEN		BIT(17)
+#define GMAC_HW_FEAT_DCBEN		BIT(16)
 #define GMAC_HW_ADDR64			GENMASK(15, 14)
 #define GMAC_HW_TXFIFOSIZE		GENMASK(10, 6)
 #define GMAC_HW_RXFIFOSIZE		GENMASK(4, 0)

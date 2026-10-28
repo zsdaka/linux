@@ -119,6 +119,7 @@ typedef irqreturn_t (*irq_handler_t)(int, void *);
  * @thread_flags:	flags related to @thread
  * @thread_mask:	bitmask for keeping track of @thread activity
  * @dir:	pointer to the proc/irq/NN/name entry
+ * @thread_dtor:	task_work for @thread irregular exit cleanup
  */
 struct irqaction {
 	irq_handler_t		handler;
@@ -137,6 +138,7 @@ struct irqaction {
 	unsigned long		thread_mask;
 	const char		*name;
 	struct proc_dir_entry	*dir;
+	struct callback_head	thread_dtor;
 } ____cacheline_internodealigned_in_smp;
 
 extern irqreturn_t no_action(int cpl, void *dev_id);
@@ -573,9 +575,11 @@ enum
  * _ IRQ_POLL: irq_poll_cpu_dead() migrates the queue
  *
  * _ (HR)TIMER_SOFTIRQ: (hr)timers_dead_cpu() migrates the queue
+ *
+ * _ BLOCK_SOFTIRQ: blk_softirq_cpu_dead() completes the remaining requests
  */
-#define SOFTIRQ_HOTPLUG_SAFE_MASK (BIT(TIMER_SOFTIRQ) | BIT(IRQ_POLL_SOFTIRQ) |\
-				   BIT(HRTIMER_SOFTIRQ) | BIT(RCU_SOFTIRQ))
+#define SOFTIRQ_HOTPLUG_SAFE_MASK (BIT(TIMER_SOFTIRQ) | BIT(BLOCK_SOFTIRQ) |\
+				   BIT(IRQ_POLL_SOFTIRQ) | BIT(HRTIMER_SOFTIRQ) | BIT(RCU_SOFTIRQ))
 
 
 /* map softirq index to softirq name. update 'softirq_to_name' in
@@ -864,6 +868,7 @@ static inline void init_irq_proc(void)
 struct seq_file;
 int show_interrupts(struct seq_file *p, void *v);
 int arch_show_interrupts(struct seq_file *p, int prec);
+void irq_proc_emit_counts(struct seq_file *p, unsigned int __percpu *cnts);
 
 extern int early_irq_init(void);
 extern int arch_probe_nr_irqs(void);

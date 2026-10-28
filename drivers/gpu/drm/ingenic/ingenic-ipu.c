@@ -86,7 +86,7 @@ to_ingenic_ipu_priv_state(struct drm_private_state *state)
 }
 
 static struct ingenic_ipu_private_state *
-ingenic_ipu_get_priv_state(struct ingenic_ipu *priv, struct drm_atomic_state *state)
+ingenic_ipu_get_priv_state(struct ingenic_ipu *priv, struct drm_atomic_commit *state)
 {
 	struct drm_private_state *priv_state;
 
@@ -98,7 +98,7 @@ ingenic_ipu_get_priv_state(struct ingenic_ipu *priv, struct drm_atomic_state *st
 }
 
 static struct ingenic_ipu_private_state *
-ingenic_ipu_get_new_priv_state(struct ingenic_ipu *priv, struct drm_atomic_state *state)
+ingenic_ipu_get_new_priv_state(struct ingenic_ipu *priv, struct drm_atomic_commit *state)
 {
 	struct drm_private_state *priv_state;
 
@@ -321,7 +321,7 @@ static inline bool osd_changed(struct drm_plane_state *state,
 }
 
 static void ingenic_ipu_plane_atomic_update(struct drm_plane *plane,
-					    struct drm_atomic_state *state)
+					    struct drm_atomic_commit *state)
 {
 	struct ingenic_ipu *ipu = plane_to_ingenic_ipu(plane);
 	struct drm_plane_state *newstate = drm_atomic_get_new_plane_state(state, plane);
@@ -565,7 +565,7 @@ static void ingenic_ipu_plane_atomic_update(struct drm_plane *plane,
 }
 
 static int ingenic_ipu_plane_atomic_check(struct drm_plane *plane,
-					  struct drm_atomic_state *state)
+					  struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *old_plane_state = drm_atomic_get_old_plane_state(state,
 										 plane);
@@ -653,7 +653,7 @@ out_check_damage:
 }
 
 static void ingenic_ipu_plane_atomic_disable(struct drm_plane *plane,
-					     struct drm_atomic_state *state)
+					     struct drm_atomic_commit *state)
 {
 	struct ingenic_ipu *ipu = plane_to_ingenic_ipu(plane);
 
@@ -718,7 +718,7 @@ ingenic_ipu_plane_atomic_set_property(struct drm_plane *plane,
 static const struct drm_plane_funcs ingenic_ipu_plane_funcs = {
 	.update_plane		= drm_atomic_helper_update_plane,
 	.disable_plane		= drm_atomic_helper_disable_plane,
-	.reset			= drm_atomic_helper_plane_reset,
+	.atomic_create_state = drm_atomic_helper_plane_create_state,
 	.destroy		= drm_plane_cleanup,
 
 	.atomic_duplicate_state	= drm_atomic_helper_plane_duplicate_state,

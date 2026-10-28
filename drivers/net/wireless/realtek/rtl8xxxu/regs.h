@@ -447,6 +447,8 @@
 /* 8188EU */
 #define REG_32K_CTRL			0x0194
 #define REG_C2HEVT_MSG_NORMAL		0x01a0
+#define C2H_HW_FEATURE_REPORT		0x19
+#define C2H_HW_FEATURE_DUMP		0xfd
 /* 8192EU/8723BU/8812 */
 #define REG_C2HEVT_CMD_ID_8723B		0x01ae
 #define REG_C2HEVT_CLEAR		0x01af
@@ -980,7 +982,7 @@
 #define REG_NHM_TH3_TO_TH0_8723B	0x0898
 #define REG_NHM_TH7_TO_TH4_8723B	0x089c
 
-#define REG_FPGA0_XA_LSSI_READBACK	0x08a0	/* Tranceiver LSSI Readback */
+#define REG_FPGA0_XA_LSSI_READBACK	0x08a0	/* Transceiver LSSI Readback */
 #define REG_FPGA0_XB_LSSI_READBACK	0x08a4
 #define REG_FPGA0_PSD_REPORT		0x08b4
 #define REG_HSPI_XA_READBACK		0x08b8	/* Transceiver A HSPI read */

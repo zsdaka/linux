@@ -414,7 +414,7 @@ static void armada_drm_crtc_mode_set_nofb(struct drm_crtc *crtc)
 }
 
 static int armada_drm_crtc_atomic_check(struct drm_crtc *crtc,
-					struct drm_atomic_state *state)
+					struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state,
 									  crtc);
@@ -430,7 +430,7 @@ static int armada_drm_crtc_atomic_check(struct drm_crtc *crtc,
 }
 
 static void armada_drm_crtc_atomic_begin(struct drm_crtc *crtc,
-					 struct drm_atomic_state *state)
+					 struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state,
 									  crtc);
@@ -446,7 +446,7 @@ static void armada_drm_crtc_atomic_begin(struct drm_crtc *crtc,
 }
 
 static void armada_drm_crtc_atomic_flush(struct drm_crtc *crtc,
-					 struct drm_atomic_state *state)
+					 struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state,
 									  crtc);
@@ -474,7 +474,7 @@ static void armada_drm_crtc_atomic_flush(struct drm_crtc *crtc,
 }
 
 static void armada_drm_crtc_atomic_disable(struct drm_crtc *crtc,
-					   struct drm_atomic_state *state)
+					   struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *old_state = drm_atomic_get_old_crtc_state(state,
 									 crtc);
@@ -512,7 +512,7 @@ static void armada_drm_crtc_atomic_disable(struct drm_crtc *crtc,
 }
 
 static void armada_drm_crtc_atomic_enable(struct drm_crtc *crtc,
-					  struct drm_atomic_state *state)
+					  struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *old_state = drm_atomic_get_old_crtc_state(state,
 									 crtc);
@@ -817,7 +817,7 @@ static void armada_drm_crtc_disable_vblank(struct drm_crtc *crtc)
 }
 
 static const struct drm_crtc_funcs armada_crtc_funcs = {
-	.reset		= drm_atomic_helper_crtc_reset,
+	.atomic_create_state = drm_atomic_helper_crtc_create_state,
 	.cursor_set	= armada_drm_crtc_cursor_set,
 	.cursor_move	= armada_drm_crtc_cursor_move,
 	.destroy	= armada_drm_crtc_destroy,

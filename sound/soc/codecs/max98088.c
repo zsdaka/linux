@@ -1342,11 +1342,21 @@ static int max98088_set_bias_level(struct snd_soc_component *component,
 #define MAX98088_RATES SNDRV_PCM_RATE_8000_96000
 #define MAX98088_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE)
 
+static const u64 max98088_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_IF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_IF;
+
 static const struct snd_soc_dai_ops max98088_dai1_ops = {
        .set_sysclk = max98088_dai_set_sysclk,
        .set_fmt = max98088_dai1_set_fmt,
        .hw_params = max98088_dai1_hw_params,
        .mute_stream = max98088_dai1_mute,
+       .auto_selectable_formats = &max98088_selectable_formats,
+       .num_auto_selectable_formats = 1,
        .no_capture_mute = 1,
 };
 
@@ -1355,6 +1365,8 @@ static const struct snd_soc_dai_ops max98088_dai2_ops = {
        .set_fmt = max98088_dai2_set_fmt,
        .hw_params = max98088_dai2_hw_params,
        .mute_stream = max98088_dai2_mute,
+       .auto_selectable_formats = &max98088_selectable_formats,
+       .num_auto_selectable_formats = 1,
        .no_capture_mute = 1,
 };
 
@@ -1722,8 +1734,8 @@ static const struct snd_soc_component_driver soc_component_dev_max98088 = {
 };
 
 static const struct i2c_device_id max98088_i2c_id[] = {
-       { "max98088", MAX98088 },
-       { "max98089", MAX98089 },
+       { .name = "max98088", .driver_data = MAX98088 },
+       { .name = "max98089", .driver_data = MAX98089 },
        { }
 };
 MODULE_DEVICE_TABLE(i2c, max98088_i2c_id);

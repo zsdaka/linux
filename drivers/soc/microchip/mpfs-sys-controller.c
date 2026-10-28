@@ -158,8 +158,8 @@ no_flash:
 
 	of_data = (struct mpfs_syscon_config *) device_get_match_data(dev);
 	if (!of_data) {
-		dev_err(dev, "Error getting match data\n");
-		return -EINVAL;
+		ret = dev_err_probe(dev, -EINVAL, "Error getting match data\n");
+		goto out_put;
 	}
 
 	for (i = 0; i < of_data->nb_subdevs; i++) {
@@ -173,6 +173,9 @@ no_flash:
 
 	return 0;
 
+out_put:
+	mpfs_sys_controller_put(sys_controller);
+	return ret;
 out_free:
 	kfree(sys_controller);
 	return ret;

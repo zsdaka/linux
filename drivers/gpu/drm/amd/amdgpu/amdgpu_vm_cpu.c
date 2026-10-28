@@ -21,6 +21,7 @@
  */
 
 #include "amdgpu_vm.h"
+#include "amdgpu_vm_internal.h"
 #include "amdgpu.h"
 #include "amdgpu_reset.h"
 #include "amdgpu_object.h"
@@ -88,12 +89,21 @@ static int amdgpu_vm_cpu_update(struct amdgpu_vm_update_params *p,
 
 	trace_amdgpu_vm_set_ptes(pe, addr, count, incr, flags, p->immediate);
 
+	if (!p->pages_addr && p->override_pte)
+		amdgpu_gmc_override_vm_pte_flags(p->adev, p->vm, addr, &flags);
+
 	for (i = 0; i < count; i++) {
+		u64 oflags = flags;
+
 		value = p->pages_addr ?
 			amdgpu_vm_map_gart(p->pages_addr, addr) :
 			addr;
+
+		if (p->pages_addr && p->override_pte)
+			amdgpu_gmc_override_vm_pte_flags(p->adev, p->vm, value, &oflags);
+
 		amdgpu_gmc_set_pte_pde(p->adev, (void *)(uintptr_t)pe,
-				       i, value, flags);
+				       i, value, oflags);
 		addr += incr;
 	}
 	return 0;

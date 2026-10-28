@@ -446,7 +446,7 @@ static void omap_crtc_arm_event(struct drm_crtc *crtc)
 }
 
 static void omap_crtc_atomic_enable(struct drm_crtc *crtc,
-				    struct drm_atomic_state *state)
+				    struct drm_atomic_commit *state)
 {
 	struct omap_drm_private *priv = crtc->dev->dev_private;
 	struct omap_crtc *omap_crtc = to_omap_crtc(crtc);
@@ -472,7 +472,7 @@ static void omap_crtc_atomic_enable(struct drm_crtc *crtc,
 }
 
 static void omap_crtc_atomic_disable(struct drm_crtc *crtc,
-				     struct drm_atomic_state *state)
+				     struct drm_atomic_commit *state)
 {
 	struct omap_drm_private *priv = crtc->dev->dev_private;
 	struct omap_crtc *omap_crtc = to_omap_crtc(crtc);
@@ -577,7 +577,7 @@ static bool omap_crtc_is_manually_updated(struct drm_crtc *crtc)
 }
 
 static int omap_crtc_atomic_check(struct drm_crtc *crtc,
-				struct drm_atomic_state *state)
+				struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state,
 									  crtc);
@@ -609,12 +609,12 @@ static int omap_crtc_atomic_check(struct drm_crtc *crtc,
 }
 
 static void omap_crtc_atomic_begin(struct drm_crtc *crtc,
-				   struct drm_atomic_state *state)
+				   struct drm_atomic_commit *state)
 {
 }
 
 static void omap_crtc_atomic_flush(struct drm_crtc *crtc,
-				   struct drm_atomic_state *state)
+				   struct drm_atomic_commit *state)
 {
 	struct omap_drm_private *priv = crtc->dev->dev_private;
 	struct omap_crtc *omap_crtc = to_omap_crtc(crtc);
@@ -707,18 +707,17 @@ static int omap_crtc_atomic_get_property(struct drm_crtc *crtc,
 	return 0;
 }
 
-static void omap_crtc_reset(struct drm_crtc *crtc)
+static struct drm_crtc_state *omap_crtc_create_state(struct drm_crtc *crtc)
 {
 	struct omap_crtc_state *state;
 
-	if (crtc->state)
-		__drm_atomic_helper_crtc_destroy_state(crtc->state);
-
-	kfree(crtc->state);
-
 	state = kzalloc_obj(*state);
-	if (state)
-		__drm_atomic_helper_crtc_reset(crtc, &state->base);
+	if (!state)
+		return ERR_PTR(-ENOMEM);
+
+	__drm_atomic_helper_crtc_state_init(&state->base, crtc);
+
+	return &state->base;
 }
 
 static struct drm_crtc_state *
@@ -745,7 +744,7 @@ omap_crtc_duplicate_state(struct drm_crtc *crtc)
 }
 
 static const struct drm_crtc_funcs omap_crtc_funcs = {
-	.reset = omap_crtc_reset,
+	.atomic_create_state = omap_crtc_create_state,
 	.set_config = drm_atomic_helper_set_config,
 	.destroy = omap_crtc_destroy,
 	.page_flip = drm_atomic_helper_page_flip,

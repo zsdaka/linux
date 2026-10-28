@@ -68,8 +68,6 @@ struct fwnode_handle;
  * @driver_override:	Set to true if this bus supports the driver_override
  *			mechanism, which allows userspace to force a specific
  *			driver to bind to a device via a sysfs attribute.
- * @need_parent_lock:	When probing or removing a device on this bus, the
- *			device core should lock the device's parent.
  *
  * A bus is a channel between the processor and one or more devices. For the
  * purposes of the device model, all devices are connected via a bus, even if
@@ -83,9 +81,9 @@ struct fwnode_handle;
 struct bus_type {
 	const char		*name;
 	const char		*dev_name;
-	const struct attribute_group **bus_groups;
-	const struct attribute_group **dev_groups;
-	const struct attribute_group **drv_groups;
+	const struct attribute_group *const *bus_groups;
+	const struct attribute_group *const *dev_groups;
+	const struct attribute_group *const *drv_groups;
 
 	int (*match)(struct device *dev, const struct device_driver *drv);
 	int (*uevent)(const struct device *dev, struct kobj_uevent_env *env);
@@ -110,9 +108,9 @@ struct bus_type {
 	const struct dev_pm_ops *pm;
 
 	bool driver_override;
-	bool need_parent_lock;
 };
 
+int __must_check companion_bus_register(const struct bus_type *bus);
 int __must_check bus_register(const struct bus_type *bus);
 
 void bus_unregister(const struct bus_type *bus);

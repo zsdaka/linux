@@ -105,7 +105,7 @@ static bool nfp_bpf_map_update_value_ok(struct bpf_verifier_env *env)
 		unsigned int soff;
 
 		soff = -(off + i) - 1;
-		stack_entry = &state->stack[soff / BPF_REG_SIZE];
+		stack_entry = bpf_stack_slot(state, soff / BPF_REG_SIZE);
 		if (stack_entry->slot_type[soff % BPF_REG_SIZE] == STACK_ZERO)
 			continue;
 
@@ -561,10 +561,10 @@ nfp_bpf_check_alu(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
 	const struct bpf_reg_state *dreg =
 		cur_regs(env) + meta->insn.dst_reg;
 
-	meta->umin_src = min(meta->umin_src, sreg->umin_value);
-	meta->umax_src = max(meta->umax_src, sreg->umax_value);
-	meta->umin_dst = min(meta->umin_dst, dreg->umin_value);
-	meta->umax_dst = max(meta->umax_dst, dreg->umax_value);
+	meta->umin_src = min(meta->umin_src, reg_umin(sreg));
+	meta->umax_src = max(meta->umax_src, reg_umax(sreg));
+	meta->umin_dst = min(meta->umin_dst, reg_umin(dreg));
+	meta->umax_dst = max(meta->umax_dst, reg_umax(dreg));
 
 	/* NFP supports u16 and u32 multiplication.
 	 *

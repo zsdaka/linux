@@ -101,8 +101,8 @@ static int cxl_parse_cxims(union acpi_subtable_headers *header, void *arg,
 	struct cxl_decoder *cxld = &cxlrd->cxlsd.cxld;
 	struct device *dev = ctx->dev;
 	struct cxl_cxims_data *cximsd;
-	unsigned int hbig, nr_maps;
-	int rc;
+	unsigned int nr_maps;
+	int hbig, rc;
 
 	rc = eig_to_granularity(cxims->hbig, &hbig);
 	if (rc)
@@ -160,7 +160,7 @@ static int cxl_acpi_cfmws_verify(struct device *dev,
 				 struct acpi_cedt_cfmws *cfmws)
 {
 	int rc, expected_len;
-	unsigned int ways;
+	int ways;
 
 	if (cfmws->interleave_arithmetic != ACPI_CEDT_CFMWS_ARITHMETIC_MODULO &&
 	    cfmws->interleave_arithmetic != ACPI_CEDT_CFMWS_ARITHMETIC_XOR) {
@@ -231,9 +231,10 @@ cxl_acpi_evaluate_qtg_dsm(acpi_handle handle, struct access_coordinate *coord,
 			  int entries, int *qos_class)
 {
 	union acpi_object *out_obj, *out_buf, *obj;
+	/* QTG _DSM expects latencies in picoseconds. */
 	union acpi_object in_array[4] = {
-		[0].integer = { ACPI_TYPE_INTEGER, coord->read_latency },
-		[1].integer = { ACPI_TYPE_INTEGER, coord->write_latency },
+		[0].integer = { ACPI_TYPE_INTEGER, coord->read_latency * 1000ULL },
+		[1].integer = { ACPI_TYPE_INTEGER, coord->write_latency * 1000ULL },
 		[2].integer = { ACPI_TYPE_INTEGER, coord->read_bandwidth },
 		[3].integer = { ACPI_TYPE_INTEGER, coord->write_bandwidth },
 	};
@@ -250,6 +251,11 @@ cxl_acpi_evaluate_qtg_dsm(acpi_handle handle, struct access_coordinate *coord,
 
 	if (!entries)
 		return -EINVAL;
+
+	/* Latency inputs must fit in the DWORD fields defined by the spec. */
+	if (coord->read_latency > U32_MAX / 1000 ||
+	    coord->write_latency > U32_MAX / 1000)
+		return -ERANGE;
 
 	out_obj = acpi_evaluate_dsm(handle, &acpi_cxl_qtg_id_guid, 1, 1, &in_obj);
 	if (!out_obj)
@@ -405,7 +411,7 @@ static int __cxl_parse_cfmws(struct acpi_cedt_cfmws *cfmws,
 	struct cxl_cxims_context cxims_ctx;
 	struct device *dev = ctx->dev;
 	struct cxl_decoder *cxld;
-	unsigned int ways, i, ig;
+	int ways, i, ig;
 	int rc;
 
 	rc = cxl_acpi_cfmws_verify(dev, cfmws);
@@ -464,7 +470,7 @@ static int __cxl_parse_cfmws(struct acpi_cedt_cfmws *cfmws,
 			if (rc < 0)
 				return rc;
 			if (!cxlrd->platform_data) {
-				dev_err(dev, "No CXIMS for HBIG %u\n", ig);
+				dev_err(dev, "No CXIMS for HBIG %d\n", ig);
 				return -EINVAL;
 			}
 		}
@@ -885,13 +891,17 @@ static int pair_cxl_resource(struct device *dev, void *data)
 
 static int cxl_acpi_probe(struct platform_device *pdev)
 {
-	int rc;
+	struct cxl_cfmws_context ctx;
+	struct acpi_device *adev;
 	struct resource *cxl_res;
 	struct cxl_root *cxl_root;
 	struct cxl_port *root_port;
 	struct device *host = &pdev->dev;
-	struct acpi_device *adev = ACPI_COMPANION(host);
-	struct cxl_cfmws_context ctx;
+	int rc;
+
+	adev = ACPI_COMPANION(host);
+	if (!adev)
+		return -ENODEV;
 
 	device_lock_set_class(&pdev->dev, &cxl_root_key);
 	rc = devm_add_action_or_reset(&pdev->dev, cxl_acpi_lock_reset_class,

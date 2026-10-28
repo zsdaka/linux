@@ -267,10 +267,7 @@ void led_blink_set_oneshot(struct led_classdev *led_cdev,
 	set_bit(LED_BLINK_ONESHOT, &led_cdev->work_flags);
 	clear_bit(LED_BLINK_ONESHOT_STOP, &led_cdev->work_flags);
 
-	if (invert)
-		set_bit(LED_BLINK_INVERT, &led_cdev->work_flags);
-	else
-		clear_bit(LED_BLINK_INVERT, &led_cdev->work_flags);
+	assign_bit(LED_BLINK_INVERT, &led_cdev->work_flags, invert);
 
 	led_blink_setup(led_cdev, delay_on, delay_off);
 }
@@ -303,24 +300,31 @@ EXPORT_SYMBOL_GPL(led_stop_software_blink);
 
 void led_set_brightness(struct led_classdev *led_cdev, unsigned int brightness)
 {
-	/*
-	 * If software blink is active, delay brightness setting
-	 * until the next timer tick.
-	 */
-	if (test_bit(LED_BLINK_SW, &led_cdev->work_flags)) {
+	if (brightness) {
+		/*
+		 * If software blink disable is pending, also queue brightness setting.
+		 * If software blink is active, delay brightness setting
+		 * until the next timer tick.
+		 */
+		if (test_bit(LED_SET_BRIGHTNESS, &led_cdev->work_flags) ||
+		    test_bit(LED_BLINK_DISABLE, &led_cdev->work_flags)) {
+			led_cdev->delayed_set_value = brightness;
+			set_bit(LED_SET_BRIGHTNESS, &led_cdev->work_flags);
+			queue_work(led_cdev->wq, &led_cdev->set_brightness_work);
+			return;
+		} else if (test_bit(LED_BLINK_SW, &led_cdev->work_flags)) {
+			led_cdev->new_blink_brightness = brightness;
+			set_bit(LED_BLINK_BRIGHTNESS_CHANGE, &led_cdev->work_flags);
+			return;
+		}
+	} else if (test_bit(LED_BLINK_SW, &led_cdev->work_flags)) {
 		/*
 		 * If we need to disable soft blinking delegate this to the
 		 * work queue task to avoid problems in case we are called
 		 * from hard irq context.
 		 */
-		if (!brightness) {
-			set_bit(LED_BLINK_DISABLE, &led_cdev->work_flags);
-			queue_work(led_cdev->wq, &led_cdev->set_brightness_work);
-		} else {
-			set_bit(LED_BLINK_BRIGHTNESS_CHANGE,
-				&led_cdev->work_flags);
-			led_cdev->new_blink_brightness = brightness;
-		}
+		set_bit(LED_BLINK_DISABLE, &led_cdev->work_flags);
+		queue_work(led_cdev->wq, &led_cdev->set_brightness_work);
 		return;
 	}
 

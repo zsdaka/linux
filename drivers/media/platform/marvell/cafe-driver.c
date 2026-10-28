@@ -127,7 +127,7 @@ struct cafe_camera {
  * Debugging and related.
  */
 #define cam_err(cam, fmt, arg...) \
-	dev_err(&(cam)->pdev->dev, fmt, ##arg);
+	dev_err(&(cam)->pdev->dev, fmt, ##arg)
 #define cam_warn(cam, fmt, arg...) \
 	dev_warn(&(cam)->pdev->dev, fmt, ##arg);
 
@@ -609,6 +609,7 @@ static void cafe_pci_remove(struct pci_dev *pdev)
 		return;
 	}
 	cafe_shutdown(cam);
+	pci_disable_device(pdev);
 	kfree(cam);
 }
 

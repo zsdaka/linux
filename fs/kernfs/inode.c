@@ -37,6 +37,7 @@ static struct kernfs_iattrs *__kernfs_iattrs(struct kernfs_node *kn, bool alloc)
 	if (!ret)
 		return NULL;
 
+	INIT_LIST_HEAD_RCU(&ret->xattrs);
 	/* assign default attributes */
 	ret->ia_uid = GLOBAL_ROOT_UID;
 	ret->ia_gid = GLOBAL_ROOT_GID;
@@ -106,7 +107,7 @@ int kernfs_setattr(struct kernfs_node *kn, const struct iattr *iattr)
 	return ret;
 }
 
-int kernfs_iop_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+int kernfs_iop_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 		       struct iattr *iattr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -140,12 +141,9 @@ ssize_t kernfs_iop_listxattr(struct dentry *dentry, char *buf, size_t size)
 	struct kernfs_node *kn = kernfs_dentry_node(dentry);
 	struct kernfs_iattrs *attrs;
 
-	attrs = kernfs_iattrs(kn);
-	if (!attrs)
-		return -ENOMEM;
+	attrs = kernfs_iattrs_noalloc(kn);
 
-	return simple_xattr_list(d_inode(dentry), READ_ONCE(attrs->xattrs),
-				 buf, size);
+	return simple_xattr_list(d_inode(dentry), attrs ? &attrs->xattrs : NULL, buf, size);
 }
 
 static inline void set_default_inode_attr(struct inode *inode, umode_t mode)
@@ -181,7 +179,7 @@ static void kernfs_refresh_inode(struct kernfs_node *kn, struct inode *inode)
 		set_nlink(inode, kn->dir.subdirs + 2);
 }
 
-int kernfs_iop_getattr(struct mnt_idmap *idmap,
+int kernfs_iop_getattr(const struct mnt_idmap *idmap,
 		       const struct path *path, struct kstat *stat,
 		       u32 request_mask, unsigned int query_flags)
 {
@@ -272,7 +270,7 @@ void kernfs_evict_inode(struct inode *inode)
 	kernfs_put(kn);
 }
 
-int kernfs_iop_permission(struct mnt_idmap *idmap,
+int kernfs_iop_permission(const struct mnt_idmap *idmap,
 			  struct inode *inode, int mask)
 {
 	struct kernfs_node *kn;
@@ -297,34 +295,35 @@ int kernfs_xattr_get(struct kernfs_node *kn, const char *name,
 		     void *value, size_t size)
 {
 	struct kernfs_iattrs *attrs = kernfs_iattrs_noalloc(kn);
-	struct simple_xattrs *xattrs;
+	struct simple_xattr_cache *cache = &kernfs_root(kn)->xa_cache;
 
 	if (!attrs)
 		return -ENODATA;
 
-	xattrs = READ_ONCE(attrs->xattrs);
-	if (!xattrs)
-		return -ENODATA;
-
-	return simple_xattr_get(xattrs, name, value, size);
+	return simple_xattr_get(cache, &attrs->xattrs, name, value, size);
 }
 
 int kernfs_xattr_set(struct kernfs_node *kn, const char *name,
 		     const void *value, size_t size, int flags)
 {
 	struct simple_xattr *old_xattr;
-	struct simple_xattrs *xattrs;
 	struct kernfs_iattrs *attrs;
+	struct simple_xattr_cache *cache = &kernfs_root(kn)->xa_cache;
 
 	attrs = kernfs_iattrs(kn);
 	if (!attrs)
 		return -ENOMEM;
 
-	xattrs = simple_xattrs_lazy_alloc(&attrs->xattrs, value, flags);
-	if (IS_ERR_OR_NULL(xattrs))
-		return PTR_ERR(xattrs);
+	/*
+	 * Protect xattr modifications with the hashed per-node mutex.
+	 * Multiple superblocks (with different namespaces) can share the same
+	 * kernfs_node, so inode locking alone is insufficient. The hashed mutex
+	 * ensures serialization of concurrent xattr operations on the same node,
+	 * including the lazy allocation of the xattrs structure itself.
+	 */
+	CLASS(kernfs_node_lock, lock)(kn);
 
-	old_xattr = simple_xattr_set(xattrs, name, value, size, flags);
+	old_xattr = simple_xattr_set(cache, &attrs->xattrs, name, value, size, flags);
 	if (IS_ERR(old_xattr))
 		return PTR_ERR(old_xattr);
 
@@ -343,7 +342,7 @@ static int kernfs_vfs_xattr_get(const struct xattr_handler *handler,
 }
 
 static int kernfs_vfs_xattr_set(const struct xattr_handler *handler,
-				struct mnt_idmap *idmap,
+				const struct mnt_idmap *idmap,
 				struct dentry *unused, struct inode *inode,
 				const char *suffix, const void *value,
 				size_t size, int flags)
@@ -355,14 +354,13 @@ static int kernfs_vfs_xattr_set(const struct xattr_handler *handler,
 }
 
 static int kernfs_vfs_user_xattr_set(const struct xattr_handler *handler,
-				     struct mnt_idmap *idmap,
+				     const struct mnt_idmap *idmap,
 				     struct dentry *unused, struct inode *inode,
 				     const char *suffix, const void *value,
 				     size_t size, int flags)
 {
 	const char *full_name = xattr_full_name(handler, suffix);
 	struct kernfs_node *kn = inode->i_private;
-	struct simple_xattrs *xattrs;
 	struct kernfs_iattrs *attrs;
 
 	if (!(kernfs_root(kn)->flags & KERNFS_ROOT_SUPPORT_USER_XATTR))
@@ -372,11 +370,11 @@ static int kernfs_vfs_user_xattr_set(const struct xattr_handler *handler,
 	if (!attrs)
 		return -ENOMEM;
 
-	xattrs = simple_xattrs_lazy_alloc(&attrs->xattrs, value, flags);
-	if (IS_ERR_OR_NULL(xattrs))
-		return PTR_ERR(xattrs);
+	/* See comment in kernfs_xattr_set() about locking. */
+	CLASS(kernfs_node_lock, lock)(kn);
 
-	return simple_xattr_set_limited(xattrs, &attrs->xattr_limits,
+	return simple_xattr_set_limited(&kernfs_root(kn)->xa_cache,
+					&attrs->xattrs, &attrs->xattr_limits,
 					full_name, value, size, flags);
 }
 

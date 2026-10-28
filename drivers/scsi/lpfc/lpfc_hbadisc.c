@@ -1340,9 +1340,9 @@ lpfc_linkdown(struct lpfc_hba *phba)
 		}
 		clear_bit(FC_PT2PT, &phba->pport->fc_flag);
 		clear_bit(FC_PT2PT_PLOGI, &phba->pport->fc_flag);
-		spin_lock_irq(shost->host_lock);
+		spin_lock_irq(&shost->host_lock);
 		phba->pport->rcv_flogi_cnt = 0;
-		spin_unlock_irq(shost->host_lock);
+		spin_unlock_irq(&shost->host_lock);
 	}
 	return 0;
 }
@@ -1406,9 +1406,9 @@ lpfc_linkup_port(struct lpfc_vport *vport)
 	}
 	set_bit(FC_NDISC_ACTIVE, &vport->fc_flag);
 
-	spin_lock_irq(shost->host_lock);
+	spin_lock_irq(&shost->host_lock);
 	vport->fc_ns_retry = 0;
-	spin_unlock_irq(shost->host_lock);
+	spin_unlock_irq(&shost->host_lock);
 	lpfc_setup_fdmi_mask(vport);
 
 	lpfc_linkup_cleanup_nodes(vport);
@@ -1437,9 +1437,9 @@ lpfc_linkup(struct lpfc_hba *phba)
 	 * absorbed without an ACQE. No lock here - in worker thread
 	 * and discovery is synchronized.
 	 */
-	spin_lock_irq(shost->host_lock);
+	spin_lock_irq(&shost->host_lock);
 	phba->pport->rcv_flogi_cnt = 0;
-	spin_unlock_irq(shost->host_lock);
+	spin_unlock_irq(&shost->host_lock);
 
 	return 0;
 }
@@ -1845,7 +1845,7 @@ lpfc_copy_fcf_record(struct lpfc_fcf_rec *fcf_rec,
  * @flag: flag bits to be set to the driver fcf record.
  *
  * This routine updates the driver FCF record from the new HBA FCF record
- * together with the address mode, vlan_id, and other informations. This
+ * together with the address mode, vlan_id, and other information. This
  * routine is called with the hbalock held.
  **/
 static void
@@ -2120,7 +2120,7 @@ lpfc_match_fcf_conn_list(struct lpfc_hba *phba,
 /**
  * lpfc_check_pending_fcoe_event - Check if there is pending fcoe event.
  * @phba: pointer to lpfc hba data structure.
- * @unreg_fcf: Unregister FCF if FCF table need to be re-scaned.
+ * @unreg_fcf: Unregister FCF if FCF table need to be re-scanned.
  *
  * This function check if there is any fcoe event pending while driver
  * scan FCF entries. If there is any pending event, it will restart the
@@ -2290,7 +2290,7 @@ lpfc_sli4_fcf_rec_mbox_parse(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq,
  * @vlan_id: the lowest vlan identifier associated to this fcf record.
  * @next_fcf_index: the index to the next fcf record in hba's fcf table.
  *
- * This routine logs the detailed FCF record if the LOG_FIP loggin is
+ * This routine logs the detailed FCF record if the LOG_FIP login is
  * enabled.
  **/
 static void
@@ -3400,9 +3400,9 @@ lpfc_mbx_cmpl_reg_vfi(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq)
 	set_bit(FC_VFI_REGISTERED, &vport->fc_flag);
 	clear_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag);
 	clear_bit(FC_VPORT_NEEDS_INIT_VPI, &vport->fc_flag);
-	spin_lock_irq(shost->host_lock);
+	spin_lock_irq(&shost->host_lock);
 	vport->vpi_state |= LPFC_VPI_REGISTERED;
-	spin_unlock_irq(shost->host_lock);
+	spin_unlock_irq(&shost->host_lock);
 
 	/* In case SLI4 FC loopback test, we are ready */
 	if ((phba->sli_rev == LPFC_SLI_REV4) &&
@@ -3475,7 +3475,7 @@ lpfc_mbx_cmpl_read_sparam(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 	phba->fc_edtov = ed_tov;
 	phba->fc_ratov = (2 * ed_tov) / 1000;
 	if (phba->fc_ratov < FF_DEF_RATOV) {
-		/* RA_TOV should be atleast 10sec for initial flogi */
+		/* RA_TOV should be at least 10sec for initial flogi */
 		phba->fc_ratov = FF_DEF_RATOV;
 	}
 
@@ -3943,9 +3943,9 @@ lpfc_mbx_cmpl_unreg_vpi(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 	}
 
 	set_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag);
-	spin_lock_irq(shost->host_lock);
+	spin_lock_irq(&shost->host_lock);
 	vport->vpi_state &= ~LPFC_VPI_REGISTERED;
-	spin_unlock_irq(shost->host_lock);
+	spin_unlock_irq(&shost->host_lock);
 	mempool_free(pmb, phba->mbox_mem_pool);
 	lpfc_cleanup_vports_rrqs(vport, NULL);
 	/*
@@ -4010,9 +4010,9 @@ lpfc_mbx_cmpl_reg_vpi(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 	}
 
 	clear_bit(FC_VPORT_NEEDS_REG_VPI, &vport->fc_flag);
-	spin_lock_irq(shost->host_lock);
+	spin_lock_irq(&shost->host_lock);
 	vport->vpi_state |= LPFC_VPI_REGISTERED;
-	spin_unlock_irq(shost->host_lock);
+	spin_unlock_irq(&shost->host_lock);
 	vport->num_disc_nodes = 0;
 	/* go thru NPR list and issue ELS PLOGIs */
 	if (atomic_read(&vport->fc_npr_cnt))
@@ -5239,7 +5239,7 @@ lpfc_set_unreg_login_mbx_cmpl(struct lpfc_hba *phba, struct lpfc_vport *vport,
  * Free rpi associated with LPFC_NODELIST entry.
  * This routine is called if the driver initiates a LOGO that completes
  * successfully, and we are waiting to PLOGI back to the remote NPort.
- * In addition, it is called after we receive and unsolicated ELS cmd,
+ * In addition, it is called after we receive and unsolicited ELS cmd,
  * send back a rsp, the rsp completes and we are waiting to PLOGI back
  * to the remote NPort.
  */
@@ -5620,9 +5620,9 @@ lpfc_findnode_did(struct lpfc_vport *vport, uint32_t did)
 	struct lpfc_nodelist *ndlp;
 	unsigned long iflags;
 
-	spin_lock_irqsave(shost->host_lock, iflags);
+	spin_lock_irqsave(&shost->host_lock, iflags);
 	ndlp = __lpfc_findnode_did(vport, did);
-	spin_unlock_irqrestore(shost->host_lock, iflags);
+	spin_unlock_irqrestore(&shost->host_lock, iflags);
 	return ndlp;
 }
 
@@ -6426,9 +6426,9 @@ lpfc_findnode_wwpn(struct lpfc_vport *vport, struct lpfc_name *wwpn)
 	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
 	struct lpfc_nodelist *ndlp;
 
-	spin_lock_irq(shost->host_lock);
+	spin_lock_irq(&shost->host_lock);
 	ndlp = __lpfc_find_node(vport, lpfc_filter_by_wwpn, wwpn);
-	spin_unlock_irq(shost->host_lock);
+	spin_unlock_irq(&shost->host_lock);
 	return ndlp;
 }
 
@@ -6444,9 +6444,9 @@ lpfc_findnode_rpi(struct lpfc_vport *vport, uint16_t rpi)
 	struct lpfc_nodelist *ndlp;
 	unsigned long flags;
 
-	spin_lock_irqsave(shost->host_lock, flags);
+	spin_lock_irqsave(&shost->host_lock, flags);
 	ndlp = __lpfc_findnode_rpi(vport, rpi);
-	spin_unlock_irqrestore(shost->host_lock, flags);
+	spin_unlock_irqrestore(&shost->host_lock, flags);
 	return ndlp;
 }
 
@@ -6551,7 +6551,7 @@ lpfc_nlp_init(struct lpfc_vport *vport, uint32_t did)
 	return ndlp;
 }
 
-/* This routine releases all resources associated with a specifc NPort's ndlp
+/* This routine releases all resources associated with a specific NPort's ndlp
  * and mempool_free's the nodelist.
  */
 static void
@@ -6786,9 +6786,9 @@ lpfc_unregister_fcf_prep(struct lpfc_hba *phba)
 				lpfc_sli4_unreg_all_rpis(vports[i]);
 			lpfc_mbx_unreg_vpi(vports[i]);
 			shost = lpfc_shost_from_vport(vports[i]);
-			spin_lock_irq(shost->host_lock);
+			spin_lock_irq(&shost->host_lock);
 			vports[i]->vpi_state &= ~LPFC_VPI_REGISTERED;
-			spin_unlock_irq(shost->host_lock);
+			spin_unlock_irq(&shost->host_lock);
 			set_bit(FC_VPORT_NEEDS_INIT_VPI, &vports[i]->fc_flag);
 		}
 	lpfc_destroy_vport_work_array(phba, vports);
@@ -6801,9 +6801,9 @@ lpfc_unregister_fcf_prep(struct lpfc_hba *phba)
 			lpfc_sli4_unreg_all_rpis(phba->pport);
 		lpfc_mbx_unreg_vpi(phba->pport);
 		shost = lpfc_shost_from_vport(phba->pport);
-		spin_lock_irq(shost->host_lock);
+		spin_lock_irq(&shost->host_lock);
 		phba->pport->vpi_state &= ~LPFC_VPI_REGISTERED;
-		spin_unlock_irq(shost->host_lock);
+		spin_unlock_irq(&shost->host_lock);
 		set_bit(FC_VPORT_NEEDS_INIT_VPI, &phba->pport->fc_flag);
 	}
 

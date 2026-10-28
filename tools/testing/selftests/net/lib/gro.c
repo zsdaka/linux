@@ -46,6 +46,12 @@
  *   - large_max: exceeding max size
  *   - large_rem: remainder handling
  *
+ * big_tcp_*:
+ *   - big_tcp_data_same:    equal segments coalescing past IP_MAXPACKET
+ *   - big_tcp_data_lrg_sml: a smaller final segment carrying it over
+ *   - big_tcp_tcp_seq:      16-bit truncated sequence number must not coalesce
+ *   - big_tcp_large_max:    coalescing stops at the configured limit
+ *
  * single, capacity:
  *  Boring cases used to test coalescing machinery itself and stats
  *  more than protocol behavior.
@@ -67,12 +73,14 @@
 #include <errno.h>
 #include <error.h>
 #include <getopt.h>
-#include <linux/filter.h>
-#include <linux/if_packet.h>
-#include <linux/ipv6.h>
-#include <linux/net_tstamp.h>
 #include <net/ethernet.h>
 #include <net/if.h>
+#include <linux/filter.h>
+#include <linux/if_packet.h>
+#include <linux/if_pppox.h>
+#include <linux/ipv6.h>
+#include <linux/net_tstamp.h>
+#include <linux/ppp_defs.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
@@ -102,8 +110,21 @@
 #define MAX_LARGE_PKT_CNT ((IP_MAXPACKET - (MAX_HDR_LEN - ETH_HLEN)) /	\
 			   (ASSUMED_MTU - (MAX_HDR_LEN - ETH_HLEN)))
 #define MIN_EXTHDR_SIZE 8
+#define L2_HLEN_MAX	(ETH_HLEN + PPPOE_SES_HLEN)
 #define EXT_PAYLOAD_1 "\x00\x00\x00\x00\x00\x00"
 #define EXT_PAYLOAD_2 "\x11\x11\x11\x11\x11\x11"
+
+#define EXIT_OVER_COALESCE	42
+
+/* Must match BIG_TCP_GRO_MAX_SIZE in gro_lib.py. */
+#define BIG_TCP_GRO_MAX_SIZE	128000
+
+#define BIG_TCP_RECV_BUF_LEN \
+	(BIG_TCP_GRO_MAX_SIZE + MAX_MSS + L2_HLEN_MAX)
+#define BIG_TCP_MIN_MSS		(ASSUMED_MTU - (MAX_HDR_LEN - ETH_HLEN))
+#define BIG_TCP_MAX_FILL_CNT \
+	((int)((BIG_TCP_GRO_MAX_SIZE - 1 - (MAX_HDR_LEN - ETH_HLEN)) / \
+	       BIG_TCP_MIN_MSS))
 
 #define ipv6_optlen(p)  (((p)->hdrlen+1) << 3) /* calculate IPv6 extension header len */
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
@@ -134,6 +155,7 @@ static int total_hdr_len = -1;
 static int ethhdr_proto = -1;
 static bool ipip;
 static bool ip6ip6;
+static bool pppoe;
 static uint64_t txtime_ns;
 static int num_flows = 4;
 static bool order_check;
@@ -160,6 +182,27 @@ static int num_large_pkt(void)
 	return max_payload() / calc_mss();
 }
 
+/* How many maximum sized segments fit under the configured limit. */
+static int big_tcp_large_cnt(void)
+{
+	return (BIG_TCP_GRO_MAX_SIZE - 1 - (total_hdr_len - ETH_HLEN)) /
+	       calc_mss();
+}
+
+/* How many calc_mss() sized segments are needed to satisfy the
+ * following condition:
+ * pkt_count * calc_mss() < IP_MAXPACKET < (pkt_count + 1) * calc_mss()
+ */
+static int big_tcp_fill_cnt(void)
+{
+	return IP_MAXPACKET / calc_mss();
+}
+
+static int big_tcp_fill_len(void)
+{
+	return big_tcp_fill_cnt() * calc_mss();
+}
+
 static void vlog(const char *fmt, ...)
 {
 	va_list args;
@@ -169,6 +212,22 @@ static void vlog(const char *fmt, ...)
 		vfprintf(stderr, fmt, args);
 		va_end(args);
 	}
+}
+
+static void fill_pppoelayer(void *buf, int payload_len, uint16_t sid)
+{
+	struct pppoe_ppp_hdr {
+		struct pppoe_hdr eh;
+		__be16 proto;
+	} *ph = buf;
+
+	payload_len += sizeof(struct tcphdr);
+	ph->eh.type = 1;
+	ph->eh.ver = 1;
+	ph->eh.code = 0;
+	ph->eh.sid = htons(sid);
+	ph->eh.length = htons(payload_len + sizeof(ph->proto));
+	ph->proto = htons(proto == PF_INET ? PPP_IP : PPP_IPV6);
 }
 
 static void setup_sock_filter(int fd)
@@ -412,11 +471,15 @@ static void create_packet(void *buf, int seq_offset, int ack_offset,
 
 	fill_networklayer(buf + inner_ip_off, payload_len, IPPROTO_TCP);
 	if (inner_ip_off > ETH_HLEN) {
-		int encap_proto = (proto == PF_INET) ?
-				  IPPROTO_IPIP : IPPROTO_IPV6;
+		if (pppoe) {
+			fill_pppoelayer(buf + ETH_HLEN, payload_len + ip_hdr_len, 0x1234);
+		} else {
+			int encap_proto = (proto == PF_INET) ?
+					  IPPROTO_IPIP : IPPROTO_IPV6;
 
-		fill_networklayer(buf + ETH_HLEN,
-				  payload_len + ip_hdr_len, encap_proto);
+			fill_networklayer(buf + ETH_HLEN,
+					  payload_len + ip_hdr_len, encap_proto);
+		}
 	}
 
 	fill_datalinklayer(buf);
@@ -526,12 +589,67 @@ static void send_flags(int fd, struct sockaddr_ll *daddr, int psh, int syn,
 static void send_data_pkts(int fd, struct sockaddr_ll *daddr,
 			   int payload_len1, int payload_len2)
 {
-	static char buf[ETH_HLEN + IP_MAXPACKET];
+	static char buf[L2_HLEN_MAX + IP_MAXPACKET];
 
 	create_packet(buf, 0, 0, payload_len1, 0);
 	write_packet(fd, buf, total_hdr_len + payload_len1, daddr);
 	create_packet(buf, payload_len1, 0, payload_len2, 0);
 	write_packet(fd, buf, total_hdr_len + payload_len2, daddr);
+}
+
+/* Send num_pkt segments of pkt_len bytes, then one of remainder len. */
+static void send_big_tcp(int fd, struct sockaddr_ll *daddr, int pkt_len,
+			 int num_pkt, int remainder)
+{
+	static char pkts[BIG_TCP_MAX_FILL_CNT][MAX_HDR_LEN + MAX_MSS];
+	static char last[MAX_HDR_LEN + MAX_MSS];
+	const int filled = num_pkt * pkt_len;
+	int i;
+
+	if (num_pkt > BIG_TCP_MAX_FILL_CNT)
+		error(1, 0, "need %d packets, array holds %d",
+		      num_pkt, BIG_TCP_MAX_FILL_CNT);
+
+	for (i = 0; i < num_pkt; i++)
+		create_packet(pkts[i], i * pkt_len, 0, pkt_len, 0);
+	create_packet(last, filled, 0, remainder, 0);
+
+	for (i = 0; i < num_pkt; i++)
+		write_packet(fd, pkts[i], total_hdr_len + pkt_len, daddr);
+	write_packet(fd, last, total_hdr_len + remainder, daddr);
+}
+
+/* In BIG TCP configuration, the total aggregate length can
+ * be greater than the legacy IP_MAXPACKET. Since the aggregate
+ * length is used in calculating the sequence numbers,
+ * send a packet with a sequence number that differs by IP_MAXPACKET + 1,
+ * to test against truncation bugs.
+ */
+static void send_big_tcp_bad_seq(int fd, struct sockaddr_ll *daddr)
+{
+	static char pkts[BIG_TCP_MAX_FILL_CNT][MAX_HDR_LEN + MAX_MSS];
+	const int num_pkt = big_tcp_fill_cnt() + 1;
+	static char last[MAX_HDR_LEN + MAX_MSS];
+	const int pkt_len = calc_mss();
+	int bad_seq;
+	int filled;
+	int i;
+
+	filled = num_pkt * pkt_len;
+	/* Low 16 bits match with the correct incoming sequence number. */
+	bad_seq = filled - (IP_MAXPACKET + 1);
+
+	if (num_pkt > BIG_TCP_MAX_FILL_CNT)
+		error(1, 0, "need %d packets, array holds %d",
+		      num_pkt, BIG_TCP_MAX_FILL_CNT);
+
+	for (i = 0; i < num_pkt; i++)
+		create_packet(pkts[i], i * pkt_len, 0, pkt_len, 0);
+	create_packet(last, bad_seq, 0, pkt_len, 0);
+
+	for (i = 0; i < num_pkt; i++)
+		write_packet(fd, pkts[i], total_hdr_len + pkt_len, daddr);
+	write_packet(fd, last, total_hdr_len + pkt_len, daddr);
 }
 
 /* If incoming segments make tracked segment length exceed
@@ -1071,6 +1189,20 @@ static void send_fragment6(int fd, struct sockaddr_ll *daddr)
 	write_packet(fd, buf, bufpkt_len, daddr);
 }
 
+static void send_changed_pppoe_sid(int fd, struct sockaddr_ll *daddr)
+{
+	static char buf[MAX_HDR_LEN + PAYLOAD_LEN];
+	int pkt_size = total_hdr_len + PAYLOAD_LEN;
+	struct pppoe_hdr *hdr = (struct pppoe_hdr *)(buf + ETH_HLEN);
+
+	create_packet(buf, 0, 0, PAYLOAD_LEN, 0);
+	write_packet(fd, buf, pkt_size, daddr);
+
+	create_packet(buf, PAYLOAD_LEN, 0, PAYLOAD_LEN, 0);
+	hdr->sid = htons(0x4321);
+	write_packet(fd, buf, pkt_size, daddr);
+}
+
 static void bind_packetsocket(int fd)
 {
 	struct sockaddr_ll daddr = {};
@@ -1121,11 +1253,14 @@ static void recv_error(int fd, int rcv_errno)
 static void check_recv_pkts(int fd, int *correct_payload,
 			    int correct_num_pkts)
 {
-	static char buffer[IP_MAXPACKET + ETH_HLEN + 1];
-	struct iphdr *iph = (struct iphdr *)(buffer + ETH_HLEN);
-	struct ipv6hdr *ip6h = (struct ipv6hdr *)(buffer + ETH_HLEN);
+	static char buffer[BIG_TCP_RECV_BUF_LEN];
+	int nhoff = ETH_HLEN + (pppoe ? PPPOE_SES_HLEN : 0);
+	struct iphdr *iph = (struct iphdr *)(buffer + nhoff);
+	struct ipv6hdr *ip6h = (struct ipv6hdr *)(buffer + nhoff);
 	struct tcphdr *tcph;
 	bool bad_packet = false;
+	int bytes_expected = 0;
+	int bytes_received = 0;
 	int tcp_ext_len = 0;
 	int ip_ext_len = 0;
 	int pkt_size = -1;
@@ -1134,13 +1269,15 @@ static void check_recv_pkts(int fd, int *correct_payload,
 	int i;
 
 	vlog("Expected {");
-	for (i = 0; i < correct_num_pkts; i++)
+	for (i = 0; i < correct_num_pkts; i++) {
 		vlog("%d ", correct_payload[i]);
+		bytes_expected += correct_payload[i];
+	}
 	vlog("}, Total %d packets\nReceived {", correct_num_pkts);
 
 	while (1) {
 		ip_ext_len = 0;
-		pkt_size = recv(fd, buffer, IP_MAXPACKET + ETH_HLEN + 1, 0);
+		pkt_size = recv(fd, buffer, sizeof(buffer), 0);
 		if (pkt_size < 0)
 			recv_error(fd, errno);
 
@@ -1166,13 +1303,22 @@ static void check_recv_pkts(int fd, int *correct_payload,
 				- sizeof(struct tcphdr) - sizeof(struct iphdr);
 		}
 		vlog("%d ", data_len);
-		if (data_len != correct_payload[num_pkt]) {
+		if (num_pkt < correct_num_pkts &&
+		    data_len != correct_payload[num_pkt]) {
 			vlog("[!=%d]", correct_payload[num_pkt]);
 			bad_packet = true;
 		}
+		bytes_received += data_len;
 		num_pkt++;
 	}
 	vlog("}, Total %d packets.\n", num_pkt);
+	/* Signal over-coalescing explicitly, it's a hard failure, unlike
+	 * under-coalescing which could be timing- or loss-related.
+	 */
+	if (num_pkt < correct_num_pkts && bytes_received == bytes_expected)
+		error(EXIT_OVER_COALESCE, 0,
+		      "over-coalesced: got %d pkts vs expected %d (%d B)",
+		      num_pkt, correct_num_pkts, bytes_received);
 	if (num_pkt != correct_num_pkts)
 		error(1, 0, "incorrect number of packets");
 	if (bad_packet)
@@ -1183,9 +1329,10 @@ static void check_recv_pkts(int fd, int *correct_payload,
 
 static void check_capacity_pkts(int fd)
 {
-	static char buffer[IP_MAXPACKET + ETH_HLEN + 1];
-	struct iphdr *iph = (struct iphdr *)(buffer + ETH_HLEN);
-	struct ipv6hdr *ip6h = (struct ipv6hdr *)(buffer + ETH_HLEN);
+	static char buffer[IP_MAXPACKET + L2_HLEN_MAX + 1];
+	int nhoff = ETH_HLEN + (pppoe ? PPPOE_SES_HLEN : 0);
+	struct iphdr *iph = (struct iphdr *)(buffer + nhoff);
+	struct ipv6hdr *ip6h = (struct ipv6hdr *)(buffer + nhoff);
 	int num_pkt = 0, num_coal = 0, pkt_idx;
 	const char *fail_reason = NULL;
 	int flow_order[num_flows * 2];
@@ -1203,7 +1350,7 @@ static void check_capacity_pkts(int fd)
 
 	while (1) {
 		ip_ext_len = 0;
-		pkt_size = recv(fd, buffer, IP_MAXPACKET + ETH_HLEN + 1, 0);
+		pkt_size = recv(fd, buffer, sizeof(buffer), 0);
 		if (pkt_size < 0)
 			recv_error(fd, errno);
 
@@ -1487,6 +1634,25 @@ static void gro_sender(void)
 		send_large(txfd, &daddr, remainder + 1);
 		write_packet(txfd, fin_pkt, total_hdr_len, &daddr);
 
+	/* big tcp sub-tests */
+	} else if (strcmp(testname, "big_tcp_data_same") == 0) {
+		send_big_tcp(txfd, &daddr, calc_mss(), big_tcp_fill_cnt(),
+			     calc_mss());
+		write_packet(txfd, fin_pkt, total_hdr_len, &daddr);
+	} else if (strcmp(testname, "big_tcp_data_lrg_sml") == 0) {
+		int remainder = calc_mss() / 2;
+
+		send_big_tcp(txfd, &daddr, calc_mss(), big_tcp_fill_cnt(),
+			     remainder);
+		write_packet(txfd, fin_pkt, total_hdr_len, &daddr);
+	} else if (strcmp(testname, "big_tcp_tcp_seq") == 0) {
+		send_big_tcp_bad_seq(txfd, &daddr);
+		write_packet(txfd, fin_pkt, total_hdr_len, &daddr);
+	} else if (strcmp(testname, "big_tcp_large_max") == 0) {
+		send_big_tcp(txfd, &daddr, calc_mss(), big_tcp_large_cnt(),
+			     calc_mss());
+		write_packet(txfd, fin_pkt, total_hdr_len, &daddr);
+
 	/* machinery sub-tests */
 	} else if (strcmp(testname, "single") == 0) {
 		static char buf[MAX_HDR_LEN + PAYLOAD_LEN];
@@ -1496,6 +1662,12 @@ static void gro_sender(void)
 		write_packet(txfd, fin_pkt, total_hdr_len, &daddr);
 	} else if (strcmp(testname, "capacity") == 0) {
 		send_capacity(txfd, &daddr);
+		usleep(fin_delay_us);
+		write_packet(txfd, fin_pkt, total_hdr_len, &daddr);
+
+	/* PPPoE sub-tests */
+	} else if (strcmp(testname, "pppoe_sid") == 0) {
+		send_changed_pppoe_sid(txfd, &daddr);
 		usleep(fin_delay_us);
 		write_packet(txfd, fin_pkt, total_hdr_len, &daddr);
 
@@ -1708,6 +1880,26 @@ static void gro_receiver(void)
 		printf("last segment sent individually: ");
 		check_recv_pkts(rxfd, correct_payload, 3);
 
+	/* big tcp sub-tests */
+	} else if (strcmp(testname, "big_tcp_data_same") == 0) {
+		correct_payload[0] = big_tcp_fill_len() + calc_mss();
+		printf("data packets of same size past IP_MAXPACKET: ");
+		check_recv_pkts(rxfd, correct_payload, 1);
+	} else if (strcmp(testname, "big_tcp_data_lrg_sml") == 0) {
+		correct_payload[0] = big_tcp_fill_len() + calc_mss() / 2;
+		printf("smaller last packet past IP_MAXPACKET: ");
+		check_recv_pkts(rxfd, correct_payload, 1);
+	} else if (strcmp(testname, "big_tcp_tcp_seq") == 0) {
+		correct_payload[0] = (big_tcp_fill_cnt() + 1) * calc_mss();
+		correct_payload[1] = calc_mss();
+		printf("aliased seq past IP_MAXPACKET doesn't coalesce: ");
+		check_recv_pkts(rxfd, correct_payload, 2);
+	} else if (strcmp(testname, "big_tcp_large_max") == 0) {
+		correct_payload[0] = big_tcp_large_cnt() * calc_mss();
+		correct_payload[1] = calc_mss();
+		printf("shouldn't coalesce past gro_max_size: ");
+		check_recv_pkts(rxfd, correct_payload, 2);
+
 	/* machinery sub-tests */
 	} else if (strcmp(testname, "single") == 0) {
 		printf("single data packet: ");
@@ -1715,6 +1907,12 @@ static void gro_receiver(void)
 		check_recv_pkts(rxfd, correct_payload, 1);
 	} else if (strcmp(testname, "capacity") == 0) {
 		check_capacity_pkts(rxfd);
+
+	} else if (strcmp(testname, "pppoe_sid") == 0) {
+		correct_payload[0] = PAYLOAD_LEN;
+		correct_payload[1] = PAYLOAD_LEN;
+		printf("different PPPoE session ID doesn't coalesce: ");
+		check_recv_pkts(rxfd, correct_payload, 2);
 
 	} else {
 		error(1, 0, "Test case error: unknown testname %s", testname);
@@ -1734,6 +1932,8 @@ static void parse_args(int argc, char **argv)
 		{ "ipv6", no_argument, NULL, '6' },
 		{ "ipip", no_argument, NULL, 'e' },
 		{ "ip6ip6", no_argument, NULL, 'E' },
+		{ "pppoev4", no_argument, NULL, 'p' },
+		{ "pppoev6", no_argument, NULL, 'P' },
 		{ "num-flows", required_argument, NULL, 'n' },
 		{ "rx", no_argument, NULL, 'r' },
 		{ "saddr", required_argument, NULL, 's' },
@@ -1745,7 +1945,7 @@ static void parse_args(int argc, char **argv)
 	};
 	int c;
 
-	while ((c = getopt_long(argc, argv, "46d:D:eEi:n:rs:S:t:ov", opts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "46d:D:eEi:n:pPrs:S:t:ov", opts, NULL)) != -1) {
 		switch (c) {
 		case '4':
 			proto = PF_INET;
@@ -1764,6 +1964,16 @@ static void parse_args(int argc, char **argv)
 			ip6ip6 = true;
 			proto = PF_INET6;
 			ethhdr_proto = htons(ETH_P_IPV6);
+			break;
+		case 'p':
+			pppoe = true;
+			proto = PF_INET;
+			ethhdr_proto = htons(ETH_P_PPP_SES);
+			break;
+		case 'P':
+			pppoe = true;
+			proto = PF_INET6;
+			ethhdr_proto = htons(ETH_P_PPP_SES);
 			break;
 		case 'd':
 			addr4_dst = addr6_dst = optarg;
@@ -1811,6 +2021,10 @@ int main(int argc, char **argv)
 		total_hdr_len = tcp_offset + sizeof(struct tcphdr);
 	} else if (ip6ip6) {
 		tcp_offset = ETH_HLEN + sizeof(struct ipv6hdr) * 2;
+		total_hdr_len = tcp_offset + sizeof(struct tcphdr);
+	} else if (pppoe) {
+		tcp_offset = ETH_HLEN + PPPOE_SES_HLEN +
+			(proto == PF_INET ? sizeof(struct iphdr) : sizeof(struct ipv6hdr));
 		total_hdr_len = tcp_offset + sizeof(struct tcphdr);
 	} else if (proto == PF_INET) {
 		tcp_offset = ETH_HLEN + sizeof(struct iphdr);

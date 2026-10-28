@@ -32,6 +32,19 @@
  * *handle* a wide range or all access rights that they know about at build time
  * (and that they have tested with a kernel that supported them all).
  *
+ * @quiet_access_fs and @quiet_access_net are bitmasks of actions for which a
+ * denial by this layer will not trigger an audit record if the corresponding
+ * object (or its children, for filesystem rules) is marked with the "quiet" bit
+ * via %LANDLOCK_ADD_RULE_QUIET, even if logging would normally take place per
+ * landlock_restrict_self() flags.  @quiet_scoped is similar, except that it
+ * does not require marking any objects as quiet - if the ruleset is created
+ * with any bits set in @quiet_scoped, then denial of such scoped resources will
+ * not trigger an audit record.  These three fields are available since Landlock
+ * ABI version 10.
+ *
+ * @quiet_access_fs, @quiet_access_net and @quiet_scoped must be a subset of
+ * @handled_access_fs, @handled_access_net and @scoped respectively.
+ *
  * This structure can grow in future Landlock versions.
  */
 struct landlock_ruleset_attr {
@@ -51,6 +64,26 @@ struct landlock_ruleset_attr {
 	 * resources (e.g. IPCs).
 	 */
 	__u64 scoped;
+	/**
+	 * @quiet_access_fs: Bitmask of filesystem actions which should not be
+	 * submitted to audit if the per-object quiet flag is set.
+	 */
+	__u64 quiet_access_fs;
+	/**
+	 * @quiet_access_net: Bitmask of network actions which should not be
+	 * submitted to audit if the per-object quiet flag is set.
+	 */
+	__u64 quiet_access_net;
+	/**
+	 * @quiet_scoped: Bitmask of scoped actions which should not be
+	 * submitted to audit.
+	 */
+	__u64 quiet_scoped;
+	/**
+	 * @handled_permissions: Bitmask of handled permissions (cf. `Permission
+	 * flags`_).
+	 */
+	__u64 handled_permissions;
 };
 
 /**
@@ -67,6 +100,39 @@ struct landlock_ruleset_attr {
 /* clang-format off */
 #define LANDLOCK_CREATE_RULESET_VERSION			(1U << 0)
 #define LANDLOCK_CREATE_RULESET_ERRATA			(1U << 1)
+/* clang-format on */
+
+/**
+ * DOC: landlock_add_rule_flags
+ *
+ * **Flags**
+ *
+ * %LANDLOCK_ADD_RULE_QUIET
+ *     Together with the quiet_* fields in struct landlock_ruleset_attr,
+ *     this flag controls whether Landlock will log audit messages when
+ *     access to the objects covered by this rule is denied by this layer.
+ *
+ *     If logging is enabled, when Landlock denies an access, it will
+ *     suppress the log if all of the following are true:
+ *
+ *     - this layer is the innermost layer that denied the access;
+ *     - all accesses denied by this layer are part of the quiet_* fields
+ *       in the related struct landlock_ruleset_attr;
+ *     - the object (or one of its parents, for filesystem rules) is
+ *       marked as "quiet" via %LANDLOCK_ADD_RULE_QUIET.
+ *
+ *     Because logging is only suppressed by a layer if the layer denies
+ *     access, a sandboxed program cannot use this flag to "hide" access
+ *     denials, without denying itself the access in the first place.
+ *
+ *     The effect of this flag does not depend on the value of
+ *     allowed_access in the passed in rule_attr.  When this flag is
+ *     present, the caller is also allowed to pass in an empty
+ *     allowed_access.
+ */
+
+/* clang-format off */
+#define LANDLOCK_ADD_RULE_QUIET			(1U << 0)
 /* clang-format on */
 
 /**
@@ -131,12 +197,25 @@ struct landlock_ruleset_attr {
  *
  *     If the calling thread is running with no_new_privs, this operation
  *     enables no_new_privs on the sibling threads as well.
+ *
+ * The following flag ties the no_new_privs attribute to the ruleset
+ * enforcement:
+ *
+ * %LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS
+ *     Sets the no_new_privs attribute of the calling thread only once the
+ *     enforcement of the ruleset succeeded: no_new_privs is set if and only
+ *     if sys_landlock_restrict_self() succeeds.  This removes the need for a
+ *     prior :manpage:`prctl(2)` ``PR_SET_NO_NEW_PRIVS`` call (or
+ *     %CAP_SYS_ADMIN use).  This flag requires a ruleset.  When
+ *     combined with %LANDLOCK_RESTRICT_SELF_TSYNC, no_new_privs is set on the
+ *     sibling threads as well.
  */
 /* clang-format off */
 #define LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF		(1U << 0)
 #define LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON			(1U << 1)
 #define LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF		(1U << 2)
 #define LANDLOCK_RESTRICT_SELF_TSYNC				(1U << 3)
+#define LANDLOCK_RESTRICT_SELF_NO_NEW_PRIVS			(1U << 4)
 /* clang-format on */
 
 /**
@@ -155,6 +234,15 @@ enum landlock_rule_type {
 	 * landlock_net_port_attr .
 	 */
 	LANDLOCK_RULE_NET_PORT,
+	/**
+	 * @LANDLOCK_RULE_NAMESPACE: Type of a &struct landlock_namespace_attr .
+	 */
+	LANDLOCK_RULE_NAMESPACE,
+	/**
+	 * @LANDLOCK_RULE_CAPABILITY: Type of a &struct
+	 * landlock_capability_attr .
+	 */
+	LANDLOCK_RULE_CAPABILITY,
 };
 
 /**
@@ -200,12 +288,83 @@ struct landlock_net_port_attr {
 	 * (also used for IPv6), and within that range, on a per-socket basis
 	 * with ``setsockopt(IP_LOCAL_PORT_RANGE)``.
 	 *
-	 * A Landlock rule with port 0 and the %LANDLOCK_ACCESS_NET_BIND_TCP
-	 * right means that requesting to bind on port 0 is allowed and it will
-	 * automatically translate to binding on a kernel-assigned ephemeral
-	 * port.
+	 * A Landlock rule with port 0 and the %LANDLOCK_ACCESS_NET_BIND_TCP or
+	 * %LANDLOCK_ACCESS_NET_BIND_UDP right means that requesting to bind on
+	 * port 0 is allowed and it will automatically translate to binding on a
+	 * kernel-assigned ephemeral port.
 	 */
 	__u64 port;
+};
+
+/**
+ * struct landlock_namespace_attr - Namespace type definition
+ *
+ * Argument of sys_landlock_add_rule() with %LANDLOCK_RULE_NAMESPACE.
+ */
+struct landlock_namespace_attr {
+	/**
+	 * @permissions: Must be set to %LANDLOCK_PERMISSION_NAMESPACE_USE.
+	 */
+	__u64 permissions;
+	/**
+	 * @allowed_namespace_types: Bitmask of namespace types (``CLONE_NEW*``
+	 * flags) to allow under this rule.  Unknown bits are silently ignored
+	 * for forward compatibility.
+	 */
+	__u64 allowed_namespace_types;
+	/**
+	 * @quiet_namespace_types: Bitmask of namespace types (``CLONE_NEW*``
+	 * flags) whose denial by this layer should not be submitted to audit,
+	 * even when landlock_restrict_self() enables audit logging.  Only audit
+	 * records attributed to this layer are suppressed; denial tracepoints
+	 * still fire (see `Permission flags`_).  Bits also set in
+	 * @allowed_namespace_types have no effect, since an allowed type is
+	 * never denied.  Unknown bits are silently ignored.
+	 *
+	 * At least one of @allowed_namespace_types or @quiet_namespace_types
+	 * must be non-zero, otherwise the call returns ``-ENOMSG``.  The
+	 * non-zero check runs on the raw input before unknown-bit masking, so a
+	 * rule that sets only bits unknown to the running kernel succeeds but
+	 * has no runtime effect.  Programs should omit this rule when they
+	 * neither allow nor quiet a namespace type.
+	 */
+	__u64 quiet_namespace_types;
+};
+
+/**
+ * struct landlock_capability_attr - Capability definition
+ *
+ * Argument of sys_landlock_add_rule() with %LANDLOCK_RULE_CAPABILITY.
+ */
+struct landlock_capability_attr {
+	/**
+	 * @permissions: Must be set to %LANDLOCK_PERMISSION_CAPABILITY_USE.
+	 */
+	__u64 permissions;
+	/**
+	 * @allowed_capabilities: Bitmask of capabilities (``1ULL << CAP_*``) to
+	 * allow under this rule.  Bits above ``CAP_LAST_CAP`` are silently
+	 * ignored for forward compatibility.
+	 */
+	__u64 allowed_capabilities;
+	/**
+	 * @quiet_capabilities: Bitmask of capabilities (``1ULL << CAP_*``)
+	 * whose denial by this layer should not be submitted to audit, even if
+	 * audit logging would normally take place per landlock_restrict_self()
+	 * flags.  Only audit records attributed to this layer are suppressed;
+	 * denial tracepoints still fire (see `Permission flags`_).  Bits also
+	 * set in @allowed_capabilities have no effect, since an allowed
+	 * capability is never denied.  Bits above ``CAP_LAST_CAP`` are silently
+	 * ignored.
+	 *
+	 * At least one of @allowed_capabilities or @quiet_capabilities must be
+	 * non-zero, otherwise the call returns ``-ENOMSG``.  The non-zero check
+	 * runs on the raw input before unknown-bit masking, so a rule that sets
+	 * only bits unknown to the running kernel (above ``CAP_LAST_CAP``)
+	 * succeeds but has no runtime effect.  Programs should omit this rule
+	 * when they neither allow nor quiet a capability.
+	 */
+	__u64 quiet_capabilities;
 };
 
 /**
@@ -255,16 +414,16 @@ struct landlock_net_port_attr {
  *   :manpage:`connect(2)` as well as calls to :manpage:`sendmsg(2)` with an
  *   explicit recipient address.
  *
- *   This access right only applies to connections to UNIX server sockets which
+ *   This access right applies only to connections to UNIX server sockets which
  *   were created outside of the newly created Landlock domain (e.g. from within
  *   a parent domain or from an unrestricted process).  Newly created UNIX
  *   servers within the same Landlock domain continue to be accessible.  In this
  *   regard, %LANDLOCK_ACCESS_FS_RESOLVE_UNIX has the same semantics as the
  *   ``LANDLOCK_SCOPE_*`` flags.
  *
- *   If a resolve attempt is denied, the operation returns an ``EACCES`` error,
- *   in line with other filesystem access rights (but different to denials for
- *   abstract UNIX domain sockets).
+ *   If a resolution attempt is denied, the operation returns an ``EACCES``
+ *   error, in line with other filesystem access rights (but different to
+ *   denials for abstract UNIX domain sockets).
  *
  *   This access right is available since the ninth version of the Landlock ABI.
  *
@@ -291,6 +450,7 @@ struct landlock_net_port_attr {
  *   device.
  * - %LANDLOCK_ACCESS_FS_MAKE_DIR: Create (or rename) a directory.
  * - %LANDLOCK_ACCESS_FS_MAKE_REG: Create (or rename or link) a regular file.
+ *   This also guards the creation of whiteout objects as used in OverlayFS.
  * - %LANDLOCK_ACCESS_FS_MAKE_SOCK: Create (or rename or link) a UNIX domain
  *   socket.
  * - %LANDLOCK_ACCESS_FS_MAKE_FIFO: Create (or rename or link) a named pipe.
@@ -373,10 +533,39 @@ struct landlock_net_port_attr {
  *   port. Support added in Landlock ABI version 4.
  * - %LANDLOCK_ACCESS_NET_CONNECT_TCP: Connect TCP sockets to the given
  *   remote port. Support added in Landlock ABI version 4.
+ *
+ * And similarly for UDP port numbers:
+ *
+ * - %LANDLOCK_ACCESS_NET_BIND_UDP: Bind UDP sockets to the given local
+ *   port. Support added in Landlock ABI version 10.
+ * - %LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP: Set the remote port of UDP
+ *   sockets to the given port, or send datagrams to the given remote port
+ *   ignoring any destination pre-set on a socket. Support added in
+ *   Landlock ABI version 10.
+ *
+ * .. note:: Setting a remote address or sending a first datagram
+ *   auto-binds UDP sockets to an ephemeral local source port if not
+ *   already bound. To allow this if both %LANDLOCK_ACCESS_NET_BIND_UDP
+ *   and %LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP are handled, you need to
+ *   either:
+ *
+ *   - use a socket already bound to a port before the ruleset started
+ *     being enforced;
+ *   - or grant %LANDLOCK_ACCESS_NET_BIND_UDP on port 0, meaning "any
+ *     port in the ephemeral port range";
+ *   - or grant %LANDLOCK_ACCESS_NET_BIND_UDP on a specific port, and
+ *     call :manpage:`bind(2)` on that port before trying to
+ *     :manpage:`connect(2)` or send datagrams.
+ *
+ * .. note:: Sending datagrams to an ``AF_UNSPEC`` destination address
+ *   family is not supported for IPv6 UDP sockets: you will need to use a
+ *   ``NULL`` address instead.
  */
 /* clang-format off */
 #define LANDLOCK_ACCESS_NET_BIND_TCP			(1ULL << 0)
 #define LANDLOCK_ACCESS_NET_CONNECT_TCP			(1ULL << 1)
+#define LANDLOCK_ACCESS_NET_BIND_UDP			(1ULL << 2)
+#define LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP		(1ULL << 3)
 /* clang-format on */
 
 /**
@@ -403,5 +592,42 @@ struct landlock_net_port_attr {
 #define LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET		(1ULL << 0)
 #define LANDLOCK_SCOPE_SIGNAL		                (1ULL << 1)
 /* clang-format on*/
+
+/**
+ * DOC: permission
+ *
+ * Permission flags
+ * ~~~~~~~~~~~~~~~~
+ *
+ * These flags restrict the use of members of a category, each member being
+ * identified by a constant from another kernel subsystem (e.g. CLONE_NEW*
+ * namespace types, CAP_* capabilities).  A flag covers every kernel path that
+ * uses a member of its category, and members that no rule explicitly allows are
+ * denied.  Values unknown to the running kernel are silently accepted for
+ * forward compatibility and stay denied by default.  See
+ * Documentation/security/landlock.rst for design details.
+ *
+ * When a ruleset handles multiple permissions whose operations overlap (e.g. a
+ * non-user namespace needs both its namespace type and CAP_SYS_ADMIN), the
+ * operation is allowed only if each handled permission independently allows it.
+ * See Documentation/userspace-api/landlock.rst.
+ *
+ * - %LANDLOCK_PERMISSION_NAMESPACE_USE: Restrict the use of specific namespace
+ *   types: creation (:manpage:`unshare(2)`, :manpage:`clone(2)`,
+ *   :manpage:`clone3(2)`), joining (:manpage:`setns(2)`), and acquiring an fd
+ *   reference (:manpage:`open_tree(2)`, :manpage:`fsmount(2)`).  A process in a
+ *   Landlock domain that handles this permission is denied from using namespace
+ *   types that are not explicitly allowed by a %LANDLOCK_RULE_NAMESPACE rule.
+ *   Support added in Landlock ABI version 12.
+ * - %LANDLOCK_PERMISSION_CAPABILITY_USE: Restrict the use of specific Linux
+ *   capabilities.  A process in a Landlock domain that handles this permission
+ *   is denied from exercising capabilities that are not explicitly allowed by a
+ *   %LANDLOCK_RULE_CAPABILITY rule.  This hook is purely restrictive: it can
+ *   deny capabilities that the kernel would otherwise grant, but it can never
+ *   grant capabilities that the kernel already denied.  Support added in
+ *   Landlock ABI version 12.
+ */
+#define LANDLOCK_PERMISSION_NAMESPACE_USE			(1ULL << 0)
+#define LANDLOCK_PERMISSION_CAPABILITY_USE			(1ULL << 1)
 
 #endif /* _UAPI_LINUX_LANDLOCK_H */

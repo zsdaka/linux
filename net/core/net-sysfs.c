@@ -37,12 +37,6 @@ static const char fmt_uint[] = "%u\n";
 static const char fmt_ulong[] = "%lu\n";
 static const char fmt_u64[] = "%llu\n";
 
-/* Caller holds RTNL, netdev->lock or RCU */
-static inline int dev_isalive(const struct net_device *dev)
-{
-	return READ_ONCE(dev->reg_state) <= NETREG_REGISTERED;
-}
-
 /* There is a possible ABBA deadlock between rtnl_lock and kernfs_node->active,
  * when unregistering a net device and accessing associated sysfs files. The
  * potential deadlock is as follow:
@@ -106,7 +100,7 @@ static int sysfs_rtnl_lock(struct kobject *kobj, struct attribute *attr,
 	/* Check dismantle on the device hasn't started, otherwise deny the
 	 * operation.
 	 */
-	if (!dev_isalive(ndev)) {
+	if (!netif_is_alive(ndev)) {
 		rtnl_unlock();
 		ret = -ENODEV;
 		goto unbreak;
@@ -124,6 +118,49 @@ unbreak:
 	return ret;
 }
 
+static int sysfs_get_link_ksettings(struct device *dev,
+				    struct device_attribute *attr,
+				    struct ethtool_link_ksettings *cmd)
+{
+	struct net_device *netdev = to_net_dev(dev);
+	bool need_rtnl;
+	int ret;
+
+	/*
+	 * The check is also done in netif_get_link_ksettings; this helps
+	 * returning early without hitting the locking section below.
+	 */
+	if (!netdev->ethtool_ops->get_link_ksettings)
+		return -EINVAL;
+
+	need_rtnl = !netdev_need_ops_lock(netdev) ||
+		    (netdev->ethtool_ops->op_needs_rtnl &
+		     ETHTOOL_OP_NEEDS_RTNL_LINKSETTINGS);
+	if (need_rtnl) {
+		ret = sysfs_rtnl_lock(&dev->kobj, &attr->attr, netdev);
+		if (ret)
+			return ret;
+	}
+	netdev_lock_ops(netdev);
+
+	if (!netif_is_alive(netdev)) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+
+	ret = -EINVAL;
+	if (netif_running(netdev)) {
+		if (!netif_get_link_ksettings(netdev, cmd))
+			ret = 0;
+	}
+
+unlock:
+	netdev_unlock_ops(netdev);
+	if (need_rtnl)
+		rtnl_unlock();
+	return ret;
+}
+
 /* use same locking rules as GIF* ioctl's */
 static ssize_t netdev_show(const struct device *dev,
 			   struct device_attribute *attr, char *buf,
@@ -133,7 +170,7 @@ static ssize_t netdev_show(const struct device *dev,
 	ssize_t ret = -EINVAL;
 
 	rcu_read_lock();
-	if (dev_isalive(ndev))
+	if (netif_is_alive(ndev))
 		ret = (*format)(ndev, buf);
 	rcu_read_unlock();
 
@@ -210,7 +247,7 @@ netdev_lock_store(struct device *dev, struct device_attribute *attr,
 
 	netdev_lock(netdev);
 
-	if (dev_isalive(netdev)) {
+	if (netif_is_alive(netdev)) {
 		ret = (*set)(netdev, new);
 		if (ret == 0)
 			ret = len;
@@ -266,7 +303,7 @@ static ssize_t address_show(struct device *dev, struct device_attribute *attr,
 	down_read(&dev_addr_sem);
 
 	rcu_read_lock();
-	if (dev_isalive(ndev))
+	if (netif_is_alive(ndev))
 		ret = sysfs_format_mac(buf, ndev->dev_addr, ndev->addr_len);
 	rcu_read_unlock();
 
@@ -282,7 +319,7 @@ static ssize_t broadcast_show(struct device *dev,
 	int ret = -EINVAL;
 
 	rcu_read_lock();
-	if (dev_isalive(ndev))
+	if (netif_is_alive(ndev))
 		ret = sysfs_format_mac(buf, ndev->broadcast, ndev->addr_len);
 	rcu_read_unlock();
 	return ret;
@@ -338,70 +375,41 @@ static DEVICE_ATTR_RW(carrier);
 static ssize_t speed_show(struct device *dev,
 			  struct device_attribute *attr, char *buf)
 {
-	struct net_device *netdev = to_net_dev(dev);
-	int ret = -EINVAL;
+	struct ethtool_link_ksettings cmd;
+	int ret;
 
-	/* The check is also done in __ethtool_get_link_ksettings; this helps
-	 * returning early without hitting the locking section below.
-	 */
-	if (!netdev->ethtool_ops->get_link_ksettings)
-		return ret;
-
-	ret = sysfs_rtnl_lock(&dev->kobj, &attr->attr, netdev);
+	ret = sysfs_get_link_ksettings(dev, attr, &cmd);
 	if (ret)
 		return ret;
 
-	ret = -EINVAL;
-	if (netif_running(netdev)) {
-		struct ethtool_link_ksettings cmd;
-
-		if (!__ethtool_get_link_ksettings(netdev, &cmd))
-			ret = sysfs_emit(buf, fmt_dec, cmd.base.speed);
-	}
-	rtnl_unlock();
-	return ret;
+	return sysfs_emit(buf, fmt_dec, cmd.base.speed);
 }
 static DEVICE_ATTR_RO(speed);
 
 static ssize_t duplex_show(struct device *dev,
 			   struct device_attribute *attr, char *buf)
 {
-	struct net_device *netdev = to_net_dev(dev);
-	int ret = -EINVAL;
+	struct ethtool_link_ksettings cmd;
+	const char *duplex;
+	int ret;
 
-	/* The check is also done in __ethtool_get_link_ksettings; this helps
-	 * returning early without hitting the locking section below.
-	 */
-	if (!netdev->ethtool_ops->get_link_ksettings)
-		return ret;
-
-	ret = sysfs_rtnl_lock(&dev->kobj, &attr->attr, netdev);
+	ret = sysfs_get_link_ksettings(dev, attr, &cmd);
 	if (ret)
 		return ret;
 
-	ret = -EINVAL;
-	if (netif_running(netdev)) {
-		struct ethtool_link_ksettings cmd;
-
-		if (!__ethtool_get_link_ksettings(netdev, &cmd)) {
-			const char *duplex;
-
-			switch (cmd.base.duplex) {
-			case DUPLEX_HALF:
-				duplex = "half";
-				break;
-			case DUPLEX_FULL:
-				duplex = "full";
-				break;
-			default:
-				duplex = "unknown";
-				break;
-			}
-			ret = sysfs_emit(buf, "%s\n", duplex);
-		}
+	switch (cmd.base.duplex) {
+	case DUPLEX_HALF:
+		duplex = "half";
+		break;
+	case DUPLEX_FULL:
+		duplex = "full";
+		break;
+	default:
+		duplex = "unknown";
+		break;
 	}
-	rtnl_unlock();
-	return ret;
+
+	return sysfs_emit(buf, "%s\n", duplex);
 }
 static DEVICE_ATTR_RO(duplex);
 
@@ -739,7 +747,7 @@ static ssize_t threaded_show(struct device *dev,
 
 	rcu_read_lock();
 
-	if (dev_isalive(netdev))
+	if (netif_is_alive(netdev))
 		ret = sysfs_emit(buf, fmt_dec, READ_ONCE(netdev->threaded));
 
 	rcu_read_unlock();
@@ -749,6 +757,7 @@ static ssize_t threaded_show(struct device *dev,
 
 static int modify_napi_threaded(struct net_device *dev, unsigned long val)
 {
+	struct napi_struct *napi;
 	int ret;
 
 	if (list_empty(&dev->napi_list))
@@ -756,6 +765,13 @@ static int modify_napi_threaded(struct net_device *dev, unsigned long val)
 
 	if (val != 0 && val != 1)
 		return -EOPNOTSUPP;
+
+	if (val) {
+		list_for_each_entry(napi, &dev->napi_list, dev_list) {
+			if (test_bit(NAPI_STATE_PERCPU, &napi->state))
+				return -EOPNOTSUPP;
+		}
+	}
 
 	ret = netif_set_threaded(dev, val);
 
@@ -816,7 +832,7 @@ static ssize_t netstat_show(const struct device *d,
 		offset % sizeof(u64) != 0);
 
 	rcu_read_lock();
-	if (dev_isalive(dev)) {
+	if (netif_is_alive(dev)) {
 		struct rtnl_link_stats64 temp;
 		const struct rtnl_link_stats64 *stats = dev_get_stats(dev, &temp);
 
@@ -1162,8 +1178,11 @@ static void rx_queue_release(struct kobject *kobj)
 		kvfree_rcu_mightsleep(rps_tag_to_table(tag_ptr));
 #endif
 
+	netdev_tracker_free(queue->dev, &queue->dev_tracker);
+	/* Pairs with the smp_mb() in rx_queue_add_kobject(). */
+	smp_mb();
 	memset(kobj, 0, sizeof(*kobj));
-	netdev_put(queue->dev, &queue->dev_tracker);
+	__dev_put(queue->dev);
 }
 
 static const struct ns_common *rx_queue_namespace(const struct kobject *kobj)
@@ -1235,6 +1254,9 @@ static int rx_queue_add_kobject(struct net_device *dev, int index)
 		netdev_warn_once(dev, "Cannot re-add rx queues before their removal completed");
 		return -EAGAIN;
 	}
+
+	/* Pairs with the smp_mb() in rx_queue_release(). */
+	smp_mb();
 
 	/* Kobject_put later will trigger rx_queue_release call which
 	 * decreases dev refcount: Take that reference here
@@ -1438,7 +1460,7 @@ static ssize_t traffic_class_show(struct kobject *kobj, struct attribute *attr,
 	/* If queue belongs to subordinate dev use its TC mapping */
 	dev = netdev_get_tx_queue(dev, index)->sb_dev ? : dev;
 
-	num_tc = dev->num_tc;
+	num_tc = READ_ONCE(dev->num_tc);
 	tc = netdev_txq_to_tc(dev, index);
 
 	rtnl_unlock();
@@ -1912,8 +1934,11 @@ static void netdev_queue_release(struct kobject *kobj)
 {
 	struct netdev_queue *queue = to_netdev_queue(kobj);
 
+	netdev_tracker_free(queue->dev, &queue->dev_tracker);
+	/* Pairs with the smp_mb() in netdev_queue_add_kobject(). */
+	smp_mb();
 	memset(kobj, 0, sizeof(*kobj));
-	netdev_put(queue->dev, &queue->dev_tracker);
+	__dev_put(queue->dev);
 }
 
 static const struct ns_common *netdev_queue_namespace(const struct kobject *kobj)
@@ -1972,6 +1997,9 @@ static int netdev_queue_add_kobject(struct net_device *dev, int index)
 		netdev_warn_once(dev, "Cannot re-add tx queues before their removal completed");
 		return -EAGAIN;
 	}
+
+	/* Pairs with the smp_mb() in netdev_queue_release(). */
+	smp_mb();
 
 	/* Kobject_put later will trigger netdev_queue_release call
 	 * which decreases dev refcount: Take that reference here
@@ -2340,6 +2368,9 @@ int netdev_register_kobject(struct net_device *ndev)
 		*groups++ = &wireless_group;
 #endif /* CONFIG_SYSFS */
 
+	/* Hold back the KOBJ_ADD uevent until the device is listed. */
+	dev_set_uevent_suppress(dev, 1);
+
 	error = device_add(dev);
 	if (error)
 		return error;
@@ -2353,6 +2384,17 @@ int netdev_register_kobject(struct net_device *ndev)
 	pm_runtime_set_memalloc_noio(dev, true);
 
 	return error;
+}
+
+/* Announce a fully registered device to userspace. This pairs with the uevent
+ * suppression from netdev_register_kobject().
+ */
+void netdev_uevent_add(struct net_device *ndev)
+{
+	struct device *dev = &ndev->dev;
+
+	dev_set_uevent_suppress(dev, 0);
+	kobject_uevent(&dev->kobj, KOBJ_ADD);
 }
 
 /* Change owner for sysfs entries when moving network devices across network

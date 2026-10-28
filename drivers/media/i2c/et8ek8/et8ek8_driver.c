@@ -1013,6 +1013,7 @@ static int et8ek8_get_pad_format(struct v4l2_subdev *subdev,
 }
 
 static int et8ek8_set_pad_format(struct v4l2_subdev *subdev,
+				 const struct v4l2_subdev_client_info *ci,
 				 struct v4l2_subdev_state *sd_state,
 				 struct v4l2_subdev_format *fmt)
 {
@@ -1485,7 +1486,7 @@ static const struct of_device_id et8ek8_of_table[] = {
 MODULE_DEVICE_TABLE(of, et8ek8_of_table);
 
 static const struct i2c_device_id et8ek8_id_table[] = {
-	{ ET8EK8_NAME },
+	{ .name = ET8EK8_NAME },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, et8ek8_id_table);

@@ -15,17 +15,15 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/io.h>
 #include <linux/lockdep.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
-#include <linux/notifier.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
-#include <linux/workqueue.h>
 
 #include <asm/byteorder.h>
 
@@ -34,21 +32,10 @@
 
 #include "8250_dwlib.h"
 
-/* Offsets for the DesignWare specific registers */
-#define DW_UART_USR	0x1f /* UART Status Register */
-#define DW_UART_DMASA	0xa8 /* DMA Software Ack */
-
 #define OCTEON_UART_USR	0x27 /* UART Status Register */
 
 #define RZN1_UART_TDMACR 0x10c /* DMA Control Register Transmit Mode */
 #define RZN1_UART_RDMACR 0x110 /* DMA Control Register Receive Mode */
-
-/* DesignWare specific register fields */
-#define DW_UART_IIR_IID			GENMASK(3, 0)
-
-#define DW_UART_MCR_SIRE		BIT(6)
-
-#define DW_UART_USR_BUSY		BIT(0)
 
 /* Renesas specific register fields */
 #define RZN1_UART_xDMACR_DMA_EN		BIT(0)
@@ -65,6 +52,7 @@
 #define DW_UART_QUIRK_APMC0D08		BIT(4)
 #define DW_UART_QUIRK_CPR_VALUE		BIT(5)
 #define DW_UART_QUIRK_IER_KICK		BIT(6)
+#define DW_UART_QUIRK_SKIP_EMPTY_FIFO_READ	BIT(7)
 
 /*
  * Number of consecutive IIR_NO_INT interrupts required to trigger interrupt
@@ -86,8 +74,6 @@ struct dw8250_data {
 	u32			msr_mask_off;
 	struct clk		*clk;
 	struct clk		*pclk;
-	struct notifier_block	clk_notifier;
-	struct work_struct	clk_work;
 	struct reset_control	*rst;
 
 	unsigned int		skip_autocfg:1;
@@ -100,16 +86,6 @@ struct dw8250_data {
 static inline struct dw8250_data *to_dw8250_data(struct dw8250_port_data *data)
 {
 	return container_of(data, struct dw8250_data, data);
-}
-
-static inline struct dw8250_data *clk_to_dw8250_data(struct notifier_block *nb)
-{
-	return container_of(nb, struct dw8250_data, clk_notifier);
-}
-
-static inline struct dw8250_data *work_to_dw8250_data(struct work_struct *work)
-{
-	return container_of(work, struct dw8250_data, clk_work);
 }
 
 static inline u32 dw8250_modify_msr(struct uart_port *p, unsigned int offset, u32 value)
@@ -182,7 +158,7 @@ static int dw8250_idle_enter(struct uart_port *p)
 	 *
 	 * FIXME: frame_time delay is too long with very low baudrates.
 	 */
-	serial8250_fifo_wait_for_lsr_thre(up, p->fifosize);
+	serial8250_fifo_wait_for_lsr_thre(up, NULL, p->fifosize);
 	ndelay(p->frame_time);
 
 	serial_port_out(p, UART_MCR, up->mcr | UART_MCR_LOOP);
@@ -462,11 +438,18 @@ static int dw8250_handle_irq(struct uart_port *p)
 	 * This problem has only been observed so far when not in DMA mode
 	 * so we limit the workaround only to non-DMA mode.
 	 */
-	if (!up->dma && rx_timeout) {
+	if (!(quirks & DW_UART_QUIRK_SKIP_EMPTY_FIFO_READ) && !up->dma && rx_timeout) {
 		status = serial_lsr_in(up);
 
+		/*
+		 * Do the bogus read from Shadow RBR (SRBR) if provided.
+		 * Both RBR and SRBR are supported ways to workaround
+		 * this problem. But read RBR can cause hardware error
+		 * (PSLVERR) if hardware choose to implement in this way
+		 * (implement REG_TIMEOUT_WIDTH to 0), whereas SRBR won't.
+		 */
 		if (!(status & (UART_LSR_DR | UART_LSR_BI)))
-			serial_port_in(p, UART_RX);
+			serial_port_in(p, d->data.srbr);
 	}
 
 	/* Manually stop the Rx DMA transfer when acting as flow controller */
@@ -482,46 +465,6 @@ static int dw8250_handle_irq(struct uart_port *p)
 	serial8250_handle_irq_locked(p, iir);
 
 	return 1;
-}
-
-static void dw8250_clk_work_cb(struct work_struct *work)
-{
-	struct dw8250_data *d = work_to_dw8250_data(work);
-	struct uart_8250_port *up;
-	unsigned long rate;
-
-	rate = clk_get_rate(d->clk);
-	if (rate <= 0)
-		return;
-
-	up = serial8250_get_port(d->data.line);
-
-	serial8250_update_uartclk(&up->port, rate);
-}
-
-static int dw8250_clk_notifier_cb(struct notifier_block *nb,
-				  unsigned long event, void *data)
-{
-	struct dw8250_data *d = clk_to_dw8250_data(nb);
-
-	/*
-	 * We have no choice but to defer the uartclk update due to two
-	 * deadlocks. First one is caused by a recursive mutex lock which
-	 * happens when clk_set_rate() is called from dw8250_set_termios().
-	 * Second deadlock is more tricky and is caused by an inverted order of
-	 * the clk and tty-port mutexes lock. It happens if clock rate change
-	 * is requested asynchronously while set_termios() is executed between
-	 * tty-port mutex lock and clk_set_rate() function invocation and
-	 * vise-versa. Anyway if we didn't have the reference clock alteration
-	 * in the dw8250_set_termios() method we wouldn't have needed this
-	 * deferred event handling complication.
-	 */
-	if (event == POST_RATE_CHANGE) {
-		queue_work(system_dfl_wq, &d->clk_work);
-		return NOTIFY_OK;
-	}
-
-	return NOTIFY_DONE;
 }
 
 static void
@@ -547,10 +490,6 @@ static void dw8250_set_termios(struct uart_port *p, struct ktermios *termios,
 	clk_disable_unprepare(d->clk);
 	rate = clk_round_rate(d->clk, newrate);
 	if (rate > 0) {
-		/*
-		 * Note that any clock-notifier worker will block in
-		 * serial8250_update_uartclk() until we are done.
-		 */
 		ret = clk_set_rate(d->clk, newrate);
 		if (!ret)
 			p->uartclk = rate;
@@ -783,9 +722,6 @@ static int dw8250_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(data->clk),
 				     "failed to get baudclk\n");
 
-	INIT_WORK(&data->clk_work, dw8250_clk_work_cb);
-	data->clk_notifier.notifier_call = dw8250_clk_notifier_cb;
-
 	if (data->clk)
 		p->uartclk = clk_get_rate(data->clk);
 
@@ -839,21 +775,9 @@ static int dw8250_probe(struct platform_device *pdev)
 		up->dma = &data->data.dma;
 	}
 
-	data->data.line = serial8250_register_8250_port(up);
-	if (data->data.line < 0)
-		return data->data.line;
-
-	/*
-	 * Some platforms may provide a reference clock shared between several
-	 * devices. In this case any clock state change must be known to the
-	 * UART port at least post factum.
-	 */
-	if (data->clk) {
-		err = clk_notifier_register(data->clk, &data->clk_notifier);
-		if (err)
-			return dev_err_probe(dev, err, "Failed to set the clock notifier\n");
-		queue_work(system_dfl_wq, &data->clk_work);
-	}
+	data->data.uport = serial8250_register_8250_port(up);
+	if (IS_ERR(data->data.uport))
+		return PTR_ERR(data->data.uport);
 
 	platform_set_drvdata(pdev, data);
 
@@ -869,13 +793,7 @@ static void dw8250_remove(struct platform_device *pdev)
 
 	pm_runtime_get_sync(dev);
 
-	if (data->clk) {
-		clk_notifier_unregister(data->clk, &data->clk_notifier);
-
-		flush_work(&data->clk_work);
-	}
-
-	serial8250_unregister_port(data->data.line);
+	serial8250_unregister_port(data->data.uport);
 
 	pm_runtime_disable(dev);
 	pm_runtime_put_noidle(dev);
@@ -885,7 +803,7 @@ static int dw8250_suspend(struct device *dev)
 {
 	struct dw8250_data *data = dev_get_drvdata(dev);
 
-	serial8250_suspend_port(data->data.line);
+	serial8250_suspend_port(data->data.uport);
 
 	return 0;
 }
@@ -894,7 +812,7 @@ static int dw8250_resume(struct device *dev)
 {
 	struct dw8250_data *data = dev_get_drvdata(dev);
 
-	serial8250_resume_port(data->data.line);
+	serial8250_resume_port(data->data.uport);
 
 	return 0;
 }
@@ -948,7 +866,15 @@ static const struct dw8250_platform_data dw8250_armada_38x_data = {
 
 static const struct dw8250_platform_data dw8250_renesas_rzn1_data = {
 	.usr_reg = DW_UART_USR,
-	.cpr_value = 0x00012f32,
+	.cpr_value = FIELD_PREP_CONST(DW_UART_CPR_ABP_DATA_WIDTH, 2) |
+		     DW_UART_CPR_AFCE_MODE |
+		     DW_UART_CPR_THRE_MODE |
+		     DW_UART_CPR_ADDITIONAL_FEATURES |
+		     DW_UART_CPR_FIFO_ACCESS |
+		     DW_UART_CPR_FIFO_STAT |
+		     DW_UART_CPR_SHADOW |
+		     DW_UART_CPR_DMA_EXTRA |
+		     DW_UART_CPR_FIFO_MODE_FROM_SIZE(16),
 	.quirks = DW_UART_QUIRK_CPR_VALUE | DW_UART_QUIRK_IS_DMA_FC,
 };
 
@@ -962,6 +888,20 @@ static const struct dw8250_platform_data dw8250_intc10ee = {
 	.quirks = DW_UART_QUIRK_IER_KICK,
 };
 
+static const struct dw8250_platform_data dw8250_ultrarisc_dp1000_data = {
+	.usr_reg = DW_UART_USR,
+	.cpr_value = FIELD_PREP_CONST(DW_UART_CPR_ABP_DATA_WIDTH, 2) |
+		     DW_UART_CPR_THRE_MODE |
+		     DW_UART_CPR_DMA_EXTRA |
+		     DW_UART_CPR_FIFO_MODE_FROM_SIZE(32),
+	.quirks = DW_UART_QUIRK_CPR_VALUE,
+};
+
+static const struct dw8250_platform_data dw8250_tda54 = {
+	.usr_reg = DW_UART_USR,
+	.quirks = DW_UART_QUIRK_SKIP_EMPTY_FIFO_READ,
+};
+
 static const struct of_device_id dw8250_of_match[] = {
 	{ .compatible = "snps,dw-apb-uart", .data = &dw8250_dw_apb },
 	{ .compatible = "cavium,octeon-3860-uart", .data = &dw8250_octeon_3860_data },
@@ -969,6 +909,8 @@ static const struct of_device_id dw8250_of_match[] = {
 	{ .compatible = "renesas,rzn1-uart", .data = &dw8250_renesas_rzn1_data },
 	{ .compatible = "sophgo,sg2044-uart", .data = &dw8250_skip_set_rate_data },
 	{ .compatible = "starfive,jh7100-uart", .data = &dw8250_skip_set_rate_data },
+	{ .compatible = "ti,tda54-uart", .data = &dw8250_tda54 },
+	{ .compatible = "ultrarisc,dp1000-uart", .data = &dw8250_ultrarisc_dp1000_data },
 	{ /* Sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, dw8250_of_match);
@@ -983,6 +925,7 @@ static const struct acpi_device_id dw8250_acpi_match[] = {
 	{ "8086228A", (kernel_ulong_t)&dw8250_dw_apb },
 	{ "AMD0020", (kernel_ulong_t)&dw8250_dw_apb },
 	{ "AMDI0020", (kernel_ulong_t)&dw8250_dw_apb },
+	{ "AMDI0021", (kernel_ulong_t)&dw8250_dw_apb },
 	{ "AMDI0022", (kernel_ulong_t)&dw8250_dw_apb },
 	{ "APMC0D08", (kernel_ulong_t)&dw8250_apmc0d08 },
 	{ "BRCM2032", (kernel_ulong_t)&dw8250_dw_apb },

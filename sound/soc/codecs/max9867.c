@@ -522,12 +522,22 @@ static int max9867_dai_set_fmt(struct snd_soc_dai *codec_dai,
 	return 0;
 }
 
+static const u64 max9867_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_IF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_IF;
+
 static const struct snd_soc_dai_ops max9867_dai_ops = {
 	.set_sysclk	= max9867_set_dai_sysclk,
 	.set_fmt	= max9867_dai_set_fmt,
 	.mute_stream	= max9867_mute,
 	.startup	= max9867_startup,
 	.hw_params	= max9867_dai_hw_params,
+	.auto_selectable_formats	= &max9867_selectable_formats,
+	.num_auto_selectable_formats	= 1,
 	.no_capture_mute = 1,
 };
 
@@ -689,7 +699,7 @@ static int max9867_i2c_probe(struct i2c_client *i2c)
 }
 
 static const struct i2c_device_id max9867_i2c_id[] = {
-	{ "max9867" },
+	{ .name = "max9867" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, max9867_i2c_id);

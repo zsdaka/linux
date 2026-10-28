@@ -62,7 +62,6 @@ struct mtk_crtc {
 	struct device			*dma_dev;
 	struct mtk_mutex		*mutex;
 	unsigned int			ddp_comp_nr;
-	struct mtk_ddp_comp		**ddp_comp;
 	unsigned int			num_conn_routes;
 	const struct mtk_drm_route	*conn_routes;
 
@@ -71,6 +70,8 @@ struct mtk_crtc {
 	bool				config_updating;
 	/* lock for config_updating to cmd buffer */
 	spinlock_t			config_lock;
+
+	struct mtk_ddp_comp		*ddp_comp[];
 };
 
 struct mtk_crtc_state {
@@ -149,19 +150,17 @@ static void mtk_crtc_destroy(struct drm_crtc *crtc)
 	drm_crtc_cleanup(crtc);
 }
 
-static void mtk_crtc_reset(struct drm_crtc *crtc)
+static struct drm_crtc_state *mtk_crtc_create_state(struct drm_crtc *crtc)
 {
 	struct mtk_crtc_state *state;
 
-	if (crtc->state)
-		__drm_atomic_helper_crtc_destroy_state(crtc->state);
-
-	kfree(to_mtk_crtc_state(crtc->state));
-	crtc->state = NULL;
-
 	state = kzalloc_obj(*state);
-	if (state)
-		__drm_atomic_helper_crtc_reset(crtc, &state->base);
+	if (!state)
+		return ERR_PTR(-ENOMEM);
+
+	__drm_atomic_helper_crtc_state_init(&state->base, crtc);
+
+	return &state->base;
 }
 
 static struct drm_crtc_state *mtk_crtc_duplicate_state(struct drm_crtc *crtc)
@@ -681,7 +680,7 @@ static void mtk_crtc_disable_vblank(struct drm_crtc *crtc)
 }
 
 static void mtk_crtc_update_output(struct drm_crtc *crtc,
-				   struct drm_atomic_state *state)
+				   struct drm_atomic_commit *state)
 {
 	int crtc_index = drm_crtc_index(crtc);
 	int i;
@@ -763,7 +762,7 @@ void mtk_crtc_plane_disable(struct drm_crtc *crtc, struct drm_plane *plane)
 }
 
 void mtk_crtc_async_update(struct drm_crtc *crtc, struct drm_plane *plane,
-			   struct drm_atomic_state *state)
+			   struct drm_atomic_commit *state)
 {
 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
 
@@ -774,7 +773,7 @@ void mtk_crtc_async_update(struct drm_crtc *crtc, struct drm_plane *plane,
 }
 
 static void mtk_crtc_atomic_enable(struct drm_crtc *crtc,
-				   struct drm_atomic_state *state)
+				   struct drm_atomic_commit *state)
 {
 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[0];
@@ -802,7 +801,7 @@ static void mtk_crtc_atomic_enable(struct drm_crtc *crtc,
 }
 
 static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
-				    struct drm_atomic_state *state)
+				    struct drm_atomic_commit *state)
 {
 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	struct mtk_ddp_comp *comp = mtk_crtc->ddp_comp[0];
@@ -843,7 +842,7 @@ static void mtk_crtc_atomic_disable(struct drm_crtc *crtc,
 }
 
 static void mtk_crtc_atomic_begin(struct drm_crtc *crtc,
-				  struct drm_atomic_state *state)
+				  struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state,
 									  crtc);
@@ -868,7 +867,7 @@ static void mtk_crtc_atomic_begin(struct drm_crtc *crtc,
 }
 
 static void mtk_crtc_atomic_flush(struct drm_crtc *crtc,
-				  struct drm_atomic_state *state)
+				  struct drm_atomic_commit *state)
 {
 	struct mtk_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	int i;
@@ -885,7 +884,7 @@ static const struct drm_crtc_funcs mtk_crtc_funcs = {
 	.set_config		= drm_atomic_helper_set_config,
 	.page_flip		= drm_atomic_helper_page_flip,
 	.destroy		= mtk_crtc_destroy,
-	.reset			= mtk_crtc_reset,
+	.atomic_create_state	= mtk_crtc_create_state,
 	.atomic_duplicate_state	= mtk_crtc_duplicate_state,
 	.atomic_destroy_state	= mtk_crtc_destroy_state,
 	.enable_vblank		= mtk_crtc_enable_vblank,
@@ -1048,18 +1047,14 @@ int mtk_crtc_create(struct drm_device *drm_dev, const unsigned int *path,
 		}
 	}
 
-	mtk_crtc = devm_kzalloc(dev, sizeof(*mtk_crtc), GFP_KERNEL);
+	mtk_crtc = devm_kzalloc(dev,
+				struct_size(mtk_crtc, ddp_comp, path_len + (conn_routes ? 1 : 0)),
+				GFP_KERNEL);
 	if (!mtk_crtc)
 		return -ENOMEM;
 
-	mtk_crtc->mmsys_dev = priv->mmsys_dev;
 	mtk_crtc->ddp_comp_nr = path_len;
-	mtk_crtc->ddp_comp = devm_kcalloc(dev,
-					  mtk_crtc->ddp_comp_nr + (conn_routes ? 1 : 0),
-					  sizeof(*mtk_crtc->ddp_comp),
-					  GFP_KERNEL);
-	if (!mtk_crtc->ddp_comp)
-		return -ENOMEM;
+	mtk_crtc->mmsys_dev = priv->mmsys_dev;
 
 	mtk_crtc->mutex = mtk_mutex_get(priv->mutex_dev);
 	if (IS_ERR(mtk_crtc->mutex)) {

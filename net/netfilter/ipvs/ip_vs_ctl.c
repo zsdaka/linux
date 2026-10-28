@@ -235,7 +235,7 @@ static void defense_work_handler(struct work_struct *work)
 	update_defense_level(ipvs);
 	if (atomic_read(&ipvs->dropentry))
 		ip_vs_random_dropentry(ipvs);
-	queue_delayed_work(system_long_wq, &ipvs->defense_work,
+	queue_delayed_work(system_dfl_long_wq, &ipvs->defense_work,
 			   DEFENSE_TIMER_PERIOD);
 }
 #endif
@@ -290,7 +290,7 @@ static void est_reload_work_handler(struct work_struct *work)
 	atomic_set(&ipvs->est_genid_done, genid);
 
 	if (repeat)
-		queue_delayed_work(system_long_wq, &ipvs->est_reload_work,
+		queue_delayed_work(system_dfl_long_wq, &ipvs->est_reload_work,
 				   delay);
 
 unlock:
@@ -821,7 +821,7 @@ out:
 	if (!READ_ONCE(ipvs->enable) || !more_work ||
 	    test_bit(IP_VS_WORK_SVC_NORESIZE, &ipvs->work_flags))
 		return;
-	queue_delayed_work(system_unbound_wq, &ipvs->svc_resize_work, 1);
+	queue_delayed_work(system_dfl_long_wq, &ipvs->svc_resize_work, 1);
 	return;
 
 unlock_m:
@@ -1304,6 +1304,40 @@ void ip_vs_stats_free(struct ip_vs_stats *stats)
 	}
 }
 
+/* Update overload flag based on number of dest conns and lower/upper
+ * connection thresholds:
+ * - conns reach u_threshold and exceed it: set the flag
+ * - conns go below l_threshold (or 75% of u_threshold): clear the flag
+ */
+static void __ip_vs_dest_update_overload(struct ip_vs_dest *dest, bool overload)
+{
+	int conns;
+	u32 l, u;
+
+	lockdep_assert_held(&dest->dst_lock);
+	u = READ_ONCE(dest->u_threshold);
+	if (u) {
+		/* Low threshold defaults to 75% of upper threshold */
+		l = READ_ONCE(dest->l_threshold) ? : (u - (u >> 2));
+		conns = atomic_read(&dest->totalconns);
+		if (conns >= (overload ? l : u)) {
+			WRITE_ONCE(dest->u_threshold_val, INT_MAX);
+			WRITE_ONCE(dest->l_threshold_val, l);
+			return;
+		}
+	}
+
+	WRITE_ONCE(dest->u_threshold_val, u ? : INT_MAX);
+	WRITE_ONCE(dest->l_threshold_val, 0);
+}
+
+void ip_vs_dest_update_overload(struct ip_vs_dest *dest, bool overload)
+{
+	spin_lock_bh(&dest->dst_lock);
+	__ip_vs_dest_update_overload(dest, overload);
+	spin_unlock_bh(&dest->dst_lock);
+}
+
 /*
  *	Update a destination in the given service
  */
@@ -1368,12 +1402,19 @@ __ip_vs_update_dest(struct ip_vs_service *svc, struct ip_vs_dest *dest,
 	}
 
 	/* set the dest status flags */
-	dest->flags |= IP_VS_DEST_F_AVAILABLE;
+	dest->cflags |= IP_VS_DEST_CF_AVAILABLE;
 
-	if (udest->u_threshold == 0 || udest->u_threshold > dest->u_threshold)
-		dest->flags &= ~IP_VS_DEST_F_OVERLOAD;
-	dest->u_threshold = udest->u_threshold;
-	dest->l_threshold = udest->l_threshold;
+	if (READ_ONCE(dest->u_threshold) != udest->u_threshold ||
+	    READ_ONCE(dest->l_threshold) != udest->l_threshold) {
+		bool overload;
+
+		spin_lock_bh(&dest->dst_lock);
+		WRITE_ONCE(dest->u_threshold, udest->u_threshold);
+		WRITE_ONCE(dest->l_threshold, udest->l_threshold);
+		overload = ip_vs_dest_is_overloaded(dest);
+		__ip_vs_dest_update_overload(dest, overload);
+		spin_unlock_bh(&dest->dst_lock);
+	}
 
 	dest->af = udest->af;
 
@@ -1445,7 +1486,7 @@ ip_vs_new_dest(struct ip_vs_service *svc, struct ip_vs_dest_user_kern *udest)
 	dest->port = udest->port;
 
 	atomic_set(&dest->activeconns, 0);
-	atomic_set(&dest->inactconns, 0);
+	atomic_set(&dest->totalconns, 0);
 	atomic_set(&dest->persistconns, 0);
 	refcount_set(&dest->refcnt, 1);
 
@@ -1485,6 +1526,9 @@ ip_vs_add_dest(struct ip_vs_service *svc, struct ip_vs_dest_user_kern *udest)
 			__func__);
 		return -ERANGE;
 	}
+
+	if (udest->u_threshold > INT_MAX)
+		return -EINVAL;
 
 	if (udest->tun_type == IP_VS_CONN_F_TUNNEL_TYPE_GUE) {
 		if (udest->tun_port == 0) {
@@ -1559,6 +1603,9 @@ ip_vs_edit_dest(struct ip_vs_service *svc, struct ip_vs_dest_user_kern *udest)
 		return -ERANGE;
 	}
 
+	if (udest->u_threshold > INT_MAX)
+		return -EINVAL;
+
 	if (udest->tun_type == IP_VS_CONN_F_TUNNEL_TYPE_GUE) {
 		if (udest->tun_port == 0) {
 			pr_err("%s(): tunnel port is zero\n", __func__);
@@ -1613,7 +1660,7 @@ static void __ip_vs_unlink_dest(struct ip_vs_service *svc,
 				struct ip_vs_dest *dest,
 				int svcupd)
 {
-	dest->flags &= ~IP_VS_DEST_F_AVAILABLE;
+	dest->cflags &= ~IP_VS_DEST_CF_AVAILABLE;
 
 	spin_lock_bh(&dest->dst_lock);
 	__ip_vs_dst_cache_reset(dest);
@@ -1869,7 +1916,7 @@ ip_vs_add_service(struct netns_ipvs *ipvs, struct ip_vs_service_user_kern *u,
 
 	/* Schedule resize work */
 	if (grow && !test_and_set_bit(IP_VS_WORK_SVC_RESIZE, &ipvs->work_flags))
-		queue_delayed_work(system_unbound_wq, &ipvs->svc_resize_work,
+		queue_delayed_work(system_dfl_long_wq, &ipvs->svc_resize_work,
 				   1);
 
 	*svc_p = svc;
@@ -1898,7 +1945,7 @@ ip_vs_add_service(struct netns_ipvs *ipvs, struct ip_vs_service_user_kern *u,
 	if (ret_hooks >= 0)
 		ip_vs_unregister_hooks(ipvs, u->af);
 	if (svc != NULL) {
-		ip_vs_unbind_scheduler(svc, sched);
+		ip_vs_unbind_scheduler(svc);
 		ip_vs_service_free(svc);
 	}
 	ip_vs_scheduler_put(sched);
@@ -1962,9 +2009,8 @@ ip_vs_edit_service(struct ip_vs_service *svc, struct ip_vs_service_user_kern *u)
 	old_sched = rcu_dereference_protected(svc->scheduler, 1);
 	if (sched != old_sched) {
 		if (old_sched) {
-			ip_vs_unbind_scheduler(svc, old_sched);
-			RCU_INIT_POINTER(svc->scheduler, NULL);
-			/* Wait all svc->sched_data users */
+			ip_vs_unbind_scheduler(svc);
+			/* Wait all svc->scheduler/sched_data users */
 			synchronize_rcu();
 		}
 		/* Bind the new scheduler */
@@ -1972,6 +2018,10 @@ ip_vs_edit_service(struct ip_vs_service *svc, struct ip_vs_service_user_kern *u)
 			ret = ip_vs_bind_scheduler(svc, sched);
 			if (ret) {
 				ip_vs_scheduler_put(sched);
+				/* Try to restore the old_sched */
+				if (old_sched &&
+				    !ip_vs_bind_scheduler(svc, old_sched))
+					old_sched = NULL;
 				goto out;
 			}
 		}
@@ -2027,7 +2077,7 @@ static void __ip_vs_del_service(struct ip_vs_service *svc, bool cleanup)
 
 	/* Unbind scheduler */
 	old_sched = rcu_dereference_protected(svc->scheduler, 1);
-	ip_vs_unbind_scheduler(svc, old_sched);
+	ip_vs_unbind_scheduler(svc);
 	ip_vs_scheduler_put(old_sched);
 
 	/* Unbind persistence engine, keep svc->pe */
@@ -2122,7 +2172,7 @@ static int ip_vs_del_service(struct ip_vs_service *svc)
 		rcu_read_unlock();
 		if (shrink && !test_and_set_bit(IP_VS_WORK_SVC_RESIZE,
 						&ipvs->work_flags))
-			queue_delayed_work(system_unbound_wq,
+			queue_delayed_work(system_dfl_long_wq,
 					   &ipvs->svc_resize_work, 1);
 	}
 	return 0;
@@ -2320,6 +2370,45 @@ static int ip_vs_zero_all(struct netns_ipvs *ipvs)
 #ifdef CONFIG_SYSCTL
 
 static int
+proc_do_conn_max(const struct ctl_table *table, int write,
+		 void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int *valp = table->data;
+	/* We can not use *valp to check if new value is provided, use INT_MIN
+	 * for this because different admins change different limits.
+	 */
+	int unset = INT_MIN;
+	int val = write ? unset : READ_ONCE(*valp);
+	int rc;
+
+	const struct ctl_table tmp = {
+		.data = &val,
+		.maxlen = sizeof(int),
+	};
+
+	rc = proc_dointvec(&tmp, write, buffer, lenp, ppos);
+	if (write && !rc && val != unset) {
+		struct netns_ipvs *ipvs = table->extra2;
+		bool priv = capable(CAP_NET_ADMIN);
+		int max;
+
+		mutex_lock(&ipvs->service_mutex);
+		/* Unprivileged admins can not go above the hard limit */
+		max = priv ? IP_VS_CONN_MAX : ipvs->conn_max_limit;
+		if (val < 0 || val > max) {
+			rc = -EINVAL;
+		} else {
+			/* Privileged admin changes both limits */
+			if (priv)
+				ipvs->conn_max_limit = val;
+			WRITE_ONCE(*valp, val);
+		}
+		mutex_unlock(&ipvs->service_mutex);
+	}
+	return rc;
+}
+
+static int
 proc_do_defense_mode(const struct ctl_table *table, int write,
 		     void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -2363,6 +2452,8 @@ proc_do_sync_threshold(const struct ctl_table *table, int write,
 	mutex_lock(&ipvs->sync_mutex);
 	memcpy(val, valp, sizeof(val));
 	rc = proc_dointvec(&tmp, write, buffer, lenp, ppos);
+	if (rc)
+		goto out;
 	if (write) {
 		if (val[0] < 0 || val[1] < 0 ||
 		    (val[0] >= val[1] && val[1]))
@@ -2370,6 +2461,7 @@ proc_do_sync_threshold(const struct ctl_table *table, int write,
 		else
 			memcpy(valp, val, sizeof(val));
 	}
+out:
 	mutex_unlock(&ipvs->sync_mutex);
 	return rc;
 }
@@ -2564,7 +2656,7 @@ static int ipvs_proc_conn_lfactor(const struct ctl_table *table, int write,
 		} else {
 			WRITE_ONCE(*valp, val);
 			if (rcu_access_pointer(ipvs->conn_tab))
-				mod_delayed_work(system_unbound_wq,
+				mod_delayed_work(system_dfl_long_wq,
 						 &ipvs->conn_resize_work, 0);
 		}
 	}
@@ -2596,7 +2688,7 @@ static int ipvs_proc_svc_lfactor(const struct ctl_table *table, int write,
 			    READ_ONCE(ipvs->enable) &&
 			    !test_bit(IP_VS_WORK_SVC_NORESIZE,
 				      &ipvs->work_flags))
-				mod_delayed_work(system_unbound_wq,
+				mod_delayed_work(system_dfl_long_wq,
 						 &ipvs->svc_resize_work, 0);
 			mutex_unlock(&ipvs->service_mutex);
 		}
@@ -2622,6 +2714,12 @@ static struct ctl_table vs_vars[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "conn_max",
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_do_conn_max,
 	},
 	{
 		.procname	= "drop_entry",
@@ -2983,7 +3081,7 @@ static int ip_vs_info_seq_show(struct seq_file *seq, void *v)
 					   ip_vs_fwd_name(atomic_read(&dest->conn_flags)),
 					   atomic_read(&dest->weight),
 					   atomic_read(&dest->activeconns),
-					   atomic_read(&dest->inactconns));
+					   ip_vs_dest_inactconns(dest));
 			else
 #endif
 				seq_printf(seq,
@@ -2994,7 +3092,7 @@ static int ip_vs_info_seq_show(struct seq_file *seq, void *v)
 					   ip_vs_fwd_name(atomic_read(&dest->conn_flags)),
 					   atomic_read(&dest->weight),
 					   atomic_read(&dest->activeconns),
-					   atomic_read(&dest->inactconns));
+					   ip_vs_dest_inactconns(dest));
 
 		}
 	}
@@ -3619,10 +3717,10 @@ __ip_vs_get_dest_entries(struct netns_ipvs *ipvs, const struct ip_vs_get_dests *
 			entry.port = dest->port;
 			entry.conn_flags = atomic_read(&dest->conn_flags);
 			entry.weight = atomic_read(&dest->weight);
-			entry.u_threshold = dest->u_threshold;
-			entry.l_threshold = dest->l_threshold;
+			entry.u_threshold = READ_ONCE(dest->u_threshold);
+			entry.l_threshold = READ_ONCE(dest->l_threshold);
 			entry.activeconns = atomic_read(&dest->activeconns);
-			entry.inactconns = atomic_read(&dest->inactconns);
+			entry.inactconns = ip_vs_dest_inactconns(dest);
 			entry.persistconns = atomic_read(&dest->persistconns);
 			ip_vs_copy_stats(&kstats, &dest->stats);
 			ip_vs_export_stats_user(&entry.stats, &kstats);
@@ -4229,12 +4327,14 @@ static int ip_vs_genl_fill_dest(struct sk_buff *skb, struct ip_vs_dest *dest)
 			 dest->tun_port) ||
 	    nla_put_u16(skb, IPVS_DEST_ATTR_TUN_FLAGS,
 			dest->tun_flags) ||
-	    nla_put_u32(skb, IPVS_DEST_ATTR_U_THRESH, dest->u_threshold) ||
-	    nla_put_u32(skb, IPVS_DEST_ATTR_L_THRESH, dest->l_threshold) ||
+	    nla_put_u32(skb, IPVS_DEST_ATTR_U_THRESH,
+			READ_ONCE(dest->u_threshold)) ||
+	    nla_put_u32(skb, IPVS_DEST_ATTR_L_THRESH,
+			READ_ONCE(dest->l_threshold)) ||
 	    nla_put_u32(skb, IPVS_DEST_ATTR_ACTIVE_CONNS,
 			atomic_read(&dest->activeconns)) ||
 	    nla_put_u32(skb, IPVS_DEST_ATTR_INACT_CONNS,
-			atomic_read(&dest->inactconns)) ||
+			ip_vs_dest_inactconns(dest)) ||
 	    nla_put_u32(skb, IPVS_DEST_ATTR_PERSIST_CONNS,
 			atomic_read(&dest->persistconns)) ||
 	    nla_put_u16(skb, IPVS_DEST_ATTR_ADDR_FAMILY, dest->af))
@@ -4977,6 +5077,14 @@ static int __net_init ip_vs_control_net_init_sysctl(struct netns_ipvs *ipvs)
 	tbl[idx++].data = &ipvs->sysctl_amemthresh;
 	ipvs->sysctl_am_droprate = 10;
 	tbl[idx++].data = &ipvs->sysctl_am_droprate;
+
+	/* Inherit both limits from init_net:conn_max */
+	ipvs->conn_max_limit = net_eq(net, &init_net) ? IP_VS_CONN_MAX :
+			       READ_ONCE(*(int *)vs_vars[idx].data);
+	ipvs->sysctl_conn_max = ipvs->conn_max_limit;
+	tbl[idx].extra2 = ipvs;
+	tbl[idx++].data = &ipvs->sysctl_conn_max;
+
 	tbl[idx++].data = &ipvs->sysctl_drop_entry;
 	tbl[idx++].data = &ipvs->sysctl_drop_packet;
 #ifdef CONFIG_IP_VS_NFCT
@@ -5070,7 +5178,7 @@ static int __net_init ip_vs_control_net_init_sysctl(struct netns_ipvs *ipvs)
 		goto err;
 
 	/* Schedule defense work */
-	queue_delayed_work(system_long_wq, &ipvs->defense_work,
+	queue_delayed_work(system_dfl_long_wq, &ipvs->defense_work,
 			   DEFENSE_TIMER_PERIOD);
 
 	return 0;

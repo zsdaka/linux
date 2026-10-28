@@ -190,11 +190,11 @@ static int ipip_err(struct sk_buff *skb, u32 info)
 	if (t->parms.iph.ttl == 0 && type == ICMP_TIME_EXCEEDED)
 		goto out;
 
-	if (time_before(jiffies, t->err_time + IPTUNNEL_ERR_TIMEO))
-		t->err_count++;
+	if (time_before(jiffies, READ_ONCE(t->err_time) + IPTUNNEL_ERR_TIMEO))
+		WRITE_ONCE(t->err_count, READ_ONCE(t->err_count) + 1);
 	else
-		t->err_count = 1;
-	t->err_time = jiffies;
+		WRITE_ONCE(t->err_count, 1);
+	WRITE_ONCE(t->err_time, jiffies);
 
 out:
 	return err;
@@ -248,7 +248,7 @@ static int ipip_tunnel_rcv(struct sk_buff *skb, u8 ipproto)
 
 			tun_dst = ip_tun_rx_dst(skb, flags, 0, 0);
 			if (!tun_dst)
-				return 0;
+				goto drop;
 			ip_tunnel_md_udp_encap(skb, &tun_dst->u.tun_info);
 		}
 		skb_reset_mac_header(skb);
@@ -360,19 +360,30 @@ static int ipip_fill_forward_path(struct net_device_path_ctx *ctx,
 	const struct iphdr *tiph = &tunnel->parms.iph;
 	struct rtable *rt;
 
-	rt = ip_route_output(dev_net(ctx->dev), tiph->daddr, 0, 0, 0,
-			     RT_SCOPE_UNIVERSE);
+	if (ctx->ether_type != cpu_to_be16(ETH_P_IP))
+		return -EOPNOTSUPP;
+
+	if (tunnel->collect_md)
+		return -EOPNOTSUPP;
+
+	if (tunnel->parms.iph.tos & 0x1)
+		return -EOPNOTSUPP;
+
+	rt = ip_route_output(dev_net(ctx->dev), tiph->daddr, tiph->saddr,
+			     inet_dsfield_to_dscp(tiph->tos),
+			     tunnel->parms.link, RT_SCOPE_UNIVERSE);
 	if (IS_ERR(rt))
 		return PTR_ERR(rt);
 
 	path->type = DEV_PATH_TUN;
 	path->tun.src_v4.s_addr = tiph->saddr;
 	path->tun.dst_v4.s_addr = tiph->daddr;
-	path->tun.l3_proto = IPPROTO_IPIP;
+	path->tun.inner_proto = IPPROTO_IPIP;
+	path->tun.encap_proto = AF_INET;
+	path->tun.dst = &rt->dst;
 	path->dev = ctx->dev;
 
 	ctx->dev = rt->dst.dev;
-	ip_rt_put(rt);
 
 	return 0;
 }
@@ -493,6 +504,9 @@ static int ipip_changelink(struct net_device *dev, struct nlattr *tb[],
 	struct ip_tunnel_parm_kern p;
 	bool collect_md;
 	__u32 fwmark = t->fwmark;
+
+	if (!rtnl_dev_link_net_capable(dev, t->net))
+		return -EPERM;
 
 	if (ip_tunnel_netlink_encap_parms(data, &ipencap)) {
 		int err = ip_tunnel_encap_setup(t, &ipencap);
@@ -632,7 +646,7 @@ static int __net_init ipip_init_net(struct net *net)
 static void __net_exit ipip_exit_rtnl(struct net *net,
 				      struct list_head *dev_to_kill)
 {
-	ip_tunnel_delete_net(net, ipip_net_id, &ipip_link_ops, dev_to_kill);
+	ip_tunnel_delete_net(net, ipip_net_id, dev_to_kill);
 }
 
 static struct pernet_operations ipip_net_ops = {

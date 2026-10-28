@@ -45,15 +45,30 @@
 		: __sysret_arg;                         /* return original value */ \
 })
 
-/* Syscall ENOSYS helper: Avoids unused-parameter warnings and provides a
- * debugging hook.
+/* Syscall ENOSYS helper: Avoids unused-parameter warnings, provides compile
+ * time validation and a debugging hook.
  */
 
+#if defined(NOLIBC_COMPILE_TIME_ENOSYS)
 static __inline__ int __nolibc_enosys(const char *syscall, ...)
 {
 	(void)syscall;
 	return -ENOSYS;
 }
+
+#elif __nolibc_has_attribute(error)
+__attribute__((error("system call not implemented")))
+extern int __nolibc_enosys(const char *syscall, ...);
+
+#else
+static __inline__ int __nolibc_enosys(const char *syscall, ...)
+{
+	extern int __nolibc_enosys_error;
+	(void)syscall;
+
+	return __nolibc_enosys_error;
+}
+#endif
 
 
 /* Functions in this file only describe syscalls. They're declared static so
@@ -87,7 +102,7 @@ static __inline__ int __nolibc_enosys(const char *syscall, ...)
 static __attribute__((unused))
 void *_sys_brk(void *addr)
 {
-	return (void *)__nolibc_syscall1(__NR_brk, addr);
+	return (void *)(unsigned long)__nolibc_syscall1(__NR_brk, addr);
 }
 
 static __attribute__((unused))
@@ -597,12 +612,18 @@ int link(const char *old, const char *new)
 static __attribute__((unused))
 off_t _sys_lseek(int fd, off_t offset, int whence)
 {
-#if defined(__NR_llseek)
+#if defined(__NR_llseek) || defined(__NR__llseek)
 	__kernel_loff_t loff = 0;
+	int ret, nr_llseek;
 	off_t result;
-	int ret;
 
-	ret = __nolibc_syscall5(__NR_llseek, fd, offset >> 32, (uint32_t)offset, &loff, whence);
+#if defined(__NR_llseek)
+	nr_llseek = __NR_llseek;
+#else
+	nr_llseek = __NR__llseek;
+#endif
+
+	ret = __nolibc_syscall5(nr_llseek, fd, offset >> 32, (uint32_t)offset, &loff, whence);
 	if (ret < 0)
 		result = ret;
 	else
@@ -721,6 +742,56 @@ static __attribute__((unused))
 int pivot_root(const char *new, const char *old)
 {
 	return __sysret(_sys_pivot_root(new, old));
+}
+
+
+/*
+ * ssize_t pread(int fd, void *buf, size_t count, off_t offset);
+ * ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
+ */
+
+#ifndef _sys_pread
+static __attribute__((unused))
+ssize_t _sys_pread(int fd, void *buf, size_t count, off_t offset)
+{
+#if __NOLIBC_BITS_PER_SYSCALL_ARG == 64
+	return __nolibc_syscall4(__NR_pread64, fd, buf, count, offset);
+#elif defined(__NOLIBC_PAD_64BIT_SYSCALL_ARGUMENT_PAIR)
+	return __nolibc_syscall6(__NR_pread64, fd, buf, count, 0,
+				 __NOLIBC_LLARGPART(offset, 0), __NOLIBC_LLARGPART(offset, 1));
+#else
+	return __nolibc_syscall5(__NR_pread64, fd, buf, count,
+				 __NOLIBC_LLARGPART(offset, 0), __NOLIBC_LLARGPART(offset, 1));
+#endif
+}
+#endif /* _sys_pread */
+
+static __attribute__((unused))
+ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+{
+	return __sysret(_sys_pread(fd, buf, count, offset));
+}
+
+#ifndef _sys_pwrite
+static __attribute__((unused))
+ssize_t _sys_pwrite(int fd, const void *buf, size_t count, off_t offset)
+{
+#if __NOLIBC_BITS_PER_SYSCALL_ARG == 64
+	return __nolibc_syscall4(__NR_pwrite64, fd, buf, count, offset);
+#elif defined(__NOLIBC_PAD_64BIT_SYSCALL_ARGUMENT_PAIR)
+	return __nolibc_syscall6(__NR_pwrite64, fd, buf, count, 0,
+				 __NOLIBC_LLARGPART(offset, 0), __NOLIBC_LLARGPART(offset, 1));
+#else
+	return __nolibc_syscall5(__NR_pwrite64, fd, buf, count,
+				 __NOLIBC_LLARGPART(offset, 0), __NOLIBC_LLARGPART(offset, 1));
+#endif
+}
+#endif /* _sys_pwrite */
+
+static __attribute__((unused))
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
+{
+	return __sysret(_sys_pwrite(fd, buf, count, offset));
 }
 
 

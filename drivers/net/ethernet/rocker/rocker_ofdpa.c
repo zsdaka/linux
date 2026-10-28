@@ -1336,7 +1336,7 @@ static int ofdpa_port_ipv4_resolve(struct ofdpa_port *ofdpa_port,
 	int err = 0;
 
 	if (!n) {
-		n = neigh_create(&arp_tbl, &ip_addr, dev);
+		n = ipv4_neigh_create(dev, &ip_addr);
 		if (IS_ERR(n))
 			return PTR_ERR(n);
 	}
@@ -1923,6 +1923,9 @@ static int ofdpa_port_fdb(struct ofdpa_port *ofdpa_port,
 		/* Refreshing existing to update aging timers */
 		flags |= OFDPA_OP_FLAG_REFRESH;
 	}
+
+	if (found && removing)
+		kfree(found);
 
 	return ofdpa_port_fdb_learn(ofdpa_port, flags, addr, vlan_id);
 }

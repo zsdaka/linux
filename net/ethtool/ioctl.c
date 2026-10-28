@@ -35,6 +35,7 @@
 #include <net/netdev_queues.h>
 
 #include "common.h"
+#include "../core/dev.h"
 
 /* State held across locks and calls for commands which have devlink fallback */
 struct ethtool_devlink_compat {
@@ -436,10 +437,10 @@ struct ethtool_link_usettings {
 };
 
 /* Internal kernel helper to query a device ethtool_link_settings. */
-int __ethtool_get_link_ksettings(struct net_device *dev,
-				 struct ethtool_link_ksettings *link_ksettings)
+int netif_get_link_ksettings(struct net_device *dev,
+			     struct ethtool_link_ksettings *link_ksettings)
 {
-	ASSERT_RTNL();
+	netdev_assert_locked_ops_compat(dev);
 
 	if (!dev->ethtool_ops->get_link_ksettings)
 		return -EOPNOTSUPP;
@@ -449,6 +450,21 @@ int __ethtool_get_link_ksettings(struct net_device *dev,
 
 	memset(link_ksettings, 0, sizeof(*link_ksettings));
 	return dev->ethtool_ops->get_link_ksettings(dev, link_ksettings);
+}
+EXPORT_SYMBOL(netif_get_link_ksettings);
+
+/* Convenience helper for callers that hold only rtnl_lock(). */
+int __ethtool_get_link_ksettings(struct net_device *dev,
+				 struct ethtool_link_ksettings *link_ksettings)
+{
+	int ret;
+
+	ASSERT_RTNL();
+
+	netdev_lock_ops(dev);
+	ret = netif_get_link_ksettings(dev, link_ksettings);
+	netdev_unlock_ops(dev);
+	return ret;
 }
 EXPORT_SYMBOL(__ethtool_get_link_ksettings);
 
@@ -529,7 +545,7 @@ static int ethtool_get_link_ksettings(struct net_device *dev,
 	int err = 0;
 	struct ethtool_link_ksettings link_ksettings;
 
-	ASSERT_RTNL();
+	netdev_assert_locked_ops_compat(dev);
 	if (!dev->ethtool_ops->get_link_ksettings)
 		return -EOPNOTSUPP;
 
@@ -586,7 +602,7 @@ static int ethtool_set_link_ksettings(struct net_device *dev,
 	struct ethtool_link_ksettings link_ksettings = {};
 	int err;
 
-	ASSERT_RTNL();
+	netdev_assert_locked_ops_compat(dev);
 
 	if (!dev->ethtool_ops->set_link_ksettings)
 		return -EOPNOTSUPP;
@@ -660,7 +676,7 @@ static int ethtool_get_settings(struct net_device *dev, void __user *useraddr)
 	struct ethtool_cmd cmd;
 	int err;
 
-	ASSERT_RTNL();
+	netdev_assert_locked_ops_compat(dev);
 	if (!dev->ethtool_ops->get_link_ksettings)
 		return -EOPNOTSUPP;
 
@@ -696,7 +712,7 @@ static int ethtool_set_settings(struct net_device *dev, void __user *useraddr)
 	struct ethtool_cmd cmd;
 	int ret;
 
-	ASSERT_RTNL();
+	netdev_assert_locked_ops_compat(dev);
 
 	if (copy_from_user(&cmd, useraddr, sizeof(cmd)))
 		return -EFAULT;
@@ -1286,15 +1302,6 @@ static int ethtool_copy_validate_indir(u32 *indir, void __user *useraddr,
 	return 0;
 }
 
-u8 netdev_rss_key[NETDEV_RSS_KEY_LEN] __read_mostly;
-
-void netdev_rss_key_fill(void *buffer, size_t len)
-{
-	BUG_ON(len > sizeof(netdev_rss_key));
-	net_get_random_once(netdev_rss_key, sizeof(netdev_rss_key));
-	memcpy(buffer, netdev_rss_key, len);
-}
-EXPORT_SYMBOL(netdev_rss_key_fill);
 
 static noinline_for_stack int ethtool_get_rxfh_indir(struct net_device *dev,
 						     void __user *useraddr)
@@ -2224,10 +2231,29 @@ static int ethtool_set_ringparam(struct net_device *dev, void __user *useraddr)
 	    ringparam.tx_pending > max.tx_max_pending)
 		return -EINVAL;
 
+	ret = netdev_reconfig_start(dev);
+	if (ret)
+		return ret;
+
+	ethtool_ringparam_set_cfg(dev->cfg_pending, &ringparam);
+
+	ret = netdev_queue_config_revalidate(dev, NULL);
+	if (ret)
+		goto out_free_cfg;
+
 	ret = dev->ethtool_ops->set_ringparam(dev, &ringparam,
 					      &kernel_ringparam, NULL);
-	if (!ret)
-		ethtool_notify(dev, ETHTOOL_MSG_RINGS_NTF);
+	if (ret)
+		goto out_free_cfg;
+
+	/* Capture ring depth adjustments reported by the driver. */
+	ethtool_ringparam_set_cfg(dev->cfg_pending, &ringparam);
+	swap(dev->cfg, dev->cfg_pending);
+	ethtool_notify(dev, ETHTOOL_MSG_RINGS_NTF);
+
+out_free_cfg:
+	__netdev_free_config(dev->cfg_pending);
+	dev->cfg_pending = dev->cfg;
 	return ret;
 }
 
@@ -2437,10 +2463,10 @@ void ethtool_puts(u8 **data, const char *str)
 }
 EXPORT_SYMBOL(ethtool_puts);
 
-static int ethtool_phys_id(struct net_device *dev, void __user *useraddr)
+static int ethtool_phys_id(struct net_device *dev, void __user *useraddr,
+			   bool has_rtnl_lock)
 {
 	struct ethtool_value id;
-	static bool busy;
 	const struct ethtool_ops *ops = dev->ethtool_ops;
 	netdevice_tracker dev_tracker;
 	int rc;
@@ -2448,7 +2474,7 @@ static int ethtool_phys_id(struct net_device *dev, void __user *useraddr)
 	if (!ops->set_phys_id)
 		return -EOPNOTSUPP;
 
-	if (busy)
+	if (dev->ethtool->phys_id_busy)
 		return -EBUSY;
 
 	if (copy_from_user(&id, useraddr, sizeof(id)))
@@ -2458,13 +2484,14 @@ static int ethtool_phys_id(struct net_device *dev, void __user *useraddr)
 	if (rc < 0)
 		return rc;
 
-	/* Drop the RTNL lock while waiting, but prevent reentry or
+	/* Drop the locks while waiting, but prevent reentry or
 	 * removal of the device.
 	 */
-	busy = true;
+	dev->ethtool->phys_id_busy = true;
 	netdev_hold(dev, &dev_tracker, GFP_KERNEL);
 	netdev_unlock_ops(dev);
-	rtnl_unlock();
+	if (has_rtnl_lock)
+		rtnl_unlock();
 
 	if (rc == 0) {
 		/* Driver will handle this itself */
@@ -2477,22 +2504,25 @@ static int ethtool_phys_id(struct net_device *dev, void __user *useraddr)
 		u64 i = 0;
 
 		do {
-			rtnl_lock();
+			if (has_rtnl_lock)
+				rtnl_lock();
 			netdev_lock_ops(dev);
 			rc = ops->set_phys_id(dev,
 				    (i++ & 1) ? ETHTOOL_ID_OFF : ETHTOOL_ID_ON);
 			netdev_unlock_ops(dev);
-			rtnl_unlock();
+			if (has_rtnl_lock)
+				rtnl_unlock();
 			if (rc)
 				break;
 			schedule_timeout_interruptible(interval);
 		} while (!signal_pending(current) && (!id.data || i < count));
 	}
 
-	rtnl_lock();
+	if (has_rtnl_lock)
+		rtnl_lock();
 	netdev_lock_ops(dev);
 	netdev_put(dev, &dev_tracker);
-	busy = false;
+	dev->ethtool->phys_id_busy = false;
 
 	(void) ops->set_phys_id(dev, ETHTOOL_ID_INACTIVE);
 	return rc;
@@ -3114,6 +3144,7 @@ static int ethtool_phy_tunable_valid(const struct ethtool_tunable *tuna)
 	switch (tuna->id) {
 	case ETHTOOL_PHY_DOWNSHIFT:
 	case ETHTOOL_PHY_FAST_LINK_DOWN:
+	case ETHTOOL_PHY_SHORT_CABLE_PRESET:
 		if (tuna->len != sizeof(u8) ||
 		    tuna->type_id != ETHTOOL_TUNABLE_U8)
 			return -EINVAL;
@@ -3121,6 +3152,12 @@ static int ethtool_phy_tunable_valid(const struct ethtool_tunable *tuna)
 	case ETHTOOL_PHY_EDPD:
 		if (tuna->len != sizeof(u16) ||
 		    tuna->type_id != ETHTOOL_TUNABLE_U16)
+			return -EINVAL;
+		break;
+	case ETHTOOL_PHY_LPF_BW:
+	case ETHTOOL_PHY_DSP_EQ_INIT_VALUE:
+		if (tuna->len != sizeof(u32) ||
+		    tuna->type_id != ETHTOOL_TUNABLE_U32)
 			return -EINVAL;
 		break;
 	default:
@@ -3243,17 +3280,14 @@ static int ethtool_set_fecparam(struct net_device *dev, void __user *useraddr)
 /* The main entry point in this file.  Called from net/core/dev_ioctl.c */
 
 static int
-__dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr,
-	      u32 ethcmd, struct ethtool_devlink_compat *devlink_state)
+dev_ethtool_locked(struct net *net, struct net_device *dev,
+		   void __user *useraddr,
+		   u32 ethcmd, struct ethtool_devlink_compat *devlink_state,
+		   bool has_rtnl_lock)
 {
-	struct net_device *dev;
 	u32 sub_cmd;
 	int rc;
 	netdev_features_t old_features;
-
-	dev = __dev_get_by_name(net, ifr->ifr_name);
-	if (!dev)
-		return -ENODEV;
 
 	if (ethcmd == ETHTOOL_PERQUEUE) {
 		if (copy_from_user(&sub_cmd, useraddr + sizeof(ethcmd), sizeof(sub_cmd)))
@@ -3305,7 +3339,8 @@ __dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr,
 			return -EPERM;
 	}
 
-	netdev_lock_ops(dev);
+	netdev_assert_locked_ops_compat(dev);
+
 	if (dev->dev.parent)
 		pm_runtime_get_sync(dev->dev.parent);
 
@@ -3393,7 +3428,7 @@ __dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr,
 		rc = ethtool_get_strings(dev, useraddr);
 		break;
 	case ETHTOOL_PHYS_ID:
-		rc = ethtool_phys_id(dev, useraddr);
+		rc = ethtool_phys_id(dev, useraddr, has_rtnl_lock);
 		break;
 	case ETHTOOL_GSTATS:
 		rc = ethtool_get_stats(dev, useraddr);
@@ -3540,12 +3575,81 @@ __dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr,
 	if (dev->ethtool_ops->complete)
 		dev->ethtool_ops->complete(dev);
 
-	if (old_features != dev->features)
-		netdev_features_change(dev);
+	switch (ethcmd) {
+	case ETHTOOL_PHYS_ID:
+		/* Don't check features if operation drops the locks.
+		 * Someone else may have changed features in parallel.
+		 */
+		break;
+	default:
+		if (old_features != dev->features) {
+			if (has_rtnl_lock)
+				netdev_features_change(dev);
+			else
+				netdev_WARN(dev, "ethtool cmd %u changed features without rtnl_lock", ethcmd);
+		}
+	}
 out:
 	if (dev->dev.parent)
 		pm_runtime_put(dev->dev.parent);
+
+	return rc;
+}
+
+/* Commands that may toggle dev->features in net/ethtool/ioctl.c and so
+ * call into __netdev_update_features(), which still requires rtnl_lock.
+ * Driver-decided SET commands that may chain into rtnl-only helpers are
+ * covered by ethtool_ioctl_needs_rtnl()/ETHTOOL_OP_NEEDS_RTNL_*.
+ */
+static bool ethtool_cmd_changes_features(u32 ethcmd)
+{
+	switch (ethcmd) {
+	case ETHTOOL_SFEATURES:
+	case ETHTOOL_SFLAGS:
+	case ETHTOOL_STXCSUM:
+	case ETHTOOL_SRXCSUM:
+	case ETHTOOL_SSG:
+	case ETHTOOL_STSO:
+	case ETHTOOL_SGSO:
+	case ETHTOOL_SGRO:
+		return true;
+	}
+	return false;
+}
+
+static int
+__dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr,
+	      u32 ethcmd, struct ethtool_devlink_compat *devlink_state)
+{
+	netdevice_tracker dev_tracker;
+	struct net_device *dev;
+	bool need_rtnl;
+	int rc;
+
+	dev = netdev_get_by_name(net, ifr->ifr_name, &dev_tracker, GFP_KERNEL);
+	if (!dev)
+		return -ENODEV;
+
+	need_rtnl = !netdev_need_ops_lock(dev) ||
+		    ethtool_cmd_changes_features(ethcmd) ||
+		    ethtool_ioctl_needs_rtnl(dev, ethcmd);
+	if (need_rtnl)
+		rtnl_lock();
+	netdev_lock_ops(dev);
+	if (dev->reg_state > NETREG_REGISTERED ||
+	    dev->moving_ns || !net_eq(dev_net(dev), net)) {
+		rc = -ENODEV;
+		goto exit_ops_unlock;
+	}
+
+	rc = dev_ethtool_locked(net, dev, useraddr, ethcmd, devlink_state,
+				need_rtnl);
+
+exit_ops_unlock:
 	netdev_unlock_ops(dev);
+	if (need_rtnl)
+		rtnl_unlock();
+	netdev_put(dev, &dev_tracker);
 
 	return rc;
 }
@@ -3573,9 +3677,7 @@ int dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr)
 		break;
 	}
 
-	rtnl_lock();
 	rc = __dev_ethtool(net, ifr, useraddr, ethcmd, state);
-	rtnl_unlock();
 	if (rc)
 		goto exit_free;
 

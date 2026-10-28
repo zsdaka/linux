@@ -310,8 +310,10 @@ efault_end:
 
 static struct kmem_cache *sock_inode_cachep __ro_after_init;
 
+static struct simple_xattr_cache sockfs_xa_cache;
+
 struct sockfs_inode {
-	struct simple_xattrs *xattrs;
+	struct list_head xattrs;
 	struct simple_xattr_limits xattr_limits;
 	struct socket_alloc;
 };
@@ -328,7 +330,7 @@ static struct inode *sock_alloc_inode(struct super_block *sb)
 	si = alloc_inode_sb(sb, sock_inode_cachep, GFP_KERNEL);
 	if (!si)
 		return NULL;
-	si->xattrs = NULL;
+	INIT_LIST_HEAD_RCU(&si->xattrs);
 	simple_xattr_limits_init(&si->xattr_limits);
 
 	init_waitqueue_head(&si->socket.wq.wait);
@@ -347,12 +349,8 @@ static struct inode *sock_alloc_inode(struct super_block *sb)
 static void sock_evict_inode(struct inode *inode)
 {
 	struct sockfs_inode *si = SOCKFS_I(inode);
-	struct simple_xattrs *xattrs = si->xattrs;
 
-	if (xattrs) {
-		simple_xattrs_free(xattrs, NULL);
-		kfree(xattrs);
-	}
+	simple_xattrs_free(&sockfs_xa_cache, &si->xattrs, NULL);
 	clear_inode(inode);
 }
 
@@ -424,7 +422,7 @@ static const struct xattr_handler sockfs_xattr_handler = {
 };
 
 static int sockfs_security_xattr_set(const struct xattr_handler *handler,
-				     struct mnt_idmap *idmap,
+				     const struct mnt_idmap *idmap,
 				     struct dentry *dentry, struct inode *inode,
 				     const char *suffix, const void *value,
 				     size_t size, int flags)
@@ -443,30 +441,21 @@ static int sockfs_user_xattr_get(const struct xattr_handler *handler,
 				 const char *suffix, void *value, size_t size)
 {
 	const char *name = xattr_full_name(handler, suffix);
-	struct simple_xattrs *xattrs;
+	struct sockfs_inode *si = SOCKFS_I(inode);
 
-	xattrs = READ_ONCE(SOCKFS_I(inode)->xattrs);
-	if (!xattrs)
-		return -ENODATA;
-
-	return simple_xattr_get(xattrs, name, value, size);
+	return simple_xattr_get(&sockfs_xa_cache, &si->xattrs, name, value, size);
 }
 
 static int sockfs_user_xattr_set(const struct xattr_handler *handler,
-				 struct mnt_idmap *idmap,
+				 const struct mnt_idmap *idmap,
 				 struct dentry *dentry, struct inode *inode,
 				 const char *suffix, const void *value,
 				 size_t size, int flags)
 {
 	const char *name = xattr_full_name(handler, suffix);
 	struct sockfs_inode *si = SOCKFS_I(inode);
-	struct simple_xattrs *xattrs;
 
-	xattrs = simple_xattrs_lazy_alloc(&si->xattrs, value, flags);
-	if (IS_ERR_OR_NULL(xattrs))
-		return PTR_ERR(xattrs);
-
-	return simple_xattr_set_limited(xattrs, &si->xattr_limits,
+	return simple_xattr_set_limited(&sockfs_xa_cache, &si->xattrs, &si->xattr_limits,
 					name, value, size, flags);
 }
 
@@ -475,6 +464,31 @@ static const struct xattr_handler sockfs_user_xattr_handler = {
 	.get = sockfs_user_xattr_get,
 	.set = sockfs_user_xattr_set,
 };
+
+/**
+ * sock_read_xattr - read a user.* xattr from a socket's sockfs inode
+ * @sock: socket whose inode holds the xattr
+ * @name: full xattr name, e.g. "user.bpf_test"
+ * @value: output buffer
+ * @size: size of @value in bytes
+ *
+ * SOCK_INODE() is valid only for sockfs sockets; sock_from_file() rejects
+ * anything else (e.g. tun, tap).
+ * Lockless: simple_xattr_get() looks up the value under RCU, no inode lock.
+ *
+ * Return: length of the value on success, a negative errno on error.
+ */
+int sock_read_xattr(struct socket *sock, const char *name, void *value, size_t size)
+{
+	struct file *file = sock->file;
+	struct sockfs_inode *si;
+
+	if (!file || sock_from_file(file) != sock)
+		return -EOPNOTSUPP;
+
+	si = SOCKFS_I(SOCK_INODE(sock));
+	return simple_xattr_get(&sockfs_xa_cache, &si->xattrs, name, value, size);
+}
 
 static const struct xattr_handler * const sockfs_xattr_handlers[] = {
 	&sockfs_xattr_handler,
@@ -635,8 +649,7 @@ static ssize_t sockfs_listxattr(struct dentry *dentry, char *buffer,
 	struct sockfs_inode *si = SOCKFS_I(d_inode(dentry));
 	ssize_t len, used;
 
-	len = simple_xattr_list(d_inode(dentry), READ_ONCE(si->xattrs),
-				buffer, size);
+	len = simple_xattr_list(d_inode(dentry), &si->xattrs, buffer, size);
 	if (len < 0)
 		return len;
 
@@ -657,7 +670,7 @@ static ssize_t sockfs_listxattr(struct dentry *dentry, char *buffer,
 	return used;
 }
 
-static int sockfs_setattr(struct mnt_idmap *idmap,
+static int sockfs_setattr(const struct mnt_idmap *idmap,
 			  struct dentry *dentry, struct iattr *iattr)
 {
 	int err = simple_setattr(&nop_mnt_idmap, dentry, iattr);
@@ -787,7 +800,10 @@ static inline int sock_sendmsg_nosec(struct socket *sock, struct msghdr *msg)
 	int ret = INDIRECT_CALL_INET(READ_ONCE(sock->ops)->sendmsg, inet6_sendmsg,
 				     inet_sendmsg, sock, msg,
 				     msg_data_left(msg));
-	BUG_ON(ret == -EIOCBQUEUED);
+	if (unlikely(ret == -EIOCBQUEUED)) {
+		DEBUG_NET_WARN_ON_ONCE(1);
+		ret = -EIO;
+	}
 
 	if (trace_sock_send_length_enabled())
 		call_trace_sock_send_length(sock->sk, ret, 0);
@@ -852,12 +868,13 @@ EXPORT_SYMBOL(kernel_sendmsg);
 
 static bool skb_is_err_queue(const struct sk_buff *skb)
 {
-	/* pkt_type of skbs enqueued on the error queue are set to
-	 * PACKET_OUTGOING in skb_set_err_queue(). This is only safe to do
-	 * in recvmsg, since skbs received on a local socket will never
-	 * have a pkt_type of PACKET_OUTGOING.
+	/* Error-queue skbs are marked as PACKET_OUTGOING in
+	 * skb_set_err_queue() and use the destructor installed by
+	 * sock_queue_err_skb(). PACKET_OUTGOING alone is not unique:
+	 * AF_PACKET outgoing taps use the same pkt_type.
 	 */
-	return skb->pkt_type == PACKET_OUTGOING;
+	return skb->pkt_type == PACKET_OUTGOING &&
+	       skb->destructor == sock_rmem_free;
 }
 
 /* On transmit, software and hardware timestamps are returned independently.
@@ -1213,8 +1230,7 @@ static ssize_t sock_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
 	struct socket *sock = file->private_data;
-	struct msghdr msg = {.msg_iter = *to,
-			     .msg_iocb = iocb};
+	struct msghdr msg = {.msg_iter = *to};
 	ssize_t res;
 
 	if (file->f_flags & O_NONBLOCK || (iocb->ki_flags & IOCB_NOWAIT))
@@ -1235,8 +1251,7 @@ static ssize_t sock_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
 	struct socket *sock = file->private_data;
-	struct msghdr msg = {.msg_iter = *from,
-			     .msg_iocb = iocb};
+	struct msghdr msg = {.msg_iter = *from};
 	ssize_t res;
 
 	if (iocb->ki_pos != 0)
@@ -1839,10 +1854,7 @@ int __sys_socketpair(int family, int type, int protocol, int __user *usockvec)
 	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
 		flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
 
-	/*
-	 * reserve descriptors and make sure we won't fail
-	 * to return them to userland.
-	 */
+	/* Reserve both descriptors before creating the sockets. */
 	fd1 = get_unused_fd_flags(flags);
 	if (unlikely(fd1 < 0))
 		return fd1;
@@ -1852,14 +1864,6 @@ int __sys_socketpair(int family, int type, int protocol, int __user *usockvec)
 		put_unused_fd(fd1);
 		return fd2;
 	}
-
-	err = put_user(fd1, &usockvec[0]);
-	if (err)
-		goto out;
-
-	err = put_user(fd2, &usockvec[1]);
-	if (err)
-		goto out;
 
 	/*
 	 * Obtain the first socket and check if the underlying protocol
@@ -1900,6 +1904,16 @@ int __sys_socketpair(int family, int type, int protocol, int __user *usockvec)
 	newfile2 = sock_alloc_file(sock2, flags, NULL);
 	if (IS_ERR(newfile2)) {
 		err = PTR_ERR(newfile2);
+		fput(newfile1);
+		goto out;
+	}
+
+	/* Publish the descriptors now that it shouldn't fail. */
+	err = put_user(fd1, &usockvec[0]);
+	if (!err)
+		err = put_user(fd2, &usockvec[1]);
+	if (err) {
+		fput(newfile2);
 		fput(newfile1);
 		goto out;
 	}
@@ -2089,7 +2103,7 @@ static int __sys_accept4_file(struct file *file, struct sockaddr __user *upeer_s
  *	we open the socket then return an error.
  *
  *	1003.1g adds the ability to recvmsg() to query connection pending
- *	status to recvmsg. We need to add that support in a way thats
+ *	status. We need to add that support in a way that's
  *	clean when we restructure accept also.
  */
 
@@ -2116,6 +2130,20 @@ SYSCALL_DEFINE3(accept, int, fd, struct sockaddr __user *, upeer_sockaddr,
 	return __sys_accept4(fd, upeer_sockaddr, upeer_addrlen, 0);
 }
 
+int connect_socket(struct socket *sock, struct sockaddr_storage *address,
+		   int addrlen, int flags)
+{
+	int err;
+
+	err = security_socket_connect(sock, (struct sockaddr *)address,
+				      addrlen);
+	if (err)
+		return err;
+
+	return READ_ONCE(sock->ops)->connect(sock, (struct sockaddr_unsized *)address,
+					     addrlen, flags);
+}
+
 /*
  *	Attempt to connect to a socket with the server address.  The address
  *	is in user space so we verify it is OK and move it to kernel space.
@@ -2132,23 +2160,13 @@ int __sys_connect_file(struct file *file, struct sockaddr_storage *address,
 		       int addrlen, int file_flags)
 {
 	struct socket *sock;
-	int err;
 
 	sock = sock_from_file(file);
-	if (!sock) {
-		err = -ENOTSOCK;
-		goto out;
-	}
+	if (!sock)
+		return -ENOTSOCK;
 
-	err =
-	    security_socket_connect(sock, (struct sockaddr *)address, addrlen);
-	if (err)
-		goto out;
-
-	err = READ_ONCE(sock->ops)->connect(sock, (struct sockaddr_unsized *)address,
-					    addrlen, sock->file->f_flags | file_flags);
-out:
-	return err;
+	return connect_socket(sock, address, addrlen,
+			      sock->file->f_flags | file_flags);
 }
 
 int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
@@ -2421,8 +2439,8 @@ INDIRECT_CALLABLE_DECLARE(bool tcp_bpf_bypass_getsockopt(int level,
  * It is important to remember that both iov points to the same data, but,
  * .iter_in is read-only and .iter_out is write-only by the protocol callbacks
  */
-static int sockptr_to_sockopt(sockopt_t *opt, sockptr_t optval,
-			      sockptr_t optlen, struct kvec *kvec)
+int sockptr_to_sockopt(sockopt_t *opt, sockptr_t optval,
+		       sockptr_t optlen, struct kvec *kvec)
 {
 	int koptlen;
 
@@ -2612,7 +2630,6 @@ int __copy_msghdr(struct msghdr *kmsg,
 	if (msg->msg_iovlen > UIO_MAXIOV)
 		return -EMSGSIZE;
 
-	kmsg->msg_iocb = NULL;
 	kmsg->msg_ubuf = NULL;
 	return 0;
 }
@@ -2835,7 +2852,7 @@ int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
 					     &msg_sys, flags, &used_address, MSG_EOR);
 			if (err < 0)
 				break;
-			err = __put_user(err, &compat_entry->msg_len);
+			err = put_user(err, &compat_entry->msg_len);
 			++compat_entry;
 		} else {
 			err = ___sys_sendmsg(sock,
@@ -2928,16 +2945,16 @@ static int ____sys_recvmsg(struct socket *sock, struct msghdr *msg_sys,
 		if (err < 0)
 			goto out;
 	}
-	err = __put_user((msg_sys->msg_flags & ~MSG_CMSG_COMPAT),
-			 COMPAT_FLAGS(msg));
+	err = put_user((msg_sys->msg_flags & ~MSG_CMSG_COMPAT),
+		       COMPAT_FLAGS(msg));
 	if (err)
 		goto out;
 	if (MSG_CMSG_COMPAT & flags)
-		err = __put_user((unsigned long)msg_sys->msg_control - cmsg_ptr,
-				 &msg_compat->msg_controllen);
+		err = put_user((unsigned long)msg_sys->msg_control - cmsg_ptr,
+			       &msg_compat->msg_controllen);
 	else
-		err = __put_user((unsigned long)msg_sys->msg_control - cmsg_ptr,
-				 &msg->msg_controllen);
+		err = put_user((unsigned long)msg_sys->msg_control - cmsg_ptr,
+			       &msg->msg_controllen);
 	if (err)
 		goto out;
 	err = len;
@@ -3049,7 +3066,7 @@ static int do_recvmmsg(int fd, struct mmsghdr __user *mmsg,
 					     datagrams);
 			if (err < 0)
 				break;
-			err = __put_user(err, &compat_entry->msg_len);
+			err = put_user(err, &compat_entry->msg_len);
 			++compat_entry;
 		} else {
 			err = ___sys_recvmsg(sock,

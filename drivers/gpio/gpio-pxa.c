@@ -268,7 +268,7 @@ static int pxa_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
 	spin_lock_irqsave(&gpio_lock, flags);
 
 	value = readl_relaxed(base + GPDR_OFFSET);
-	if (__gpio_is_inverted(chip->base + offset))
+	if (__gpio_is_inverted(offset))
 		value |= mask;
 	else
 		value &= ~mask;
@@ -297,7 +297,7 @@ static int pxa_gpio_direction_output(struct gpio_chip *chip,
 	spin_lock_irqsave(&gpio_lock, flags);
 
 	tmp = readl_relaxed(base + GPDR_OFFSET);
-	if (__gpio_is_inverted(chip->base + offset))
+	if (__gpio_is_inverted(offset))
 		tmp &= ~mask;
 	else
 		tmp |= mask;
@@ -406,7 +406,7 @@ static int pxa_gpio_irq_type(struct irq_data *d, unsigned int type)
 		if (__gpio_is_occupied(pchip, gpio))
 			return 0;
 
-		type = IRQ_TYPE_EDGE_RISING | IRQ_TYPE_EDGE_FALLING;
+		type = IRQ_TYPE_EDGE_BOTH;
 	}
 
 	gpdr = readl_relaxed(c->regbase + GPDR_OFFSET);
@@ -708,15 +708,15 @@ static int pxa_gpio_probe(struct platform_device *pdev)
 }
 
 static const struct platform_device_id gpio_id_table[] = {
-	{ "pxa25x-gpio",	(unsigned long)&pxa25x_id },
-	{ "pxa26x-gpio",	(unsigned long)&pxa26x_id },
-	{ "pxa27x-gpio",	(unsigned long)&pxa27x_id },
-	{ "pxa3xx-gpio",	(unsigned long)&pxa3xx_id },
-	{ "pxa93x-gpio",	(unsigned long)&pxa93x_id },
-	{ "mmp-gpio",		(unsigned long)&mmp_id },
-	{ "mmp2-gpio",		(unsigned long)&mmp2_id },
-	{ "pxa1928-gpio",	(unsigned long)&pxa1928_id },
-	{ },
+	{ .name = "pxa25x-gpio",	.driver_data = (unsigned long)&pxa25x_id },
+	{ .name = "pxa26x-gpio",	.driver_data = (unsigned long)&pxa26x_id },
+	{ .name = "pxa27x-gpio",	.driver_data = (unsigned long)&pxa27x_id },
+	{ .name = "pxa3xx-gpio",	.driver_data = (unsigned long)&pxa3xx_id },
+	{ .name = "pxa93x-gpio",	.driver_data = (unsigned long)&pxa93x_id },
+	{ .name = "mmp-gpio",		.driver_data = (unsigned long)&mmp_id },
+	{ .name = "mmp2-gpio",		.driver_data = (unsigned long)&mmp2_id },
+	{ .name = "pxa1928-gpio",	.driver_data = (unsigned long)&pxa1928_id },
+	{ }
 };
 
 static struct platform_driver pxa_gpio_driver = {

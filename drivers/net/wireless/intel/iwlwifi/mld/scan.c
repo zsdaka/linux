@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2024-2025 Intel Corporation
+ * Copyright (C) 2024-2026 Intel Corporation
  */
 #include <linux/crc32.h>
 
@@ -236,6 +236,12 @@ iwl_mld_scan_type iwl_mld_get_scan_type(struct iwl_mld *mld,
 	if ((load == IWL_MLD_TRAFFIC_HIGH || data->global_low_latency) &&
 	    vif->type != NL80211_IFTYPE_P2P_DEVICE)
 		return IWL_SCAN_TYPE_FRAGMENTED;
+
+	/* While associated to MLD AP with active EMLSR, set all scan
+	 * operations as fast-balance scans.
+	 */
+	if (iwl_mld_emlsr_active(vif))
+		return IWL_SCAN_TYPE_FAST_BALANCE;
 
 	/* In case of DCM with P2P GO set all scan requests as
 	 * fast-balance scan
@@ -1675,7 +1681,8 @@ out:
 static int
 iwl_mld_scan_abort(struct iwl_mld *mld, int type, int uid, bool *wait)
 {
-	enum iwl_umac_scan_abort_status status;
+	enum iwl_umac_scan_abort_status status =
+		IWL_UMAC_SCAN_ABORT_STATUS_NOT_FOUND;
 	int ret;
 
 	*wait = true;
@@ -1985,7 +1992,14 @@ void iwl_mld_int_mlo_scan(struct iwl_mld *mld, struct ieee80211_vif *vif)
 void iwl_mld_handle_scan_iter_complete_notif(struct iwl_mld *mld,
 					     struct iwl_rx_packet *pkt)
 {
-	struct iwl_umac_scan_iter_complete_notif *notif = (void *)pkt->data;
+	/*
+	 * The v3 notification is a superset of v2, so the fields that are
+	 * common to both versions can always be read from the v3 layout.
+	 */
+	const struct iwl_umac_scan_iter_complete_notif *notif =
+		(const void *)pkt->data;
+	u8 notif_ver = iwl_fw_lookup_notif_ver(mld->fw, LEGACY_GROUP,
+					       SCAN_ITERATION_COMPLETE_UMAC, 2);
 	u32 uid = __le32_to_cpu(notif->uid);
 
 	if (IWL_FW_CHECK(mld, uid >= ARRAY_SIZE(mld->scan.uid_status),
@@ -1998,6 +2012,12 @@ void iwl_mld_handle_scan_iter_complete_notif(struct iwl_mld *mld,
 	IWL_DEBUG_SCAN(mld,
 		       "UMAC Scan iteration complete: status=0x%x scanned_channels=%d\n",
 		       notif->status, notif->scanned_channels);
+
+	if (notif_ver >= 3)
+		IWL_DEBUG_SCAN(mld,
+			       "UMAC Scan iteration complete: EBS=%s, EBS channel status=0x%llx\n",
+			       iwl_mld_scan_ebs_status_str(notif->ebs_status),
+			       le64_to_cpu(notif->ebs_channel_status));
 
 	if (mld->scan.pass_all_sched_res == SCHED_SCAN_PASS_ALL_STATE_FOUND) {
 		IWL_DEBUG_SCAN(mld, "Pass all scheduled scan results found\n");
@@ -2253,6 +2273,7 @@ void iwl_mld_handle_channel_survey_notif(struct iwl_mld *mld,
 	/* Times are all in ms */
 	info->time = le32_to_cpu(notif->active_time);
 	info->time_busy = le32_to_cpu(notif->busy_time);
+	info->time_rx = le32_to_cpu(notif->rx_time);
 	info->noise =
 		iwl_average_neg_dbm(notif->noise, ARRAY_SIZE(notif->noise));
 }
@@ -2301,9 +2322,11 @@ int iwl_mld_mac80211_get_survey(struct ieee80211_hw *hw, int idx,
 			/* Found (the next) channel to report */
 			survey->channel = &sband->channels[per_band_idx];
 			survey->filled = SURVEY_INFO_TIME |
-					 SURVEY_INFO_TIME_BUSY;
+					 SURVEY_INFO_TIME_BUSY |
+					 SURVEY_INFO_TIME_RX;
 			survey->time = info->time;
 			survey->time_busy = info->time_busy;
+			survey->time_rx = info->time_rx;
 			survey->noise = info->noise;
 			if (survey->noise < 0)
 				survey->filled |= SURVEY_INFO_NOISE_DBM;

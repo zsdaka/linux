@@ -36,7 +36,7 @@
 
 #include "internal.h"
 
-int do_truncate(struct mnt_idmap *idmap, struct dentry *dentry,
+int do_truncate(const struct mnt_idmap *idmap, struct dentry *dentry,
 		loff_t length, unsigned int time_attrs, struct file *filp)
 {
 	int ret;
@@ -72,7 +72,7 @@ int do_truncate(struct mnt_idmap *idmap, struct dentry *dentry,
 
 int vfs_truncate(const struct path *path, loff_t length)
 {
-	struct mnt_idmap *idmap;
+	const struct mnt_idmap *idmap;
 	struct inode *inode;
 	int error;
 
@@ -570,9 +570,12 @@ retry:
 
 SYSCALL_DEFINE1(fchdir, unsigned int, fd)
 {
-	CLASS(fd_raw, f)(fd);
 	int error;
 
+	if ((int)fd == FD_FAILFS_ROOT)
+		return failfs_current_chdir();
+
+	CLASS(fd_raw, f)(fd);
 	if (fd_empty(f))
 		return -EBADF;
 
@@ -612,6 +615,52 @@ dput_and_out:
 		lookup_flags |= LOOKUP_REVAL;
 		goto retry;
 	}
+	return error;
+}
+
+SYSCALL_DEFINE2(fchroot, int, fd, unsigned int, flags)
+{
+	struct path path;
+	int error;
+
+	if (flags)
+		return -EINVAL;
+
+	if (fd == FD_FAILFS_ROOT) {
+		if (!ns_capable(current_user_ns(), CAP_SYS_CHROOT)) {
+			if (!task_no_new_privs(current))
+				return -EPERM;
+			/* A shared fs_struct lets a sibling exec setuid past the check above. */
+			if (current->fs->users != 1)
+				return -EINVAL;
+			/* Moving the root to failfs lifts the old root's ".." barrier. */
+			if (current_chrooted())
+				return -EPERM;
+		}
+		failfs_get_root(&path);
+	} else {
+		CLASS(fd_raw, f)(fd);
+		if (fd_empty(f))
+			return -EBADF;
+
+		if (!d_can_lookup(fd_file(f)->f_path.dentry))
+			return -ENOTDIR;
+
+		error = file_permission(fd_file(f), MAY_EXEC | MAY_CHDIR);
+		if (error)
+			return error;
+
+		if (!ns_capable(current_user_ns(), CAP_SYS_CHROOT))
+			return -EPERM;
+
+		path = fd_file(f)->f_path;
+		path_get(&path);
+	}
+
+	error = security_path_chroot(&path);
+	if (!error)
+		set_fs_root(current->fs, &path);
+	path_put(&path);
 	return error;
 }
 
@@ -738,7 +787,7 @@ static inline bool setattr_vfsgid(struct iattr *attr, kgid_t kgid)
 
 int chown_common(const struct path *path, uid_t user, gid_t group)
 {
-	struct mnt_idmap *idmap;
+	const struct mnt_idmap *idmap;
 	struct user_namespace *fs_userns;
 	struct inode *inode = path->dentry->d_inode;
 	struct delegated_inode delegated_inode = { };
@@ -882,6 +931,11 @@ cleanup_inode:
 	return error;
 }
 
+/*
+ * Populate struct file
+ *
+ * NOTE: it assumes f_path is populated and consumes the caller's reference.
+ */
 static int do_dentry_open(struct file *f,
 			  int (*open)(struct inode *, struct file *))
 {
@@ -889,7 +943,6 @@ static int do_dentry_open(struct file *f,
 	struct inode *inode = f->f_path.dentry->d_inode;
 	int error;
 
-	path_get(&f->f_path);
 	f->f_inode = inode;
 	f->f_mapping = inode->i_mapping;
 	f->f_wb_err = filemap_sample_wb_err(f->f_mapping);
@@ -960,40 +1013,13 @@ static int do_dentry_open(struct file *f,
 	if (f->f_mapping->a_ops && f->f_mapping->a_ops->direct_IO)
 		f->f_mode |= FMODE_CAN_ODIRECT;
 
-	f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
+	f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | __O_REGULAR);
 	f->f_iocb_flags = iocb_flags(f);
 
 	file_ra_state_init(&f->f_ra, f->f_mapping->host->i_mapping);
 
 	if ((f->f_flags & O_DIRECT) && !(f->f_mode & FMODE_CAN_ODIRECT))
 		return -EINVAL;
-
-	/*
-	 * XXX: Huge page cache doesn't support writing yet. Drop all page
-	 * cache for this file before processing writes.
-	 */
-	if (f->f_mode & FMODE_WRITE) {
-		/*
-		 * Depends on full fence from get_write_access() to synchronize
-		 * against collapse_file() regarding i_writecount and nr_thps
-		 * updates. Ensures subsequent insertion of THPs into the page
-		 * cache will fail.
-		 */
-		if (filemap_nr_thps(inode->i_mapping)) {
-			struct address_space *mapping = inode->i_mapping;
-
-			filemap_invalidate_lock(inode->i_mapping);
-			/*
-			 * unmap_mapping_range just need to be called once
-			 * here, because the private pages is not need to be
-			 * unmapped mapping (e.g. data segment of dynamic
-			 * shared libraries here).
-			 */
-			unmap_mapping_range(mapping, 0, 0, 0);
-			truncate_inode_pages(mapping, 0);
-			filemap_invalidate_unlock(inode->i_mapping);
-		}
-	}
 
 	return 0;
 
@@ -1033,6 +1059,7 @@ int finish_open(struct file *file, struct dentry *dentry,
 	BUG_ON(file->f_mode & FMODE_OPENED); /* once it's opened, it's opened */
 
 	file->__f_path.dentry = dentry;
+	path_get(&file->f_path);
 	return do_dentry_open(file, open);
 }
 EXPORT_SYMBOL(finish_open);
@@ -1076,6 +1103,7 @@ int vfs_open(const struct path *path, struct file *file)
 	int ret;
 
 	file->__f_path = *path;
+	path_get(&file->f_path);
 	ret = do_dentry_open(file, NULL);
 	if (!ret) {
 		/*
@@ -1083,6 +1111,25 @@ int vfs_open(const struct path *path, struct file *file)
 		 * fsnotify_close(), so we need fsnotify_open() here for
 		 * symmetry.
 		 */
+		fsnotify_open(file);
+	}
+	return ret;
+}
+
+/**
+ * vfs_open_consume - open the file at the given path and consume the reference
+ * @path: path to open
+ * @file: newly allocated file with f_flag initialized
+ */
+int vfs_open_consume(struct path *path, struct file *file)
+{
+	int ret;
+
+	file->__f_path = *path;
+	path->mnt = NULL;
+	path->dentry = NULL;
+	ret = do_dentry_open(file, NULL);
+	if (!ret) {
 		fsnotify_open(file);
 	}
 	return ret;
@@ -1158,7 +1205,7 @@ struct file *kernel_file_open(const struct path *path, int flags,
 EXPORT_SYMBOL_GPL(kernel_file_open);
 
 #define WILL_CREATE(flags)	(flags & (O_CREAT | __O_TMPFILE))
-#define O_PATH_FLAGS		(O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC)
+#define O_PATH_FLAGS		(O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC | O_EMPTYPATH)
 
 inline struct open_how build_open_how(int flags, umode_t mode)
 {
@@ -1184,7 +1231,15 @@ inline int build_open_flags(const struct open_how *how, struct open_flags *op)
 	int acc_mode = ACC_MODE(flags);
 
 	BUILD_BUG_ON_MSG(upper_32_bits(VALID_OPEN_FLAGS),
-			 "struct open_flags doesn't yet handle flags > 32 bits");
+			 "VALID_OPEN_FLAGS must fit in 32 bits");
+	/* The whole point: OPENAT2_REGULAR must be unrepresentable in int. */
+	BUILD_BUG_ON_MSG(!upper_32_bits(OPENAT2_REGULAR),
+			 "OPENAT2_REGULAR must live in the upper 32 bits of open_how::flags");
+	/* Prevent a future bit collision between UAPI and internal carrier. */
+	BUILD_BUG_ON_MSG(OPENAT2_REGULAR & VALID_OPEN_FLAGS,
+			 "OPENAT2_REGULAR must not alias any open()/openat() flag");
+	BUILD_BUG_ON_MSG(__O_REGULAR & VALID_OPENAT2_FLAGS,
+			 "__O_REGULAR must not alias any user-visible flag");
 
 	/*
 	 * Strip flags that aren't relevant in determining struct open_flags.
@@ -1196,7 +1251,7 @@ inline int build_open_flags(const struct open_how *how, struct open_flags *op)
 	 * values before calling build_open_flags(), but openat2(2) checks all
 	 * of its arguments.
 	 */
-	if (flags & ~VALID_OPEN_FLAGS)
+	if (flags & ~VALID_OPENAT2_FLAGS)
 		return -EINVAL;
 	if (how->resolve & ~VALID_RESOLVE_FLAGS)
 		return -EINVAL;
@@ -1236,6 +1291,14 @@ inline int build_open_flags(const struct open_how *how, struct open_flags *op)
 		if (!(acc_mode & MAY_WRITE))
 			return -EINVAL;
 	}
+	/*
+	 * Asking to open a directory and a regular file at the same time is
+	 * contradictory.
+	 */
+	if ((flags & (O_DIRECTORY | OPENAT2_REGULAR)) ==
+	    (O_DIRECTORY | OPENAT2_REGULAR))
+		return -EINVAL;
+
 	if (flags & O_PATH) {
 		/* O_PATH only permits certain other flags to be set. */
 		if (flags & ~O_PATH_FLAGS)
@@ -1251,6 +1314,19 @@ inline int build_open_flags(const struct open_how *how, struct open_flags *op)
 	 */
 	if (flags & __O_SYNC)
 		flags |= O_DSYNC;
+
+	/*
+	 * Translate the upper-32-bit UAPI bit OPENAT2_REGULAR into the
+	 * kernel-internal lower-32-bit __O_REGULAR carrier so the bit
+	 * survives the assignment to op->open_flag (an int) below and the
+	 * subsequent flow through f->f_flags (unsigned int) and the
+	 * i_op->atomic_open() callback (unsigned). do_dentry_open() strips
+	 * __O_REGULAR before the file becomes visible to userspace.
+	 */
+	if (flags & OPENAT2_REGULAR) {
+		flags &= ~OPENAT2_REGULAR;
+		flags |= __O_REGULAR;
+	}
 
 	op->open_flag = flags;
 
@@ -1279,6 +1355,8 @@ inline int build_open_flags(const struct open_how *how, struct open_flags *op)
 		lookup_flags |= LOOKUP_DIRECTORY;
 	if (!(flags & O_NOFOLLOW))
 		lookup_flags |= LOOKUP_FOLLOW;
+	if (flags & O_EMPTYPATH)
+		lookup_flags |= LOOKUP_EMPTY;
 
 	if (how->resolve & RESOLVE_NO_XDEV)
 		lookup_flags |= LOOKUP_NO_XDEV;
@@ -1360,7 +1438,7 @@ static int do_sys_openat2(int dfd, const char __user *filename,
 	if (unlikely(err))
 		return err;
 
-	CLASS(filename, name)(filename);
+	CLASS(filename_flags, name)(filename, op.lookup_flags);
 	return FD_ADD(how->flags, do_file_open(dfd, name, &op));
 }
 
@@ -1484,6 +1562,19 @@ int filp_close(struct file *filp, fl_owner_t id)
 }
 EXPORT_SYMBOL(filp_close);
 
+/* Like filp_close() but the last reference is put right here. */
+int filp_close_sync(struct file *filp, fl_owner_t id)
+{
+	int retval;
+
+	/* Kernel threads must never put their final reference here. */
+	VFS_WARN_ON_ONCE(current->flags & PF_KTHREAD);
+	retval = filp_flush(filp, id);
+	fput_close_sync(filp);
+
+	return retval;
+}
+
 /*
  * Careful here! We test whether the file pointer is NULL before
  * releasing the fd. This ensures that one clone task can't release
@@ -1498,13 +1589,11 @@ SYSCALL_DEFINE1(close, unsigned int, fd)
 	if (!file)
 		return -EBADF;
 
-	retval = filp_flush(file, current->files);
-
 	/*
 	 * We're returning to user space. Don't bother
 	 * with any delayed fput() cases.
 	 */
-	fput_close_sync(file);
+	retval = filp_close_sync(file, current->files);
 
 	if (likely(retval == 0))
 		return 0;

@@ -58,8 +58,8 @@ bool dcn42_program_hpd_filter(struct link_encoder *enc, int delay_on_connect_in_
 	struct dcn10_link_encoder *enc10 = TO_DCN10_LINK_ENC(enc);
 
 	HPD_REG_SET_2(DC_HPD_TOGGLE_FILT_CNTL, 0,
-			DC_HPD_CONNECT_INT_DELAY, delay_on_connect_in_ms,
-			DC_HPD_DISCONNECT_INT_DELAY, delay_on_disconnect_in_ms);
+			DC_HPD_CONNECT_INT_DELAY, delay_on_connect_in_ms / 10,
+			DC_HPD_DISCONNECT_INT_DELAY, delay_on_disconnect_in_ms / 10);
 
 	return true;
 }
@@ -93,6 +93,15 @@ static const struct link_encoder_funcs dcn42_link_enc_funcs = {
 	.get_dig_mode = dcn401_get_dig_mode,
 	.is_in_alt_mode = dcn32_link_encoder_is_in_alt_mode,
 	.get_max_link_cap = dcn32_link_encoder_get_max_link_cap,
+	.dpcstx_set_order_invert_18_bit = NULL,
+	.set_phy_source = NULL,
+	.dpcs_initialize_phy = NULL,
+	.dpcs_configure_phypll = NULL,
+	.dpcs_configure_dpcs = NULL,
+	.dpcs_enable_dpcs = NULL,
+	.prog_eq_setting = dpcs401_program_eq_setting,
+	.get_txffe = dpcs401_get_txffe,
+	.set_txffe = dpcs401_set_txffe,
 	.set_dio_phy_mux = dcn31_link_encoder_set_dio_phy_mux,
 	.enable_dpia_output = dcn35_link_encoder_enable_dpia_output,
 	.disable_dpia_output = dcn35_link_encoder_disable_dpia_output,
@@ -194,6 +203,12 @@ void dcn42_link_encoder_construct(
 		enc10->base.features.flags.bits.IS_UHBR10_CAPABLE = bp_cap_info.DP_UHBR10_EN;
 		enc10->base.features.flags.bits.IS_UHBR13_5_CAPABLE = bp_cap_info.DP_UHBR13_5_EN;
 		enc10->base.features.flags.bits.IS_UHBR20_CAPABLE = bp_cap_info.DP_UHBR20_EN;
+		enc10->base.features.flags.bits.IS_HDMI_FRL_CAPABLE =
+				bp_cap_info.FRL_8G_EN || bp_cap_info.FRL_10G_EN || bp_cap_info.FRL_12G_EN;
+		enc10->base.features.flags.bits.IS_FRL_8G_CAPABLE = bp_cap_info.FRL_8G_EN;
+		enc10->base.features.flags.bits.IS_FRL_10G_CAPABLE = bp_cap_info.FRL_10G_EN;
+		enc10->base.features.flags.bits.IS_FRL_12G_CAPABLE = bp_cap_info.FRL_12G_EN;
+		enc10->base.txffe_state = 0;
 	} else {
 		DC_LOG_WARNING("%s: Failed to get encoder_cap_info from VBIOS with error code %d!\n",
 				__func__,
@@ -202,4 +217,12 @@ void dcn42_link_encoder_construct(
 	if (enc10->base.ctx->dc->debug.hdmi20_disable) {
 		enc10->base.features.flags.bits.HDMI_6GB_EN = 0;
 	}
+	if (enc10->base.ctx->dc->config.force_hdmi21_frl_enc_enable) {
+		enc10->base.features.flags.bits.IS_HDMI_FRL_CAPABLE = 1;
+		enc10->base.features.flags.bits.IS_FRL_8G_CAPABLE = 1;
+		enc10->base.features.flags.bits.IS_FRL_10G_CAPABLE = 1;
+		enc10->base.features.flags.bits.IS_FRL_12G_CAPABLE = 1;
+	}
+
+	enc10->base.inst = (unsigned int)enc10->base.preferred_engine;
 }

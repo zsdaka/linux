@@ -393,12 +393,20 @@ static int cs42xx8_mute(struct snd_soc_dai *dai, int mute, int direction)
 	return 0;
 }
 
+static const u64 cs42xx8_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_RIGHT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A;
+
 static const struct snd_soc_dai_ops cs42xx8_dai_ops = {
 	.set_fmt	= cs42xx8_set_dai_fmt,
 	.set_sysclk	= cs42xx8_set_dai_sysclk,
 	.hw_params	= cs42xx8_hw_params,
 	.hw_free	= cs42xx8_hw_free,
 	.mute_stream	= cs42xx8_mute,
+	.auto_selectable_formats	= &cs42xx8_selectable_formats,
+	.num_auto_selectable_formats	= 1,
 	.no_capture_mute = 1,
 };
 
@@ -478,6 +486,9 @@ const struct regmap_config cs42xx8_regmap_config = {
 	.volatile_reg = cs42xx8_volatile_register,
 	.writeable_reg = cs42xx8_writeable_register,
 	.cache_type = REGCACHE_MAPLE,
+	.reg_format_endian  = REGMAP_ENDIAN_BIG,
+	.use_single_read = true,
+	.use_single_write = true,
 };
 EXPORT_SYMBOL_GPL(cs42xx8_regmap_config);
 

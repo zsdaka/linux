@@ -38,6 +38,8 @@ typedef int (*ksym_search_cmp_t)(const void *p1, const struct ksym *p2);
 int load_kallsyms(void);
 struct ksym *ksym_search(long key);
 long ksym_get_addr(const char *name);
+unsigned long long module_get_base_addr(const char *module);
+unsigned long long module_get_base_addr_sec(const char *module, const char *sec);
 
 struct ksyms *load_kallsyms_local(void);
 struct ksym *ksym_search_local(struct ksyms *ksyms, long key);
@@ -63,4 +65,5 @@ int read_build_id(const char *path, char *build_id, size_t size);
 int bpf_get_ksyms(struct ksyms **ksymsp, bool kernel);
 int bpf_get_addrs(unsigned long **addrsp, size_t *cntp, bool kernel);
 
+bool is_unsafe_function(const char *name);
 #endif

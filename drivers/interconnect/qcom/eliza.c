@@ -127,6 +127,12 @@ static struct qcom_icc_node qhs_qup2 = {
 	.buswidth = 4,
 };
 
+static struct qcom_icc_node qhs_sdc1 = {
+	.name = "qhs_sdc1",
+	.channels = 1,
+	.buswidth = 4,
+};
+
 static struct qcom_icc_node qhs_sdc2 = {
 	.name = "qhs_sdc2",
 	.channels = 1,
@@ -383,7 +389,7 @@ static struct qcom_icc_node qsm_cfg = {
 	.name = "qsm_cfg",
 	.channels = 1,
 	.buswidth = 4,
-	.num_links = 29,
+	.num_links = 30,
 	.link_nodes = { &qhs_ahb2phy0, &qhs_ahb2phy1,
 			&qhs_camera_cfg, &qhs_clk_ctl,
 			&qhs_crypto0_cfg, &qhs_display_cfg,
@@ -392,7 +398,7 @@ static struct qcom_icc_node qsm_cfg = {
 			&qhs_mss_cfg, &qhs_pcie_0_cfg,
 			&qhs_prng, &qhs_qdss_cfg,
 			&qhs_qspi, &qhs_qup1,
-			&qhs_qup2, &qhs_sdc2,
+			&qhs_qup2, &qhs_sdc1, &qhs_sdc2,
 			&qhs_tcsr, &qhs_tlmm,
 			&qhs_ufs_mem_cfg, &qhs_usb3_0,
 			&qhs_venus_cfg, &qhs_vsense_ctrl_cfg,
@@ -445,7 +451,7 @@ static struct qcom_icc_node qns_gem_noc_cnoc = {
 	.link_nodes = { &qnm_gemnoc_cnoc },
 };
 
-static struct qcom_icc_qosbox alm_gpu_tcu_qos = {
+static const struct qcom_icc_qosbox alm_gpu_tcu_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x155000 },
 	.prio = 1,
@@ -462,7 +468,7 @@ static struct qcom_icc_node alm_gpu_tcu = {
 	.link_nodes = { &qns_gem_noc_cnoc, &qns_llcc },
 };
 
-static struct qcom_icc_qosbox alm_sys_tcu_qos = {
+static const struct qcom_icc_qosbox alm_sys_tcu_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x157000 },
 	.prio = 6,
@@ -488,7 +494,7 @@ static struct qcom_icc_node chm_apps = {
 			&qns_pcie },
 };
 
-static struct qcom_icc_qosbox qnm_gpu_qos = {
+static const struct qcom_icc_qosbox qnm_gpu_qos = {
 	.num_ports = 2,
 	.port_offsets = { 0x31000, 0xb1000 },
 	.prio = 0,
@@ -505,7 +511,7 @@ static struct qcom_icc_node qnm_gpu = {
 	.link_nodes = { &qns_gem_noc_cnoc, &qns_llcc },
 };
 
-static struct qcom_icc_qosbox qnm_lpass_gemnoc_qos = {
+static const struct qcom_icc_qosbox qnm_lpass_gemnoc_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x159000 },
 	.prio = 0,
@@ -532,7 +538,7 @@ static struct qcom_icc_node qnm_mdsp = {
 			&qns_pcie },
 };
 
-static struct qcom_icc_qosbox qnm_mnoc_hf_qos = {
+static const struct qcom_icc_qosbox qnm_mnoc_hf_qos = {
 	.num_ports = 2,
 	.port_offsets = { 0x33000, 0xb3000 },
 	.prio = 0,
@@ -549,7 +555,7 @@ static struct qcom_icc_node qnm_mnoc_hf = {
 	.link_nodes = { &qns_gem_noc_cnoc, &qns_llcc },
 };
 
-static struct qcom_icc_qosbox qnm_mnoc_sf_qos = {
+static const struct qcom_icc_qosbox qnm_mnoc_sf_qos = {
 	.num_ports = 2,
 	.port_offsets = { 0x35000, 0xb5000 },
 	.prio = 0,
@@ -566,7 +572,7 @@ static struct qcom_icc_node qnm_mnoc_sf = {
 	.link_nodes = { &qns_gem_noc_cnoc, &qns_llcc },
 };
 
-static struct qcom_icc_qosbox qnm_nsp_gemnoc_qos = {
+static const struct qcom_icc_qosbox qnm_nsp_gemnoc_qos = {
 	.num_ports = 2,
 	.port_offsets = { 0x37000, 0xb7000 },
 	.prio = 0,
@@ -584,7 +590,7 @@ static struct qcom_icc_node qnm_nsp_gemnoc = {
 			&qns_pcie },
 };
 
-static struct qcom_icc_qosbox qnm_pcie_qos = {
+static const struct qcom_icc_qosbox qnm_pcie_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x15b000 },
 	.prio = 2,
@@ -682,7 +688,7 @@ static struct qcom_icc_node qnm_lpiaon_noc = {
 	.link_nodes = { &qns_lpass_ag_noc_gemnoc },
 };
 
-static struct qcom_icc_qosbox qnm_camnoc_nrt_icp_sf_qos = {
+static const struct qcom_icc_qosbox qnm_camnoc_nrt_icp_sf_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x25000 },
 	.prio = 4,
@@ -1111,7 +1117,7 @@ static struct qcom_icc_bcm bcm_cn0 = {
 	.name = "CN0",
 	.enable_mask = BIT(0),
 	.keepalive = true,
-	.num_nodes = 43,
+	.num_nodes = 44,
 	.nodes = { &qsm_cfg, &qhs_ahb2phy0,
 		   &qhs_ahb2phy1, &qhs_camera_cfg,
 		   &qhs_clk_ctl, &qhs_crypto0_cfg,
@@ -1119,7 +1125,7 @@ static struct qcom_icc_bcm bcm_cn0 = {
 		   &qhs_i3c_ibi1_cfg, &qhs_imem_cfg,
 		   &qhs_mss_cfg, &qhs_pcie_0_cfg,
 		   &qhs_prng, &qhs_qdss_cfg,
-		   &qhs_qspi, &qhs_sdc2,
+		   &qhs_qspi, &qhs_sdc1, &qhs_sdc2,
 		   &qhs_tcsr, &qhs_tlmm,
 		   &qhs_ufs_mem_cfg, &qhs_usb3_0,
 		   &qhs_venus_cfg, &qhs_vsense_ctrl_cfg,
@@ -1321,6 +1327,7 @@ static struct qcom_icc_node * const cnoc_cfg_nodes[] = {
 	[SLAVE_QSPI_0] = &qhs_qspi,
 	[SLAVE_QUP_1] = &qhs_qup1,
 	[SLAVE_QUP_2] = &qhs_qup2,
+	[SLAVE_SDCC_1] = &qhs_sdc1,
 	[SLAVE_SDCC_2] = &qhs_sdc2,
 	[SLAVE_TCSR] = &qhs_tcsr,
 	[SLAVE_TLMM] = &qhs_tlmm,

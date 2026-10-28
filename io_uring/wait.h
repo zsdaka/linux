@@ -5,12 +5,29 @@
 #include <linux/io_uring_types.h>
 
 /*
- * No waiters. It's larger than any valid value of the tw counter
- * so that tests against ->cq_wait_nr would fail and skip wake_up().
+ * ->cq_wait_nr is armed with the number of lazy task_work adds the waiter
+ * still needs, and counted down by the add side, with the add reaching zero
+ * issuing the (single) wake up for this wait cycle. Zero and below means no
+ * wake up is to be issued: IO_CQ_WAKE_INIT when no task is waiting (also
+ * what a forced wake up resets it to when claiming one), zero once the
+ * countdown has fired.
  */
-#define IO_CQ_WAKE_INIT		(-1U)
-/* Forced wake up if there is a waiter regardless of ->cq_wait_nr */
-#define IO_CQ_WAKE_FORCE	(IO_CQ_WAKE_INIT >> 1)
+#define IO_CQ_WAKE_INIT		(-1)
+
+/*
+ * Start a wait cycle of the current task. The add that uses up ->cq_wait_nr
+ * may be one that queued its entry long ago and only now gets to look at the
+ * count. As nobody else wakes us after that, it has to find us sleeping, hence
+ * the task state must be visible before the count is. The barrier pairs with
+ * the xchg() in mpscq_push(), see io_req_local_work_add().
+ */
+static inline void io_cq_wait_arm(struct io_ring_ctx *ctx, int nr_wait)
+{
+	__set_current_state(TASK_INTERRUPTIBLE);
+	atomic_set_release(&ctx->cq_wait_nr, nr_wait);
+	/* order the above against looking at the work list */
+	smp_mb();
+}
 
 struct ext_arg {
 	size_t argsz;

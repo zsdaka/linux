@@ -15,6 +15,7 @@
 #include <linux/kmsan.h>
 #include <asm/asm-extable.h>
 
+asm(".include \"asm/insn-common-asm.h\"\n");
 asm(".include \"asm/fpu-insn-asm.h\"\n");
 
 /*
@@ -103,9 +104,9 @@ static inline void fpu_lfpc_safe(unsigned int *fpc)
 {
 	instrument_read(fpc, sizeof(*fpc));
 	asm_inline volatile(
-		"	lfpc	%[fpc]\n"
-		"0:	nopr	%%r7\n"
-		EX_TABLE_FPC(0b, 0b)
+		"0:	lfpc	%[fpc]\n"
+		"1:\n"
+		EX_TABLE_INSN_FPC(0b, 1b)
 		:
 		: [fpc] "Q" (*fpc)
 		: "memory");

@@ -49,7 +49,7 @@ macro_rules! impl_safe_as {
             #[allow(unused)]
             #[inline(always)]
             pub(crate) const fn [<$from _as_ $into>](value: $from) -> $into {
-                kernel::static_assert!(size_of::<$into>() >= size_of::<$from>());
+                ::kernel::build_assert::static_assert!(size_of::<$into>() >= size_of::<$from>());
 
                 value as $into
             }
@@ -263,7 +263,7 @@ macro_rules! bounded_enum {
             ) -> kernel::error::Result<Self> {
                 match value.get() {
                     $(
-                        $value => Ok($enum_type::$variant),
+                        value if value == $value => Ok($enum_type::$variant),
                     )*
                     _ => Err(kernel::error::code::EINVAL),
                 }

@@ -87,6 +87,7 @@ enum hubp_3dlut_fl_addressing_mode {
 };
 
 enum hubp_3dlut_fl_width {
+	hubp_3dlut_fl_width_9 = 9,
 	hubp_3dlut_fl_width_17 = 17,
 	hubp_3dlut_fl_width_33 = 33,
 	hubp_3dlut_fl_width_17_transformed    = 4916, //mpc default
@@ -133,7 +134,7 @@ struct surface_flip_registers {
 	uint32_t DCSURF_SECONDARY_META_SURFACE_ADDRESS;
 	uint32_t DCSURF_SECONDARY_SURFACE_ADDRESS_HIGH;
 	uint32_t DCSURF_SECONDARY_SURFACE_ADDRESS;
-	bool tmz_surface;
+	uint8_t tmz_surface;
 	bool immediate;
 	uint8_t vmid;
 	bool grph_stereo;
@@ -175,7 +176,8 @@ struct hubp_funcs {
 	bool (*hubp_program_surface_flip_and_addr)(
 		struct hubp *hubp,
 		const struct dc_plane_address *address,
-		bool flip_immediate);
+		bool flip_immediate,
+		bool dcc);
 
 	void (*hubp_program_pte_vm)(
 		struct hubp *hubp,
@@ -216,6 +218,8 @@ struct hubp_funcs {
 			struct hubp *hubp,
 			const struct dc_cursor_position *pos,
 			const struct dc_cursor_mi_param *param);
+
+	void (*refresh_cursor_state)(struct hubp *hubp);
 
 	void (*hubp_disconnect)(struct hubp *hubp);
 
@@ -281,7 +285,7 @@ struct hubp_funcs {
 	void (*hubp_enable_3dlut_fl)(struct hubp *hubp, bool enable);
 	void (*hubp_program_3dlut_fl_crossbar)(struct hubp *hubp,
 			enum dc_cm_lut_pixel_format format);
-	int (*hubp_get_3dlut_fl_done)(struct hubp *hubp);
+	uint32_t (*hubp_get_3dlut_fl_done)(struct hubp *hubp);
 	void (*hubp_clear_tiling)(struct hubp *hubp);
 	uint32_t (*hubp_get_current_read_line)(struct hubp *hubp);
 	uint32_t (*hubp_get_det_config_error)(struct hubp *hubp);

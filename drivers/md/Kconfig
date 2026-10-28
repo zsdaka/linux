@@ -315,6 +315,17 @@ config DM_CRYPT
 
 	  If unsure, say N.
 
+config DM_INLINECRYPT
+	tristate "Inline encryption target support"
+	depends on BLK_DEV_DM
+	depends on (KEYS || KEYS=n)
+	depends on BLK_INLINE_ENCRYPTION
+	help
+	  This device-mapper target is similar to dm-crypt, but it uses the
+	  blk-crypto API instead of the regular crypto API. This allows it to
+	  take advantage of inline encryption hardware such as that commonly
+	  built into UFS host controllers.
+
 config DM_SNAPSHOT
        tristate "Snapshot target"
        depends on BLK_DEV_DM
@@ -596,6 +607,20 @@ config DM_VERITY_VERIFY_ROOTHASH_SIG_PLATFORM_KEYRING
 	depends on INTEGRITY_PLATFORM_KEYRING
 	help
 	  Rely also on the platform keyring to verify dm-verity signatures.
+
+	  If unsure, say N.
+
+config DM_VERITY_VERIFY_ROOTHASH_SIG_FORCE
+	bool "Require dm-verity root hash signature verification"
+	depends on DM_VERITY_VERIFY_ROOTHASH_SIG
+	help
+	  Reject dm-verity devices that are created without a valid root hash
+	  signature.  Without this, whether a signature is required is decided
+	  at boot time by the dm_verity.require_signatures parameter which
+	  defaults to off.
+
+	  Enabling this makes that parameter default to on and it can then no
+	  longer be turned off.
 
 	  If unsure, say N.
 

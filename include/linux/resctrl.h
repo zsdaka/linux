@@ -54,10 +54,10 @@ enum resctrl_res_level {
 	RDT_RESOURCE_MBA,
 	RDT_RESOURCE_SMBA,
 	RDT_RESOURCE_PERF_PKG,
-
-	/* Must be the last */
-	RDT_NUM_RESOURCES,
+	RDT_RESOURCE_LAST = RDT_RESOURCE_PERF_PKG
 };
+
+#define RDT_NUM_RESOURCES (RDT_RESOURCE_LAST + 1)
 
 /**
  * enum resctrl_conf_type - The type of configuration.
@@ -69,9 +69,10 @@ enum resctrl_conf_type {
 	CDP_NONE,
 	CDP_CODE,
 	CDP_DATA,
+	CDP_LAST = CDP_DATA
 };
 
-#define CDP_NUM_TYPES	(CDP_DATA + 1)
+#define CDP_NUM_TYPES	(CDP_LAST + 1)
 
 /*
  * struct pseudo_lock_region - pseudo-lock region information
@@ -286,13 +287,15 @@ enum resctrl_schema_fmt {
 
 /**
  * struct resctrl_mon - Monitoring related data of a resctrl resource.
- * @num_rmid:		Number of RMIDs available.
- * @mbm_cfg_mask:	Memory transactions that can be tracked when bandwidth
- *			monitoring events can be configured.
- * @num_mbm_cntrs:	Number of assignable counters.
- * @mbm_cntr_assignable:Is system capable of supporting counter assignment?
- * @mbm_assign_on_mkdir:True if counters should automatically be assigned to MBM
- *			events of monitor groups created via mkdir.
+ * @num_rmid:			Number of RMIDs available.
+ * @mbm_cfg_mask:		Memory transactions that can be tracked when
+ *				bandwidth monitoring events can be configured.
+ * @num_mbm_cntrs:		Number of assignable counters.
+ * @mbm_cntr_assignable:	Is system capable of supporting counter assignment?
+ * @mbm_assign_on_mkdir:	True if counters should automatically be assigned to MBM
+ *				events of monitor groups created via mkdir.
+ * @mbm_cntr_configurable:	True if assignable counters are configurable.
+ * @mbm_cntr_assign_fixed:	True if the counter assignment mode is fixed.
  */
 struct resctrl_mon {
 	u32			num_rmid;
@@ -300,6 +303,8 @@ struct resctrl_mon {
 	int			num_mbm_cntrs;
 	bool			mbm_cntr_assignable;
 	bool			mbm_assign_on_mkdir;
+	bool			mbm_cntr_configurable;
+	bool			mbm_cntr_assign_fixed;
 };
 
 /**
@@ -319,7 +324,7 @@ struct resctrl_mon {
  * @cdp_capable:	Is the CDP feature available on this resource
  */
 struct rdt_resource {
-	int			rid;
+	enum resctrl_res_level	rid;
 	bool			alloc_capable;
 	bool			mon_capable;
 	enum resctrl_scope	ctrl_scope;
@@ -499,6 +504,25 @@ bool resctrl_arch_mbm_cntr_assign_enabled(struct rdt_resource *r);
  * 0 on success, < 0 on error.
  */
 int resctrl_arch_mbm_cntr_assign_set(struct rdt_resource *r, bool enable);
+
+/**
+ * resctrl_arch_preconvert_bw() - Prepare bandwidth control value for arch use.
+ * @r:		Resource whose schema was written.
+ * @val:	Bandwidth control value written to the schemata file by userspace.
+ *
+ * Convert the user provided bandwidth control value to an appropriate form for
+ * consumption by the hardware driver for resource @r. Converted value is stored
+ * in rdt_ctrl_domain::staged_config[] for later consumption by
+ * resctrl_arch_update_domains(). Is not called when MBA software controller is
+ * enabled.
+ *
+ * Architectures for which this pre-conversion hook is not useful should supply
+ * an implementation of this function that just returns @val unmodified.
+ *
+ * Return:
+ * The converted value.
+ */
+u32 resctrl_arch_preconvert_bw(const struct rdt_resource *r, u32 val);
 
 /*
  * Update the ctrl_val and apply this config right now.

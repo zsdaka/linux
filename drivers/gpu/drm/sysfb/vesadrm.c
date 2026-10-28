@@ -5,6 +5,7 @@
 #include <linux/limits.h>
 #include <linux/platform_device.h>
 #include <linux/sysfb.h>
+#include <linux/pm.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
@@ -21,7 +22,9 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_modeset_helper.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_panic_helper.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 
@@ -246,7 +249,7 @@ static const u64 vesadrm_primary_plane_format_modifiers[] = {
 };
 
 static int vesadrm_primary_plane_helper_atomic_check(struct drm_plane *plane,
-						     struct drm_atomic_state *new_state)
+						     struct drm_atomic_commit *new_state)
 {
 	struct drm_sysfb_device *sysfb = to_drm_sysfb_device(plane->dev);
 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(new_state, plane);
@@ -315,7 +318,7 @@ static const struct drm_plane_funcs vesadrm_primary_plane_funcs = {
 };
 
 static void vesadrm_crtc_helper_atomic_flush(struct drm_crtc *crtc,
-					     struct drm_atomic_state *state)
+					     struct drm_atomic_commit *state)
 {
 	struct drm_device *dev = crtc->dev;
 	struct drm_sysfb_device *sysfb = to_drm_sysfb_device(dev);
@@ -400,7 +403,8 @@ static struct vesadrm_device *vesadrm_device_create(struct drm_driver *drv,
 	const struct screen_info *si;
 	const struct drm_format_info *format;
 	int width, height, stride;
-	u64 vsize;
+	unsigned int panel_width, panel_height;
+	s64 vsize;
 	struct resource resbuf;
 	struct resource *res;
 	struct vesadrm_device *vesa;
@@ -455,8 +459,8 @@ static struct vesadrm_device *vesadrm_device_create(struct drm_driver *drv,
 	if (stride < 0)
 		return ERR_PTR(stride);
 	vsize = drm_sysfb_get_visible_size_si(dev, si, height, stride, resource_size(res));
-	if (!vsize)
-		return ERR_PTR(-EINVAL);
+	if (vsize < 0)
+		return ERR_PTR(vsize);
 
 	drm_dbg(dev, "framebuffer format=%p4cc, size=%dx%d, stride=%d bytes\n",
 		&format->format, width, height, stride);
@@ -482,6 +486,20 @@ static struct vesadrm_device *vesadrm_device_create(struct drm_driver *drv,
 	if (drm_edid_header_is_valid(dpy->edid.dummy) == 8)
 		sysfb->edid = dpy->edid.dummy;
 #endif
+
+	panel_width = width;
+	panel_height = height;
+
+	if (sysfb->edid) {
+		const struct drm_edid *drm_edid;
+
+		drm_edid = drm_edid_alloc(sysfb->edid, EDID_LENGTH);
+		if (drm_edid) {
+			drm_edid_detect_panel_size(drm_edid, &panel_width, &panel_height);
+			drm_edid_free(drm_edid);
+		}
+	}
+
 	sysfb->fb_mode = drm_sysfb_mode(width, height, 0, 0);
 	sysfb->fb_format = format;
 	sysfb->fb_pitch = stride;
@@ -583,7 +601,7 @@ static struct vesadrm_device *vesadrm_device_create(struct drm_driver *drv,
 	drm_connector_helper_add(connector, &vesadrm_connector_helper_funcs);
 	drm_connector_set_panel_orientation_with_quirk(connector,
 						       DRM_MODE_PANEL_ORIENTATION_UNKNOWN,
-						       width, height);
+						       panel_width, panel_height);
 	if (sysfb->edid)
 		drm_connector_attach_edid_property(connector);
 
@@ -617,6 +635,22 @@ static struct drm_driver vesadrm_driver = {
  * Platform driver
  */
 
+static int vesadrm_pm_suspend(struct device *dev)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+
+	return drm_mode_config_helper_suspend(drm);
+}
+
+static int vesadrm_pm_resume(struct device *dev)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+
+	return drm_mode_config_helper_resume(drm);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(vesadrm_pm_ops, vesadrm_pm_suspend, vesadrm_pm_resume);
+
 static int vesadrm_probe(struct platform_device *pdev)
 {
 	struct vesadrm_device *vesa;
@@ -649,6 +683,7 @@ static void vesadrm_remove(struct platform_device *pdev)
 static struct platform_driver vesadrm_platform_driver = {
 	.driver = {
 		.name = "vesa-framebuffer",
+		.pm = pm_sleep_ptr(&vesadrm_pm_ops),
 	},
 	.probe = vesadrm_probe,
 	.remove = vesadrm_remove,

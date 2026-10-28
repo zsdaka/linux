@@ -509,7 +509,7 @@ Device Tree
 -----------
 
 DSA features a standardized binding which is documented in
-``Documentation/devicetree/bindings/net/dsa/dsa.txt``. PHY/MDIO library helper
+``Documentation/devicetree/bindings/net/dsa/dsa.yaml``. PHY/MDIO library helper
 functions such as ``of_get_phy_mode()``, ``of_phy_connect()`` are also used to query
 per-port PHY specific details: interface connection, MDIO bus location, etc.
 
@@ -864,7 +864,7 @@ The drivers which act upon the ``dsa_db`` argument in ``port_fdb_add``,
 DSA associates each offloaded bridge and each offloaded LAG with a one-based ID
 (``struct dsa_bridge :: num``, ``struct dsa_lag :: id``) for the purposes of
 refcounting addresses on shared ports. Drivers may piggyback on DSA's numbering
-scheme (the ID is readable through ``db->bridge.num`` and ``db->lag.id`` or may
+scheme (the ID is readable through ``db->bridge.num`` and ``db->lag.id``) or may
 implement their own.
 
 Only the drivers which declare support for FDB isolation are notified of FDB

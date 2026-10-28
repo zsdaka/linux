@@ -67,9 +67,6 @@ void *vmemdup_array_user(const void __user *src, size_t n, size_t size)
 #ifndef __HAVE_ARCH_STRCPY
 extern char * strcpy(char *,const char *);
 #endif
-#ifndef __HAVE_ARCH_STRNCPY
-extern char * strncpy(char *,const char *, __kernel_size_t);
-#endif
 ssize_t sized_strscpy(char *, const char *, size_t);
 
 /*
@@ -279,6 +276,19 @@ static inline void memcpy_flushcache(void *dst, const void *src, size_t cnt)
 {
 	memcpy(dst, src, cnt);
 }
+#endif
+
+#ifndef memcpy_nontemporal
+/*
+ * memcpy_nontemporal() requests a non-temporal copy when the
+ * architecture has a suitable backend. Architectures without a
+ * specialized backend fall back to memcpy(). Keep this as a
+ * function-like macro so the compiler can still see the original
+ * memcpy() call site and preserve the usual FORTIFY coverage when
+ * object sizes remain visible there, while keeping the API void.
+ */
+#define memcpy_nontemporal(dst, src, len) \
+	((void)memcpy(dst, src, len))
 #endif
 
 void *memchr_inv(const void *s, int c, size_t n);

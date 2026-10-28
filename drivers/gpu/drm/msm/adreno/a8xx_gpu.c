@@ -104,13 +104,16 @@ void a8xx_gpu_get_slice_info(struct msm_gpu *gpu)
 		return;
 	}
 
-	slice_mask &= a6xx_llc_read(a6xx_gpu,
+	slice_mask &= a6xx_cx_misc_read(a6xx_gpu,
 			REG_A8XX_CX_MISC_SLICE_ENABLE_FINAL);
 
 	a6xx_gpu->slice_mask = slice_mask;
 
 	/* Chip ID depends on the number of slices available. So update it */
 	adreno_gpu->chip_id |= FIELD_PREP(GENMASK(7, 4), hweight32(slice_mask));
+
+	/* GMEM is split evenly between slices: report the active share */
+	adreno_gpu->gmem = (adreno_gpu->info->gmem / info->max_slices) * hweight32(slice_mask);
 
 	/* Update the gpu-name to reflect the slice config: */
 	const char *name = devm_kasprintf(dev, GFP_KERNEL,
@@ -200,7 +203,7 @@ static void a8xx_set_hwcg(struct msm_gpu *gpu, bool state)
 	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
 	u32 val;
 
-	if (adreno_is_x285(adreno_gpu) && state)
+	if ((adreno_is_x285_family(adreno_gpu) || adreno_is_a830(adreno_gpu)) && state)
 		gpu_write(gpu, REG_A8XX_RBBM_CGC_0_PC, 0x00000702);
 
 	gmu_write(gmu, REG_A6XX_GPU_GMU_AO_GMU_CGC_MODE_CNTL,
@@ -228,7 +231,7 @@ static void a8xx_set_hwcg(struct msm_gpu *gpu, bool state)
 		 * GMU enables clk gating in GBIF during boot up. So,
 		 * override that here when hwcg feature is disabled
 		 */
-		gpu_rmw(gpu, REG_A8XX_GBIF_CX_CONFIG, BIT(0), 0);
+		gpu_rmw(gpu, REG_A6XX_GBIF_CX_CONFIG, BIT(0), 0);
 	}
 }
 
@@ -265,8 +268,8 @@ static void a8xx_set_cp_protect(struct msm_gpu *gpu)
 	 * Last span feature is only supported on PIPE specific register.
 	 * So update those here
 	 */
-	a8xx_write_pipe(gpu, PIPE_BR, REG_A8XX_CP_PROTECT_PIPE(protect->count_max), final_cfg);
-	a8xx_write_pipe(gpu, PIPE_BV, REG_A8XX_CP_PROTECT_PIPE(protect->count_max), final_cfg);
+	a8xx_write_pipe(gpu, PIPE_BR, REG_A8XX_CP_PROTECT_PIPE(15), final_cfg);
+	a8xx_write_pipe(gpu, PIPE_BV, REG_A8XX_CP_PROTECT_PIPE(15), final_cfg);
 
 	a8xx_aperture_clear(gpu);
 }
@@ -275,41 +278,38 @@ static void a8xx_set_ubwc_config(struct msm_gpu *gpu)
 {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
 	const struct qcom_ubwc_cfg_data *cfg = adreno_gpu->ubwc_config;
-	u32 level2_swizzling_dis = !(cfg->ubwc_swizzle & UBWC_SWIZZLE_ENABLE_LVL2);
-	u32 level3_swizzling_dis = !(cfg->ubwc_swizzle & UBWC_SWIZZLE_ENABLE_LVL3);
+	u32 level2_swizzling_dis = !(qcom_ubwc_swizzle(cfg) & UBWC_SWIZZLE_ENABLE_LVL2);
+	u32 level3_swizzling_dis = !(qcom_ubwc_swizzle(cfg) & UBWC_SWIZZLE_ENABLE_LVL3);
 	bool rgba8888_lossless = false, fp16compoptdis = false;
 	bool yuvnotcomptofc = false, min_acc_len_64b = false;
-	bool rgb565_predicator = false, amsbc = false;
+	bool rgb565_predicator = false;
+	bool amsbc = qcom_ubwc_enable_amsbc(cfg);
 	bool ubwc_mode = qcom_ubwc_get_ubwc_mode(cfg);
 	u32 ubwc_version = cfg->ubwc_enc_version;
-	u32 hbb, hbb_hi, hbb_lo, mode = 1;
+	u32 hbb, hbb_hi, hbb_lo, mode;
 	u8 uavflagprd_inv = 2;
 
-	switch (ubwc_version) {
-	case UBWC_6_0:
-		yuvnotcomptofc = true;
-		mode = 5;
-		break;
-	case UBWC_5_0:
-		amsbc = true;
-		rgb565_predicator = true;
-		mode = 4;
-		break;
-	case UBWC_4_0:
-		amsbc = true;
-		rgb565_predicator = true;
-		fp16compoptdis = true;
-		rgba8888_lossless = true;
-		mode = 2;
-		break;
-	case UBWC_3_0:
-		amsbc = true;
-		mode = 1;
-		break;
-	default:
+	if (ubwc_version > UBWC_7_0)
 		dev_err(&gpu->pdev->dev, "Unknown UBWC version: 0x%x\n", ubwc_version);
-		break;
-	}
+
+	if (ubwc_version == UBWC_6_0 ||
+	    ubwc_version == UBWC_7_0)
+		yuvnotcomptofc = true;
+
+	if (ubwc_version < UBWC_5_0 &&
+	    ubwc_version >= UBWC_4_0)
+		rgba8888_lossless = true;
+
+	if (ubwc_version < UBWC_4_3)
+		fp16compoptdis = true;
+
+	if (cfg->ubwc_enc_version >= UBWC_4_0)
+		rgb565_predicator = true;
+
+	if (ubwc_version < UBWC_3_0)
+		dev_err(&gpu->pdev->dev, "Unsupported UBWC version: 0x%x\n", ubwc_version);
+
+	mode = qcom_ubwc_version_tag(cfg);
 
 	/*
 	 * We subtract 13 from the highest bank bit (13 is the minimum value
@@ -468,6 +468,7 @@ static void a8xx_patch_pwrup_reglist(struct msm_gpu *gpu)
 	}
 
 	lock->dynamic_list_len = dyn_pwrup_reglist_count;
+	a6xx_gpu->dynamic_sel_reglist_offset = dyn_pwrup_reglist_count;
 
 done:
 	a8xx_aperture_clear(gpu);
@@ -488,15 +489,7 @@ static int a8xx_preempt_start(struct msm_gpu *gpu)
 
 	a6xx_emit_set_pseudo_reg(ring, a6xx_gpu, NULL);
 
-	/* Yield the floor on command completion */
-	OUT_PKT7(ring, CP_CONTEXT_SWITCH_YIELD, 4);
-	OUT_RING(ring, 0x00);
-	OUT_RING(ring, 0x00);
-	OUT_RING(ring, 0x00);
-	/* Generate interrupt on preemption completion */
-	OUT_RING(ring, 0x00);
-
-	a6xx_flush(gpu, ring);
+	a6xx_flush_yield(gpu, ring);
 
 	return a8xx_idle(gpu, ring) ? 0 : -EINVAL;
 }
@@ -737,6 +730,7 @@ static int hw_init(struct msm_gpu *gpu)
 
 	for (pipe_id = PIPE_BR; pipe_id <= PIPE_DDE_BV; pipe_id++) {
 		u32 apriv_mask = A8XX_APRIV_MASK;
+		u32 int_mask = A8XX_CP_INTERRUPT_STATUS_MASK_PIPE;
 		unsigned long flags;
 
 		if (pipe_id == PIPE_LPAC)
@@ -745,10 +739,16 @@ static int hw_init(struct msm_gpu *gpu)
 		if (pipe_id == PIPE_BR)
 			apriv_mask = A8XX_BR_APRIV_MASK;
 
+		/*
+		 * A845/A850's BV pipe raises a spurious RTWROVF fault interrupt;
+		 * mask it off to avoid false fault recovery.
+		 */
+		if (adreno_is_a850_family(adreno_gpu) && pipe_id == PIPE_BV)
+			int_mask &= ~A8XX_CP_INTERRUPT_STATUS_MASK_PIPE_RTWROVF;
+
 		a8xx_aperture_acquire(gpu, pipe_id, &flags);
 		gpu_write(gpu, REG_A8XX_CP_APRIV_CNTL_PIPE, apriv_mask);
-		gpu_write(gpu, REG_A8XX_CP_INTERRUPT_STATUS_MASK_PIPE,
-				A8XX_CP_INTERRUPT_STATUS_MASK_PIPE);
+		gpu_write(gpu, REG_A8XX_CP_INTERRUPT_STATUS_MASK_PIPE, int_mask);
 		gpu_write(gpu, REG_A8XX_CP_HW_FAULT_STATUS_MASK_PIPE,
 				A8XX_CP_HW_FAULT_STATUS_MASK_PIPE);
 		a8xx_aperture_release(gpu, flags);
@@ -849,7 +849,7 @@ out:
 	 */
 	a6xx_gmu_clear_oob(&a6xx_gpu->gmu, GMU_OOB_GPU_SET);
 
-	if (!ret && (refcount_read(&gpu->sysprof_active) > 1)) {
+	if (!ret && msm_gpu_sysprof_no_perfcntr_zap(gpu)) {
 		ret = a6xx_gmu_set_oob(gmu, GMU_OOB_PERFCOUNTER_SET);
 		if (!ret)
 			set_bit(GMU_STATUS_OOB_PERF_SET, &gmu->status);
@@ -886,17 +886,22 @@ void a8xx_recover(struct msm_gpu *gpu)
 
 	adreno_dump_info(gpu);
 
-	if (hang_debug)
-		a8xx_dump(gpu);
-
 	/*
 	 * To handle recovery specific sequences during the rpm suspend we are
 	 * about to trigger
 	 */
 	a6xx_gpu->hung = true;
 
-	/* Halt SQE first */
-	gpu_write(gpu, REG_A8XX_CP_SQE_CNTL, 3);
+	if (adreno_gpu->funcs->gx_is_on(adreno_gpu)) {
+		/*
+		 * Sometimes crashstate capture is skipped, so SQE should be
+		 * halted here again
+		 */
+		gpu_write(gpu, REG_A8XX_CP_SQE_CNTL, 3);
+
+		if (hang_debug)
+			a8xx_dump(gpu);
+	}
 
 	pm_runtime_dont_use_autosuspend(&gpu->pdev->dev);
 
@@ -1217,8 +1222,11 @@ irqreturn_t a8xx_irq(struct msm_gpu *gpu)
 
 	gpu_write(gpu, REG_A8XX_RBBM_INT_CLEAR_CMD, status);
 
-	if (priv->disable_err_irq)
+	if (priv->disable_err_irq) {
+		/* Turn off interrupts to avoid interrupt storm */
+		gpu_write(gpu, REG_A8XX_RBBM_INT_0_MASK, A6XX_RBBM_INT_0_MASK_CP_CACHE_FLUSH_TS);
 		status &= A6XX_RBBM_INT_0_MASK_CP_CACHE_FLUSH_TS;
+	}
 
 	if (status & A6XX_RBBM_INT_0_MASK_RBBM_HANG_DETECT)
 		a8xx_fault_detect_irq(gpu);
@@ -1352,4 +1360,24 @@ u64 a8xx_gpu_busy(struct msm_gpu *gpu, unsigned long *out_sample_rate)
 bool a8xx_progress(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 {
 	return true;
+}
+
+void a8xx_perfcntr_flush(struct msm_gpu *gpu)
+{
+	u32 val;
+
+	/*
+	 * Flush delta counters (both perf counters and pipe stats) present in
+	 * RBBM_S and RBBM_US to perf RAM logic to get the latest data.
+	 */
+	gpu_write(gpu, REG_A8XX_RBBM_PERFCTR_FLUSH_HOST_CMD, BIT(0));
+	gpu_write(gpu, REG_A8XX_RBBM_SLICE_PERFCTR_FLUSH_HOST_CMD, BIT(0));
+
+	/* Ensure all writes are posted before polling status register */
+	wmb();
+
+	if (gpu_poll_timeout(gpu, REG_A8XX_RBBM_PERFCTR_FLUSH_HOST_STATUS, val,
+			     val & BIT(0), 100, 100 * 1000)) {
+		dev_err(&gpu->pdev->dev, "Perfcounter flush timed out: status=0x%08x\n", val);
+	}
 }

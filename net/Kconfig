@@ -68,7 +68,6 @@ config SKB_EXTENSIONS
 
 config NET_DEVMEM
 	def_bool y
-	select GENERIC_ALLOCATOR
 	depends on DMA_SHARED_BUFFER
 	depends on PAGE_POOL
 
@@ -261,7 +260,6 @@ source "net/bridge/Kconfig"
 source "net/dsa/Kconfig"
 source "net/8021q/Kconfig"
 source "net/llc/Kconfig"
-source "net/appletalk/Kconfig"
 source "net/x25/Kconfig"
 source "net/lapb/Kconfig"
 source "net/phonet/Kconfig"

@@ -19,6 +19,7 @@
 struct statfs;
 struct smb_rqst;
 struct smb3_fs_context;
+struct fs_context;
 
 /*
  *****************************************************************
@@ -130,6 +131,7 @@ void cifs_signal_cifsd_for_reconnect(struct TCP_Server_Info *server,
 void cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
 					   bool mark_smb_session);
 int cifs_reconnect(struct TCP_Server_Info *server, bool mark_smb_session);
+void smb2_add_credits_from_hdr(char *buffer, struct TCP_Server_Info *server);
 bool backup_cred(struct cifs_sb_info *cifs_sb);
 bool is_size_safe_to_change(struct cifsInodeInfo *cifsInode, __u64 end_of_file,
 			    bool from_readdir);
@@ -211,9 +213,9 @@ struct smb_ntsd *get_cifs_acl(struct cifs_sb_info *cifs_sb,
 struct smb_ntsd *get_cifs_acl_by_fid(struct cifs_sb_info *cifs_sb,
 				     const struct cifs_fid *cifsfid,
 				     u32 *pacllen, u32 info);
-struct posix_acl *cifs_get_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+struct posix_acl *cifs_get_acl(const struct mnt_idmap *idmap, struct dentry *dentry,
 			       int type);
-int cifs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+int cifs_set_acl(const struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct posix_acl *acl, int type);
 int set_cifs_acl(struct smb_ntsd *pnntsd, __u32 acllen, struct inode *inode,
 		 const char *path, int aclflag);
@@ -235,7 +237,7 @@ void cifs_mount_put_conns(struct cifs_mount_ctx *mnt_ctx);
 int cifs_mount_get_session(struct cifs_mount_ctx *mnt_ctx);
 int cifs_is_path_remote(struct cifs_mount_ctx *mnt_ctx);
 int cifs_mount_get_tcon(struct cifs_mount_ctx *mnt_ctx);
-int cifs_match_super(struct super_block *sb, void *data);
+int cifs_match_super(struct super_block *sb, struct fs_context *fc);
 int cifs_mount(struct cifs_sb_info *cifs_sb, struct smb3_fs_context *ctx);
 void cifs_umount(struct cifs_sb_info *cifs_sb);
 void cifs_mark_open_files_invalid(struct cifs_tcon *tcon);
@@ -289,8 +291,7 @@ int cifs_tree_connect(const unsigned int xid, struct cifs_tcon *tcon);
 int cifs_negotiate_protocol(const unsigned int xid, struct cifs_ses *ses,
 			    struct TCP_Server_Info *server);
 int cifs_setup_session(const unsigned int xid, struct cifs_ses *ses,
-		       struct TCP_Server_Info *server,
-		       struct nls_table *nls_info);
+		       struct TCP_Server_Info *server);
 int cifs_enable_signing(struct TCP_Server_Info *server,
 			bool mnt_sign_required);
 
@@ -306,7 +307,7 @@ struct cifs_tcon *tcon_info_alloc(bool dir_leases_enabled,
 				  enum smb3_tcon_ref_trace trace);
 void tconInfoFree(struct cifs_tcon *tcon, enum smb3_tcon_ref_trace trace);
 
-int setup_ntlmv2_rsp(struct cifs_ses *ses, const struct nls_table *nls_cp);
+int setup_ntlmv2_rsp(struct cifs_ses *ses);
 void cifs_crypto_secmech_release(struct TCP_Server_Info *server);
 int calc_seckey(struct cifs_ses *ses);
 int generate_smb30signingkey(struct cifs_ses *ses,
@@ -316,11 +317,12 @@ int generate_smb311signingkey(struct cifs_ses *ses,
 
 #ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
 #endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
-void cifs_autodisable_serverino(struct cifs_sb_info *cifs_sb);
+void cifs_autodisable_serverino(struct cifs_sb_info *cifs_sb, const char *reason, int rc);
 bool couldbe_mf_symlink(const struct cifs_fattr *fattr);
-int check_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
-		     struct cifs_sb_info *cifs_sb, struct cifs_fattr *fattr,
-		     const unsigned char *path);
+int cifs_check_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
+			  struct cifs_sb_info *cifs_sb,
+			  const char *full_path, struct inode *inode,
+			  struct cifs_fattr *fattr);
 int E_md4hash(const unsigned char *passwd, unsigned char *p16,
 	      const struct nls_table *codepage);
 
@@ -336,9 +338,11 @@ struct cifs_ses *cifs_get_smb_ses(struct TCP_Server_Info *server,
 int cifs_readv_receive(struct TCP_Server_Info *server,
 		       struct mid_q_entry *mid);
 
-int cifs_query_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
+int cifs_query_mf_symlink(const unsigned int xid,
+			  struct cifs_tcon *tcon,
 			  struct cifs_sb_info *cifs_sb,
-			  const unsigned char *path, char *pbuf,
+			  const char *full_path,
+			  struct inode *inode, char *pbuf,
 			  unsigned int *pbytes_read);
 int cifs_create_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
 			   struct cifs_sb_info *cifs_sb,

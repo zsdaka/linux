@@ -678,10 +678,9 @@ static int vfat_add_entry(struct inode *dir, const struct qstr *qname,
 
 	/* update timestamp */
 	fat_truncate_time(dir, ts, FAT_UPDATE_CMTIME);
+	mark_inode_dirty(dir);
 	if (IS_DIRSYNC(dir))
-		(void)fat_sync_inode(dir);
-	else
-		mark_inode_dirty(dir);
+		(void)sync_inode_metadata(dir, 1);
 cleanup:
 	kfree(slots);
 	return err;
@@ -754,8 +753,8 @@ error:
 	return ERR_PTR(err);
 }
 
-static int vfat_create(struct mnt_idmap *idmap, struct inode *dir,
-		       struct dentry *dentry, umode_t mode, bool excl)
+static int vfat_create(const struct mnt_idmap *idmap, struct inode *dir,
+		       struct dentry *dentry, umode_t mode)
 {
 	struct super_block *sb = dir->i_sb;
 	struct inode *inode;
@@ -772,11 +771,17 @@ static int vfat_create(struct mnt_idmap *idmap, struct inode *dir,
 	inode_inc_iversion(dir);
 
 	inode = fat_build_inode(sb, sinfo.de, sinfo.i_pos);
-	brelse(sinfo.bh);
 	if (IS_ERR(inode)) {
+		int err2;
+
 		err = PTR_ERR(inode);
+		err2 = fat_remove_entries(dir, &sinfo);
+		if (err2)
+			fat_msg(sb, KERN_WARNING,
+				"failed to roll back new entry (%d)", err2);
 		goto out;
 	}
+	brelse(sinfo.bh);
 	inode_inc_iversion(inode);
 
 	d_instantiate(dentry, inode);
@@ -847,7 +852,7 @@ out:
 	return err;
 }
 
-static struct dentry *vfat_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+static struct dentry *vfat_mkdir(const struct mnt_idmap *idmap, struct inode *dir,
 				  struct dentry *dentry, umode_t mode)
 {
 	struct super_block *sb = dir->i_sb;
@@ -871,12 +876,20 @@ static struct dentry *vfat_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inc_nlink(dir);
 
 	inode = fat_build_inode(sb, sinfo.de, sinfo.i_pos);
-	brelse(sinfo.bh);
 	if (IS_ERR(inode)) {
+		int err2;
+
 		err = PTR_ERR(inode);
-		/* the directory was completed, just return a error */
-		goto out;
+		err2 = fat_remove_entries(dir, &sinfo);
+		if (err2) {
+			fat_msg(sb, KERN_WARNING,
+				"failed to roll back new entry (%d)", err2);
+			goto out;
+		}
+		drop_nlink(dir);
+		goto out_free;
 	}
+	brelse(sinfo.bh);
 	inode_inc_iversion(inode);
 	set_nlink(inode, 2);
 
@@ -904,9 +917,9 @@ static int vfat_get_dotdot_de(struct inode *inode, struct buffer_head **bh,
 
 static int vfat_sync_ipos(struct inode *dir, struct inode *inode)
 {
-	if (IS_DIRSYNC(dir))
-		return fat_sync_inode(inode);
 	mark_inode_dirty(inode);
+	if (IS_DIRSYNC(dir))
+		return sync_inode_metadata(inode, 1);
 	return 0;
 }
 
@@ -925,10 +938,9 @@ static void vfat_update_dir_metadata(struct inode *dir, struct timespec64 *ts)
 {
 	inode_inc_iversion(dir);
 	fat_truncate_time(dir, ts, FAT_UPDATE_CMTIME);
+	mark_inode_dirty(dir);
 	if (IS_DIRSYNC(dir))
-		(void)fat_sync_inode(dir);
-	else
-		mark_inode_dirty(dir);
+		(void)sync_inode_metadata(dir, 1);
 }
 
 static int vfat_rename(struct inode *old_dir, struct dentry *old_dentry,
@@ -1024,8 +1036,10 @@ error_inode:
 	fat_attach(old_inode, old_sinfo.i_pos);
 	if (new_inode) {
 		fat_attach(new_inode, new_i_pos);
-		if (corrupt)
-			corrupt |= fat_sync_inode(new_inode);
+		if (corrupt) {
+			mark_inode_dirty(new_inode);
+			corrupt |= sync_inode_metadata(new_inode, 1);
+		}
 	} else {
 		/*
 		 * If new entry was not sharing the data cluster, it
@@ -1160,7 +1174,7 @@ error_exchange:
 	goto out;
 }
 
-static int vfat_rename2(struct mnt_idmap *idmap, struct inode *old_dir,
+static int vfat_rename2(const struct mnt_idmap *idmap, struct inode *old_dir,
 			struct dentry *old_dentry, struct inode *new_dir,
 			struct dentry *new_dentry, unsigned int flags)
 {
@@ -1185,6 +1199,7 @@ static const struct inode_operations vfat_dir_inode_operations = {
 	.rename		= vfat_rename2,
 	.setattr	= fat_setattr,
 	.getattr	= fat_getattr,
+	.fileattr_get	= fat_fileattr_get,
 	.update_time	= fat_update_time,
 };
 

@@ -27,10 +27,12 @@
 #include "intel_display_power.h"
 #include "intel_display_power_well.h"
 #include "intel_display_regs.h"
+#include "intel_display_reset.h"
 #include "intel_display_rpm.h"
 #include "intel_display_types.h"
 #include "intel_dmc.h"
 #include "intel_dp.h"
+#include "intel_dp_link_caps.h"
 #include "intel_dp_link_training.h"
 #include "intel_dp_mst.h"
 #include "intel_dp_test.h"
@@ -47,6 +49,7 @@
 #include "intel_psr.h"
 #include "intel_psr_regs.h"
 #include "intel_vdsc.h"
+#include "intel_vrr.h"
 #include "intel_wm.h"
 #include "intel_tc.h"
 
@@ -416,11 +419,12 @@ static void intel_scaler_info(struct seq_file *m, struct intel_crtc *crtc)
 
 	/* Not all platforms have a scaler */
 	if (num_scalers) {
-		seq_printf(m, "\tnum_scalers=%d, scaler_users=%x scaler_id=%d scaling_filter=%d",
+		seq_printf(m, "\tnum_scalers=%d, scaler_users=%x scaler_id=%d scaling_filter=%d sharpness_strength=%d",
 			   num_scalers,
 			   crtc_state->scaler_state.scaler_users,
 			   crtc_state->scaler_state.scaler_id,
-			   crtc_state->hw.scaling_filter);
+			   crtc_state->hw.scaling_filter,
+			   crtc_state->hw.sharpness_strength);
 
 		for (i = 0; i < num_scalers; i++) {
 			const struct intel_scaler *sc =
@@ -570,6 +574,12 @@ static void intel_crtc_info(struct seq_file *m, struct intel_crtc *crtc)
 
 	intel_scaler_info(m, crtc);
 
+	if (DISPLAY_VER(display) >= 9) {
+		u32 background = crtc_state->hw.background_color;
+
+		seq_printf(m, "\tbackground color (10bpc XRGB2101010): %08x\n", background);
+	}
+
 	if (crtc_state->joiner_pipes)
 		seq_printf(m, "\tLinked to 0x%x pipes as a %s\n",
 			   crtc_state->joiner_pipes,
@@ -604,7 +614,7 @@ static int i915_display_info(struct seq_file *m, void *unused)
 
 	seq_printf(m, "CRTC info\n");
 	seq_printf(m, "---------\n");
-	for_each_intel_crtc(display->drm, crtc)
+	for_each_intel_crtc(display, crtc)
 		intel_crtc_info(m, crtc);
 
 	seq_printf(m, "\n");
@@ -662,7 +672,7 @@ static int i915_ddb_info(struct seq_file *m, void *unused)
 
 	seq_printf(m, "%-15s%8s%8s%8s\n", "", "Start", "End", "Size");
 
-	for_each_intel_crtc(display->drm, crtc) {
+	for_each_intel_crtc(display, crtc) {
 		struct intel_crtc_state *crtc_state =
 			to_intel_crtc_state(crtc->base.state);
 		enum pipe pipe = crtc->pipe;
@@ -769,7 +779,7 @@ i915_fifo_underrun_reset_write(struct file *filp,
 	if (!reset)
 		return cnt;
 
-	for_each_intel_crtc(display->drm, crtc) {
+	for_each_intel_crtc(display, crtc) {
 		struct drm_crtc_commit *commit;
 		struct intel_crtc_state *crtc_state;
 
@@ -837,6 +847,7 @@ void intel_display_debugfs_register(struct intel_display *display)
 
 	intel_bios_debugfs_register(display);
 	intel_cdclk_debugfs_register(display);
+	intel_display_reset_debugfs_register(display);
 	intel_dmc_debugfs_register(display);
 	intel_dp_test_debugfs_register(display);
 	intel_fbc_debugfs_register(display);
@@ -1274,22 +1285,11 @@ static ssize_t i915_joiner_write(struct file *file,
 	if (ret < 0)
 		return ret;
 
-	switch (force_joined_pipes) {
-	case 0:
-	case 1:
-	case 2:
-		connector->force_joined_pipes = force_joined_pipes;
-		break;
-	case 4:
-		if (HAS_ULTRAJOINER(display)) {
-			connector->force_joined_pipes = force_joined_pipes;
-			break;
-		}
-
-		fallthrough;
-	default:
+	if (force_joined_pipes &&
+	    !intel_joiner_valid_primary_pipe_mask(display, force_joined_pipes))
 		return -EINVAL;
-	}
+
+	connector->force_joined_pipes = force_joined_pipes;
 
 	*offp += len;
 
@@ -1333,6 +1333,7 @@ void intel_connector_debugfs_add(struct intel_connector *connector)
 	intel_psr_connector_debugfs_add(connector);
 	intel_alpm_lobf_debugfs_add(connector);
 	intel_dp_link_training_debugfs_add(connector);
+	intel_dp_link_caps_debugfs_add(connector);
 	intel_link_bw_connector_debugfs_add(connector);
 
 	if (DISPLAY_VER(display) >= 11 &&
@@ -1384,6 +1385,7 @@ void intel_crtc_debugfs_add(struct intel_crtc *crtc)
 	intel_drrs_crtc_debugfs_add(crtc);
 	intel_fbc_crtc_debugfs_add(crtc);
 	hsw_ips_crtc_debugfs_add(crtc);
+	intel_vrr_crtc_debugfs_add(crtc);
 
 	debugfs_create_file("i915_current_bpc", 0444, root, crtc,
 			    &i915_current_bpc_fops);

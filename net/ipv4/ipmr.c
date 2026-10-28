@@ -479,6 +479,7 @@ static struct net_device *ipmr_new_tunnel(struct net *net, struct vifctl *v)
 {
 	struct net_device *tunnel_dev, *new_dev;
 	struct ip_tunnel_parm_kern p = { };
+	LIST_HEAD(dev_kill_list);
 	int err;
 
 	tunnel_dev = __dev_get_by_name(net, "tunl0");
@@ -520,7 +521,8 @@ static struct net_device *ipmr_new_tunnel(struct net *net, struct vifctl *v)
 	return new_dev;
 
 out_unregister:
-	unregister_netdevice(new_dev);
+	new_dev->rtnl_link_ops->dellink(new_dev, &dev_kill_list);
+	unregister_netdevice_many(&dev_kill_list);
 out:
 	return ERR_PTR(-ENOBUFS);
 }
@@ -733,8 +735,12 @@ static int vif_delete(struct mr_table *mrt, int vifi, int notify,
 		ip_rt_multicast_event(in_dev);
 	}
 
-	if (v->flags & (VIFF_TUNNEL | VIFF_REGISTER) && !notify)
-		unregister_netdevice_queue(dev, head);
+	if (!notify) {
+		if (v->flags & VIFF_TUNNEL)
+			dev->rtnl_link_ops->dellink(dev, head);
+		else if (v->flags & VIFF_REGISTER)
+			unregister_netdevice_queue(dev, head);
+	}
 
 	netdev_put(dev, &v->dev_tracker);
 	return 0;
@@ -761,7 +767,8 @@ static void ipmr_destroy_unres(struct mr_table *mrt, struct mfc_cache *c)
 	struct sk_buff *skb;
 	struct nlmsgerr *e;
 
-	atomic_dec(&mrt->cache_resolve_queue_len);
+	WRITE_ONCE(mrt->cache_resolve_queue_len,
+		   mrt->cache_resolve_queue_len - 1);
 
 	while ((skb = skb_dequeue(&c->_c.mfc_un.unres.unresolved))) {
 		if (ip_hdr(skb)->version == 0) {
@@ -1180,11 +1187,12 @@ static int ipmr_cache_unresolved(struct mr_table *mrt, vifi_t vifi,
 		if (err < 0)
 			goto err;
 
-		atomic_inc(&mrt->cache_resolve_queue_len);
+		WRITE_ONCE(mrt->cache_resolve_queue_len,
+			   mrt->cache_resolve_queue_len + 1);
 		list_add(&c->_c.list, &mrt->mfc_unres_queue);
 		mroute_netlink_event(mrt, c, RTM_NEWROUTE);
 
-		if (atomic_read(&mrt->cache_resolve_queue_len) == 1)
+		if (mrt->cache_resolve_queue_len == 1)
 			mod_timer(&mrt->ipmr_expire_timer,
 				  c->_c.mfc_un.unres.expires);
 	}
@@ -1297,7 +1305,8 @@ static int ipmr_mfc_add(struct net *net, struct mr_table *mrt,
 		if (uc->mfc_origin == c->mfc_origin &&
 		    uc->mfc_mcastgrp == c->mfc_mcastgrp) {
 			list_del(&_uc->list);
-			atomic_dec(&mrt->cache_resolve_queue_len);
+			WRITE_ONCE(mrt->cache_resolve_queue_len,
+				   mrt->cache_resolve_queue_len - 1);
 			found = true;
 			break;
 		}
@@ -1356,7 +1365,7 @@ static void mroute_clean_tables(struct mr_table *mrt, int flags,
 	}
 
 	if (flags & MRT_FLUSH_MFC) {
-		if (atomic_read(&mrt->cache_resolve_queue_len) != 0 || !check_net(net)) {
+		if (READ_ONCE(mrt->cache_resolve_queue_len) || !check_net(net)) {
 			spin_lock_bh(&mfc_unres_lock);
 			list_for_each_entry_safe(c, tmp, &mrt->mfc_unres_queue, list) {
 				list_del(&c->list);
@@ -2210,6 +2219,9 @@ int ip_mr_input(struct sk_buff *skb)
 	if (IPCB(skb)->flags & IPSKB_FORWARDED)
 		goto dont_forward;
 
+	if (!local)
+		skb_orphan(skb);
+
 	mrt = ipmr_rt_fib_lookup(net, skb);
 	if (IS_ERR(mrt)) {
 		kfree_skb(skb);
@@ -2777,9 +2789,7 @@ errout_unlock:
 
 static int ipmr_rtm_dumproute(struct sk_buff *skb, struct netlink_callback *cb)
 {
-	struct fib_dump_filter filter = {
-		.rtnl_held = false,
-	};
+	struct fib_dump_filter filter = {};
 	int err;
 
 	rcu_read_lock();
@@ -2964,10 +2974,9 @@ static int ipmr_rtm_route(struct sk_buff *skb, struct nlmsghdr *nlh,
 
 static bool ipmr_fill_table(struct mr_table *mrt, struct sk_buff *skb)
 {
-	u32 queue_len = atomic_read(&mrt->cache_resolve_queue_len);
-
 	if (nla_put_u32(skb, IPMRA_TABLE_ID, mrt->id) ||
-	    nla_put_u32(skb, IPMRA_TABLE_CACHE_RES_QUEUE_LEN, queue_len) ||
+	    nla_put_u32(skb, IPMRA_TABLE_CACHE_RES_QUEUE_LEN,
+			READ_ONCE(mrt->cache_resolve_queue_len)) ||
 	    nla_put_s32(skb, IPMRA_TABLE_MROUTE_REG_VIF_NUM,
 			READ_ONCE(mrt->mroute_reg_vif_num)) ||
 	    nla_put_u8(skb, IPMRA_TABLE_MROUTE_DO_ASSERT,
@@ -3175,8 +3184,9 @@ static int ipmr_vif_seq_show(struct seq_file *seq, void *v)
 		seq_printf(seq,
 			   "%2td %-10s %8ld %7ld  %8ld %7ld %05X %08X %08X\n",
 			   vif - mrt->vif_table,
-			   name, vif->bytes_in, vif->pkt_in,
-			   vif->bytes_out, vif->pkt_out,
+			   name,
+			   READ_ONCE(vif->bytes_in), READ_ONCE(vif->pkt_in),
+			   READ_ONCE(vif->bytes_out), READ_ONCE(vif->pkt_out),
 			   vif->flags, vif->local, vif->remote);
 	}
 	return 0;
@@ -3373,7 +3383,8 @@ int __init ip_mr_init(void)
 {
 	int err;
 
-	mrt_cachep = KMEM_CACHE(mfc_cache, SLAB_HWCACHE_ALIGN | SLAB_PANIC);
+	mrt_cachep = KMEM_CACHE(mfc_cache,
+				SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT);
 
 	err = register_pernet_subsys(&ipmr_net_ops);
 	if (err)

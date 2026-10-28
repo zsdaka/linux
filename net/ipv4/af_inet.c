@@ -161,7 +161,7 @@ void inet_sock_destruct(struct sock *sk)
 	WARN_ON_ONCE(sk->sk_wmem_queued);
 	WARN_ON_ONCE(sk->sk_forward_alloc);
 
-	kfree(rcu_dereference_protected(inet->inet_opt, 1));
+	kfree_rcu(rcu_dereference_protected(inet->inet_opt, 1), rcu);
 	dst_release(rcu_dereference_protected(sk->sk_dst_cache, 1));
 	dst_release(rcu_dereference_protected(sk->sk_rx_dst, 1));
 	psp_sk_assoc_free(sk);
@@ -226,7 +226,8 @@ int __inet_listen_sk(struct sock *sk, int backlog)
 		if (err)
 			return err;
 
-		tcp_call_bpf(sk, BPF_SOCK_OPS_TCP_LISTEN_CB, 0, NULL);
+		tcp_call_bpf(sk, BPF_SOCK_OPS_TCP_LISTEN_CB);
+		bpf_tcp_ops_call(listen, sk);
 	}
 	return 0;
 }
@@ -582,7 +583,6 @@ int inet_dgram_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
 	if (addr_len < sizeof(uaddr->sa_family))
 		return -EINVAL;
 
-	/* IPV6_ADDRFORM can change sk->sk_prot under us. */
 	prot = READ_ONCE(sk->sk_prot);
 
 	if (uaddr->sa_family == AF_UNSPEC)
@@ -789,7 +789,6 @@ int inet_accept(struct socket *sock, struct socket *newsock,
 {
 	struct sock *sk1 = sock->sk, *sk2;
 
-	/* IPV6_ADDRFORM can change sk->sk_prot under us. */
 	arg->err = -EINVAL;
 	sk2 = READ_ONCE(sk1->sk_prot)->accept(sk1, arg);
 	if (!sk2)
@@ -852,7 +851,6 @@ int inet_send_prepare(struct sock *sk)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(inet_send_prepare);
 
 int inet_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 {
@@ -876,12 +874,10 @@ void inet_splice_eof(struct socket *sock)
 	if (unlikely(inet_send_prepare(sk)))
 		return;
 
-	/* IPV6_ADDRFORM can change sk->sk_prot under us. */
 	prot = READ_ONCE(sk->sk_prot);
 	if (prot->splice_eof)
 		prot->splice_eof(sock);
 }
-EXPORT_SYMBOL_GPL(inet_splice_eof);
 
 int inet_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 		 int flags)
@@ -1349,7 +1345,6 @@ int inet_sk_rebuild_header(struct sock *sk)
 
 	return err;
 }
-EXPORT_SYMBOL(inet_sk_rebuild_header);
 
 void inet_sk_set_state(struct sock *sk, int state)
 {
@@ -1378,6 +1373,9 @@ struct sk_buff *inet_gso_segment(struct sk_buff *skb,
 	int id;
 
 	skb_reset_network_header(skb);
+	if (unlikely(gso_recursion_inc_test(skb,
+					   IP_TUNNEL_RECURSION_LIMIT)))
+		goto out;
 	nhoff = skb_network_header(skb) - skb_mac_header(skb);
 	if (unlikely(!pskb_may_pull(skb, sizeof(*iph))))
 		goto out;
@@ -1540,6 +1538,7 @@ out:
 
 	return pp;
 }
+EXPORT_INDIRECT_CALLABLE(inet_gro_receive);
 
 static struct sk_buff *ipip_gro_receive(struct list_head *head,
 					struct sk_buff *skb)
@@ -1578,7 +1577,6 @@ __be32 inet_current_timestamp(void)
 	/* Convert to network byte order. */
 	return htonl(msecs);
 }
-EXPORT_SYMBOL(inet_current_timestamp);
 
 int inet_recv_error(struct sock *sk, struct msghdr *msg, int len)
 {
@@ -1625,6 +1623,7 @@ int inet_gro_complete(struct sk_buff *skb, int nhoff)
 out:
 	return err;
 }
+EXPORT_INDIRECT_CALLABLE(inet_gro_complete);
 
 static int ipip_gro_complete(struct sk_buff *skb, int nhoff)
 {
@@ -1663,7 +1662,6 @@ unsigned long snmp_fold_field(void __percpu *mib, int offt)
 		res += snmp_get_cpu_field(mib, i, offt);
 	return res;
 }
-EXPORT_SYMBOL_GPL(snmp_fold_field);
 
 #if BITS_PER_LONG==32
 
@@ -1684,7 +1682,6 @@ u64 snmp_get_cpu_field64(void __percpu *mib, int cpu, int offt,
 
 	return v;
 }
-EXPORT_SYMBOL_GPL(snmp_get_cpu_field64);
 
 u64 snmp_fold_field64(void __percpu *mib, int offt, size_t syncp_offset)
 {
@@ -1696,7 +1693,6 @@ u64 snmp_fold_field64(void __percpu *mib, int offt, size_t syncp_offset)
 	}
 	return res;
 }
-EXPORT_SYMBOL_GPL(snmp_fold_field64);
 #endif
 
 #ifdef CONFIG_IP_MULTICAST

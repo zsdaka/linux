@@ -96,9 +96,9 @@ static int temp_from_reg_unsigned(u8 val_h, u8 val_l)
 
 static int temp_from_reg_signed(u8 val_h, u8 val_l)
 {
-	if (val_h & 0x80)
-		return (val_h - 0x100) * 1000;
-	return temp_from_reg_unsigned(val_h, val_l);
+	s16 val_hl = (val_h << 8) | val_l;
+
+	return val_hl * 1000 / 256;
 }
 
 static int lm95245_read_conversion_rate(struct lm95245_data *data)
@@ -546,8 +546,8 @@ static int lm95245_probe(struct i2c_client *client)
 
 /* Driver data (common to all clients) */
 static const struct i2c_device_id lm95245_id[] = {
-	{ "lm95235" },
-	{ "lm95245" },
+	{ .name = "lm95235" },
+	{ .name = "lm95245" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, lm95245_id);

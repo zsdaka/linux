@@ -301,7 +301,7 @@ struct sk_filter;
   *	@sk_type: socket type (%SOCK_STREAM, etc)
   *	@sk_protocol: which protocol this socket belongs in this network family
   *	@sk_peer_lock: lock protecting @sk_peer_pid and @sk_peer_cred
-  *	@sk_peer_pid: &struct pid for this socket's peer
+  *	@sk_peer_pid: &struct pid for this socket's peer, by pid type
   *	@sk_peer_cred: %SO_PEERCRED setting
   *	@sk_rcvlowat: %SO_RCVLOWAT setting
   *	@sk_rcvtimeo: %SO_RCVTIMEO setting
@@ -356,6 +356,7 @@ struct sk_filter;
   *	@sk_scm_security: flagged by SO_PASSSEC to recv SCM_SECURITY
   *	@sk_scm_pidfd: flagged by SO_PASSPIDFD to recv SCM_PIDFD
   *	@sk_scm_rights: flagged by SO_PASSRIGHTS to recv SCM_RIGHTS
+  *	@sk_scm_pidfd_thread: flagged by SO_PASSPIDFD_THREAD to recv a thread SCM_PIDFD
   *	@sk_scm_unused: unused flags for scm_recv()
   *	@ns_tracker: tracker for netns reference
   *	@sk_user_frags: xarray of pages the user is holding a reference on.
@@ -545,7 +546,7 @@ struct sock {
 	u64			sk_ino;
 	spinlock_t		sk_peer_lock;
 	int			sk_bind_phc;
-	struct pid		*sk_peer_pid;
+	DECLARE_PIDS(sk_peer_pid, PIDTYPE_TGID);
 	const struct cred	*sk_peer_cred;
 
 	ktime_t			sk_stamp;
@@ -562,7 +563,8 @@ struct sock {
 				sk_scm_security : 1,
 				sk_scm_pidfd : 1,
 				sk_scm_rights : 1,
-				sk_scm_unused : 4;
+				sk_scm_pidfd_thread : 1,
+				sk_scm_unused : 3;
 		};
 	};
 	u8			sk_clockid;
@@ -1129,6 +1131,8 @@ static inline void sk_forward_alloc_add(struct sock *sk, int val)
 }
 
 void sk_stream_write_space(struct sock *sk);
+void sk_set_nospace(struct sock *sk);
+void sk_clear_nospace(struct sock *sk);
 
 /* OOB backlog add */
 static inline void __sk_add_backlog(struct sock *sk, struct sk_buff *skb)
@@ -1850,12 +1854,22 @@ static inline struct sock *sk_clone_lock(const struct sock *sk, const gfp_t prio
 
 struct sk_buff *sock_wmalloc(struct sock *sk, unsigned long size, int force,
 			     gfp_t priority);
-void __sock_wfree(struct sk_buff *skb);
 void sock_wfree(struct sk_buff *skb);
+void __sock_wfree(struct sk_buff *skb);
+void tcp_wfree(struct sk_buff *skb);
+
+static inline bool is_skb_wmem(const struct sk_buff *skb)
+{
+	return skb->destructor == sock_wfree ||
+	       (IS_ENABLED(CONFIG_INET) && skb->destructor == __sock_wfree) ||
+	       (IS_ENABLED(CONFIG_INET) && skb->destructor == tcp_wfree);
+}
+
 struct sk_buff *sock_omalloc(struct sock *sk, unsigned long size,
 			     gfp_t priority);
 void skb_orphan_partial(struct sk_buff *skb);
 void sock_rfree(struct sk_buff *skb);
+void sock_rmem_free(struct sk_buff *skb);
 void sock_efree(struct sk_buff *skb);
 #ifdef CONFIG_INET
 void sock_edemux(struct sk_buff *skb);
@@ -2252,6 +2266,20 @@ sk_dst_reset(struct sock *sk)
 	sk_dst_set(sk, NULL);
 }
 
+/* Re-roll the socket txhash.  On a rehash, IPv6 also drops the cached route
+ * so the next transmit re-selects an ECMP path; IPv4 keeps its route, since
+ * IPv4 ECMP path selection does not use sk_txhash.
+ */
+static inline bool __sk_rethink_txhash_reset_dst(struct sock *sk)
+{
+	if (sk_rethink_txhash(sk)) {
+		if (sk->sk_family == AF_INET6)
+			__sk_dst_reset(sk);
+		return true;
+	}
+	return false;
+}
+
 struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie);
 
 struct dst_entry *sk_dst_check(struct sock *sk, u32 cookie);
@@ -2287,6 +2315,8 @@ static inline void sk_gso_disable(struct sock *sk)
 	sk->sk_gso_disabled = 1;
 	sk->sk_route_caps &= ~NETIF_F_GSO_MASK;
 }
+
+bool sk_has_decrypt_user(const struct sock *sk);
 
 static inline int skb_do_copy_data_nocache(struct sock *sk, struct sk_buff *skb,
 					   struct iov_iter *from, char *to,

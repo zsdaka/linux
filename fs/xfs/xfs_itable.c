@@ -63,7 +63,7 @@ want_metadir_file(
 STATIC int
 xfs_bulkstat_one_int(
 	struct xfs_mount	*mp,
-	struct mnt_idmap	*idmap,
+	const struct mnt_idmap	*idmap,
 	struct xfs_trans	*tp,
 	xfs_ino_t		ino,
 	struct xfs_bstat_chunk	*bc)
@@ -97,7 +97,7 @@ xfs_bulkstat_one_int(
 	}
 
 	ASSERT(ip != NULL);
-	ASSERT(ip->i_imap.im_blkno != 0);
+	ASSERT(ip->i_imap.im_agbno != 0);
 	inode = VFS_I(ip);
 	vfsuid = i_uid_into_vfsuid(idmap, inode);
 	vfsgid = i_gid_into_vfsgid(idmap, inode);

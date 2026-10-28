@@ -102,7 +102,7 @@ ice_parser_create_table(struct ice_hw *hw, u32 sect_type,
 	if (!seg)
 		return ERR_PTR(-EINVAL);
 
-	table = kzalloc(item_size * length, GFP_KERNEL);
+	table = kcalloc(length, item_size, GFP_KERNEL);
 	if (!table)
 		return ERR_PTR(-ENOMEM);
 
@@ -2367,6 +2367,9 @@ int ice_parser_profile_init(struct ice_parser_result *rslt,
 	u8 proto_id = U8_MAX;
 	u16 proto_off = 0;
 	u16 off;
+
+	if (rslt->ptype >= ICE_FLOW_PTYPE_MAX)
+		return -EINVAL;
 
 	memset(prof, 0, sizeof(*prof));
 	set_bit(rslt->ptype, prof->ptypes);

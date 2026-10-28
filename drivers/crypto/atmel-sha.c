@@ -28,7 +28,6 @@
 #include <linux/irq.h>
 #include <linux/scatterlist.h>
 #include <linux/dma-mapping.h>
-#include <linux/mod_devicetable.h>
 #include <linux/delay.h>
 #include <linux/crypto.h>
 #include <crypto/scatterwalk.h>
@@ -305,12 +304,12 @@ static size_t atmel_sha_append_sg(struct atmel_sha_reqctx *ctx)
 	size_t count;
 
 	while ((ctx->bufcnt < ctx->buflen) && ctx->total) {
-		count = min(ctx->sg->length - ctx->offset, ctx->total);
-		count = min(count, ctx->buflen - ctx->bufcnt);
+		count = min3(ctx->sg->length - ctx->offset, ctx->total,
+			     ctx->buflen - ctx->bufcnt);
 
-		if (count <= 0) {
+		if (count == 0) {
 			/*
-			* Check if count <= 0 because the buffer is full or
+			* Check if count == 0 because the buffer is full or
 			* because the sg length is 0. In the latest case,
 			* check if there is another sg in the list, a 0 length
 			* sg doesn't necessarily mean the end of the sg list.
@@ -422,6 +421,9 @@ static int atmel_sha_init(struct ahash_request *req)
 	struct atmel_sha_ctx *tctx = crypto_ahash_ctx(tfm);
 	struct atmel_sha_reqctx *ctx = ahash_request_ctx(req);
 	struct atmel_sha_dev *dd = atmel_sha_find_dev(tctx);
+
+	if (!dd)
+		return -ENODEV;
 
 	ctx->dd = dd;
 
@@ -1204,7 +1206,7 @@ static int atmel_sha_finup(struct ahash_request *req)
 
 	/*
 	 * final() has to be always called to cleanup resources
-	 * even if udpate() failed, except EINPROGRESS
+	 * even if update() failed, except EINPROGRESS
 	 */
 	err2 = atmel_sha_final(req);
 
@@ -1339,7 +1341,7 @@ static int atmel_sha_done(struct atmel_sha_dev *dd)
 	return err;
 
 finish:
-	/* finish curent request */
+	/* finish current request */
 	atmel_sha_finish_req(dd->req, err);
 
 	return err;
@@ -1724,8 +1726,7 @@ static int atmel_sha_hmac_setup(struct atmel_sha_dev *dd,
 		return atmel_sha_hmac_prehash_key(dd, key, keylen);
 
 	/* Prepare ipad. */
-	memcpy((u8 *)hmac->ipad, key, keylen);
-	memset((u8 *)hmac->ipad + keylen, 0, bs - keylen);
+	memcpy_and_pad(hmac->ipad, bs, key, keylen, 0);
 	return atmel_sha_hmac_compute_ipad_hash(dd);
 }
 
@@ -2385,10 +2386,24 @@ static int atmel_sha_authenc_final_done(struct atmel_sha_dev *dd)
 {
 	struct ahash_request *req = dd->req;
 	struct atmel_sha_authenc_reqctx *authctx = ahash_request_ctx(req);
+	atmel_aes_authenc_fn_t cb;
+	struct atmel_aes_dev *aes_dev;
 	size_t i, num_words = authctx->digestlen / sizeof(u32);
 
 	for (i = 0; i < num_words; ++i)
 		authctx->digest[i] = atmel_sha_read(dd, SHA_REG_DIGEST(i));
+
+	if (!dd->is_async) {
+		/*
+		 * Return the AES finalizer's status directly for synchronous requests.
+		 * The ahash callback cannot propagate it.
+		 */
+		cb = authctx->cb;
+		aes_dev = authctx->aes_dev;
+		dd->force_complete = false;
+		(void)atmel_sha_complete(dd, 0);
+		return cb(aes_dev, 0, false);
+	}
 
 	return atmel_sha_complete(dd, 0);
 }
@@ -2606,10 +2621,8 @@ static int atmel_sha_probe(struct platform_device *pdev)
 
 	err = devm_request_irq(&pdev->dev, sha_dd->irq, atmel_sha_irq,
 			       IRQF_SHARED, "atmel-sha", sha_dd);
-	if (err) {
-		dev_err(dev, "unable to request sha irq.\n");
+	if (err)
 		goto err_tasklet_kill;
-	}
 
 	/* Initializing the clock */
 	sha_dd->iclk = devm_clk_get_prepared(&pdev->dev, "sha_clk");

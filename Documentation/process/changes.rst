@@ -36,7 +36,7 @@ bindgen (optional)     0.71.1           bindgen --version
 binutils               2.30             ld -v
 bison                  2.0              bison --version
 btrfs-progs            0.18             btrfs --version
-Clang/LLVM (optional)  15.0.0           clang --version
+Clang/LLVM (optional)  17.0.1           clang --version
 e2fsprogs              1.41.4           e2fsck -V
 flex                   2.5.35           flex --version
 gdb                    7.2              gdb --version
@@ -53,8 +53,9 @@ mcelog                 0.6              mcelog --version
 mkimage (optional)     2017.01          mkimage --version
 nfs-utils              1.0.5            showmount --version
 openssl & libcrypto    1.0.0            openssl version
-pahole                 1.22             pahole --version
+pahole                 1.26             pahole --version
 pcmciautils            004              pccardctl -V
+pigz (optional)        2.4              pigz --version
 PPP                    2.4.0            pppd --version
 procps                 3.2.0            ps --version
 Python                 3.9.x            python3 --version
@@ -205,6 +206,13 @@ GNU AWK
 
 GNU AWK is needed if you want kernel builds to generate address range data for
 builtin modules (CONFIG_BUILTIN_MODULE_RANGES).
+
+pigz (optional)
+---------------
+
+pigz is a parallel implementation of gzip. If it is installed the compressed
+kernel image is produced with it rather than with gzip, see ``KPGZIP`` in
+Documentation/kbuild/kbuild.rst.
 
 System utilities
 ****************

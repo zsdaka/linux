@@ -417,7 +417,7 @@ static void cptvf_enable_swerr_interrupts(struct cpt_vf *cptvf)
 
 	vqx_misc_ena.u = cpt_read_csr64(cptvf->reg_base,
 					CPTX_VQX_MISC_ENA_W1S(0, 0));
-	/* Set mbox(0) interupts for the requested vf */
+	/* Set mbox(0) interrupts for the requested vf */
 	vqx_misc_ena.s.swerr = 1;
 	cpt_write_csr64(cptvf->reg_base, CPTX_VQX_MISC_ENA_W1S(0, 0),
 			vqx_misc_ena.u);
@@ -429,7 +429,7 @@ static void cptvf_enable_mbox_interrupts(struct cpt_vf *cptvf)
 
 	vqx_misc_ena.u = cpt_read_csr64(cptvf->reg_base,
 					CPTX_VQX_MISC_ENA_W1S(0, 0));
-	/* Set mbox(0) interupts for the requested vf */
+	/* Set mbox(0) interrupts for the requested vf */
 	vqx_misc_ena.s.mbox = 1;
 	cpt_write_csr64(cptvf->reg_base, CPTX_VQX_MISC_ENA_W1S(0, 0),
 			vqx_misc_ena.u);
@@ -835,9 +835,10 @@ static void cptvf_shutdown(struct pci_dev *pdev)
 
 /* Supported devices */
 static const struct pci_device_id cptvf_id_table[] = {
-	{PCI_VDEVICE(CAVIUM, CPT_81XX_PCI_VF_DEVICE_ID), 0},
-	{ 0, }  /* end of table */
+	{ PCI_VDEVICE(CAVIUM, CPT_81XX_PCI_VF_DEVICE_ID) },
+	{ }  /* end of table */
 };
+MODULE_DEVICE_TABLE(pci, cptvf_id_table);
 
 static struct pci_driver cptvf_pci_driver = {
 	.name = DRV_NAME,
@@ -853,4 +854,3 @@ MODULE_AUTHOR("George Cherian <george.cherian@cavium.com>");
 MODULE_DESCRIPTION("Cavium Thunder CPT Virtual Function Driver");
 MODULE_LICENSE("GPL v2");
 MODULE_VERSION(DRV_VERSION);
-MODULE_DEVICE_TABLE(pci, cptvf_id_table);

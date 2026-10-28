@@ -3,14 +3,27 @@
 //! String representations.
 
 use crate::{
-    alloc::{flags::*, AllocError, KVec},
-    error::{to_result, Result},
-    fmt::{self, Write},
-    prelude::*,
+    alloc::{
+        AllocError,
+        KVec, //
+    },
+    error::{
+        to_result,
+        Result, //
+    },
+    fmt::{
+        self,
+        Write, //
+    },
+    prelude::*, //
 };
 use core::{
     marker::PhantomData,
-    ops::{Deref, DerefMut, Index},
+    ops::{
+        Deref,
+        DerefMut,
+        Index, //
+    }, //
 };
 
 pub use crate::prelude::CStr;
@@ -398,7 +411,7 @@ impl AsRef<BStr> for CStr {
 /// const BAD: &CStr = c_str!("literal");
 ///
 /// // `c_str!` is still needed for static non-literal C strings.
-/// const GOOD: &CStr = c_str!(concat!(file!(), ":", line!(), ": My CStr!"));
+/// const GOOD: &CStr = c_str!(concat!(file!(), ":", ::core::line!(), ": My CStr!"));
 /// ```
 #[macro_export]
 macro_rules! c_str {
@@ -415,6 +428,7 @@ macro_rules! c_str {
     }};
 }
 
+#[cfg(CONFIG_RUST_STR_KUNIT_TEST)]
 #[kunit_tests(rust_kernel_str)]
 mod tests {
     use super::*;

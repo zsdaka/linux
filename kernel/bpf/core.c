@@ -18,8 +18,11 @@
  */
 
 #include <uapi/linux/btf.h>
+#include <linux/ctype.h>
 #include <linux/filter.h>
+#include <linux/sched/signal.h>
 #include <linux/skbuff.h>
+#include <linux/static_call.h>
 #include <linux/vmalloc.h>
 #include <linux/prandom.h>
 #include <linux/bpf.h>
@@ -125,6 +128,7 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	fp->aux->main_prog_aux = aux;
 	fp->aux->prog = fp;
 	fp->jit_requested = ebpf_jit_enabled();
+	fp->jit_required = IS_ENABLED(CONFIG_BPF_JIT_ALWAYS_ON);
 	fp->blinding_requested = bpf_jit_blinding_enabled(fp);
 #ifdef CONFIG_CGROUP_BPF
 	aux->cgroup_atype = CGROUP_BPF_ATTACH_TYPE_INVALID;
@@ -138,10 +142,6 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	mutex_init(&fp->aux->ext_mutex);
 	mutex_init(&fp->aux->dst_mutex);
 	mutex_init(&fp->aux->st_ops_assoc_mutex);
-
-#ifdef CONFIG_BPF_SYSCALL
-	bpf_prog_stream_init(fp);
-#endif
 
 	return fp;
 }
@@ -172,7 +172,6 @@ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags)
 	}
 	return prog;
 }
-EXPORT_SYMBOL_GPL(bpf_prog_alloc);
 
 int bpf_prog_alloc_jited_linfo(struct bpf_prog *prog)
 {
@@ -270,6 +269,7 @@ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
 		memcpy(fp, fp_old, fp_old->pages * PAGE_SIZE);
 		fp->pages = pages;
 		fp->aux->prog = fp;
+		bpf_prog_dev_bound_moved(fp);
 
 		/* We keep fp->aux from fp_old around in the new
 		 * reallocated structure.
@@ -286,6 +286,9 @@ struct bpf_prog *bpf_prog_realloc(struct bpf_prog *fp_old, unsigned int size,
 void __bpf_prog_free(struct bpf_prog *fp)
 {
 	if (fp->aux) {
+#ifdef CONFIG_BPF_SYSCALL
+		bpf_prog_stream_free(fp);
+#endif
 		mutex_destroy(&fp->aux->used_maps_mutex);
 		mutex_destroy(&fp->aux->dst_mutex);
 		mutex_destroy(&fp->aux->st_ops_assoc_mutex);
@@ -304,7 +307,7 @@ int bpf_prog_calc_tag(struct bpf_prog *fp)
 	bool was_ld_map;
 	u32 i;
 
-	dst = vmalloc(size);
+	dst = __vmalloc(size, GFP_KERNEL_ACCOUNT);
 	if (!dst)
 		return -ENOMEM;
 
@@ -587,6 +590,10 @@ bpf_prog_ksym_set_name(struct bpf_prog *prog)
 				      prog->aux->func_info[prog->aux->func_idx].type_id);
 		func_name = btf_name_by_offset(prog->aux->btf, type->name_off);
 		snprintf(sym, (size_t)(end - sym), "_%s", func_name);
+		/* the name of a function of Rust is not an identifier */
+		for (; *sym; sym++)
+			if (!isalnum(*sym) && *sym != '_' && *sym != '.')
+				*sym = '_';
 		return;
 	}
 
@@ -875,6 +882,7 @@ int bpf_jit_add_poke_descriptor(struct bpf_prog *prog,
 struct bpf_prog_pack {
 	struct list_head list;
 	void *ptr;
+	bool arch_flush_needed;
 	unsigned long bitmap[];
 };
 
@@ -882,6 +890,15 @@ void bpf_jit_fill_hole_with_zero(void *area, unsigned int size)
 {
 	memset(area, 0, size);
 }
+
+DEFINE_STATIC_CALL_NULL(bpf_arch_pred_flush, bpf_arch_pred_flush);
+
+/*
+ * Enabled once bpf_arch_pred_flush points at a real flush routine. Lets the
+ * pack allocator test "is a predictor flush wired up at all" with a cheap
+ * static branch instead of repeatedly querying the static call target.
+ */
+DEFINE_STATIC_KEY_FALSE(bpf_pred_flush_enabled);
 
 #define BPF_PROG_SIZE_TO_NBITS(size)	(round_up(size, BPF_PROG_CHUNK_SIZE) / BPF_PROG_CHUNK_SIZE)
 
@@ -904,6 +921,11 @@ static LIST_HEAD(pack_list);
 
 #define BPF_PROG_CHUNK_COUNT (BPF_PROG_PACK_SIZE / BPF_PROG_CHUNK_SIZE)
 
+static bool bpf_jit_mem_is_rox(void)
+{
+	return execmem_is_rox(EXECMEM_BPF);
+}
+
 static struct bpf_prog_pack *alloc_new_pack(bpf_jit_fill_hole_t bpf_fill_ill_insns)
 {
 	struct bpf_prog_pack *pack;
@@ -915,14 +937,18 @@ static struct bpf_prog_pack *alloc_new_pack(bpf_jit_fill_hole_t bpf_fill_ill_ins
 	pack->ptr = bpf_jit_alloc_exec(BPF_PROG_PACK_SIZE);
 	if (!pack->ptr)
 		goto out;
-	bpf_fill_ill_insns(pack->ptr, BPF_PROG_PACK_SIZE);
 	bitmap_zero(pack->bitmap, BPF_PROG_PACK_SIZE / BPF_PROG_CHUNK_SIZE);
 
-	set_vm_flush_reset_perms(pack->ptr);
-	err = set_memory_rox((unsigned long)pack->ptr,
-			     BPF_PROG_PACK_SIZE / PAGE_SIZE);
-	if (err)
-		goto out;
+	if (static_branch_unlikely(&bpf_pred_flush_enabled))
+		pack->arch_flush_needed = true;
+	if (!bpf_jit_mem_is_rox()) {
+		bpf_fill_ill_insns(pack->ptr, BPF_PROG_PACK_SIZE);
+		set_vm_flush_reset_perms(pack->ptr);
+		err = set_memory_rox((unsigned long)pack->ptr,
+				     BPF_PROG_PACK_SIZE / PAGE_SIZE);
+		if (err)
+			goto out;
+	}
 	list_add_tail(&pack->list, &pack_list);
 	return pack;
 
@@ -932,18 +958,26 @@ out:
 	return NULL;
 }
 
-void *bpf_prog_pack_alloc(u32 size, bpf_jit_fill_hole_t bpf_fill_ill_insns)
+void *bpf_prog_pack_alloc(u32 size, bpf_jit_fill_hole_t bpf_fill_ill_insns, bool was_classic)
 {
 	unsigned int nbits = BPF_PROG_SIZE_TO_NBITS(size);
-	struct bpf_prog_pack *pack;
-	unsigned long pos;
+	struct bpf_prog_pack *pack, *fallback_pack = NULL;
+	unsigned long pos, fallback_pos = 0;
 	void *ptr = NULL;
 
 	mutex_lock(&pack_mutex);
 	if (size > BPF_PROG_PACK_SIZE) {
+		/*
+		 * Allocations larger than a pack get their own pages, and
+		 * predictors are not flushed for such allocation. This is only
+		 * safe because cBPF programs (the unprivileged attack surface)
+		 * are bounded well below a pack size.
+		 */
+		if (was_classic && static_branch_unlikely(&bpf_pred_flush_enabled))
+			pr_warn_once("BPF: Predictors not flushed for allocations greater than BPF_PROG_PACK_SIZE\n");
 		size = round_up(size, PAGE_SIZE);
 		ptr = bpf_jit_alloc_exec(size);
-		if (ptr) {
+		if (ptr && !bpf_jit_mem_is_rox()) {
 			int err;
 
 			bpf_fill_ill_insns(ptr, size);
@@ -960,8 +994,29 @@ void *bpf_prog_pack_alloc(u32 size, bpf_jit_fill_hole_t bpf_fill_ill_insns)
 	list_for_each_entry(pack, &pack_list, list) {
 		pos = bitmap_find_next_zero_area(pack->bitmap, BPF_PROG_CHUNK_COUNT, 0,
 						 nbits, 0);
-		if (pos < BPF_PROG_CHUNK_COUNT)
+		if (pos >= BPF_PROG_CHUNK_COUNT)
+			continue;
+		/* Flush not enabled, use any pack */
+		if (!static_branch_unlikely(&bpf_pred_flush_enabled))
 			goto found_free_area;
+		/*
+		 * cBPF reuse of a dirty pack triggers a flush, so prefer a
+		 * clean pack for cBPF. eBPF never flushes, so steer it to a
+		 * dirty pack and keep clean packs free for cBPF.
+		 */
+		if (was_classic ^ pack->arch_flush_needed)
+			goto found_free_area;
+		if (!fallback_pack) {
+			fallback_pack = pack;
+			fallback_pos = pos;
+		}
+	}
+
+	/* No preferred pack found */
+	if (fallback_pack) {
+		pack = fallback_pack;
+		pos = fallback_pos;
+		goto found_free_area;
 	}
 
 	pack = alloc_new_pack(bpf_fill_ill_insns);
@@ -971,6 +1026,16 @@ void *bpf_prog_pack_alloc(u32 size, bpf_jit_fill_hole_t bpf_fill_ill_insns)
 	pos = 0;
 
 found_free_area:
+	/* Flush only for cBPF as it may contain a crafted gadget */
+	if (static_branch_unlikely(&bpf_pred_flush_enabled) &&
+	    pack->arch_flush_needed &&
+	    was_classic) {
+		struct bpf_prog_pack *p;
+
+		static_call_cond(bpf_arch_pred_flush)();
+		list_for_each_entry(p, &pack_list, list)
+			p->arch_flush_needed = false;
+	}
 	bitmap_set(pack->bitmap, pos, nbits);
 	ptr = (void *)(pack->ptr) + (pos << BPF_PROG_CHUNK_SHIFT);
 
@@ -1008,6 +1073,9 @@ void bpf_prog_pack_free(void *ptr, u32 size)
 		  "bpf_prog_pack bug: missing bpf_arch_text_invalidate?\n");
 
 	bitmap_clear(pack->bitmap, pos, nbits);
+
+	if (static_branch_unlikely(&bpf_pred_flush_enabled))
+		pack->arch_flush_needed = true;
 	if (bitmap_find_next_zero_area(pack->bitmap, BPF_PROG_CHUNK_COUNT, 0,
 				       BPF_PROG_CHUNK_COUNT, 0) == 0) {
 		list_del(&pack->list);
@@ -1060,12 +1128,12 @@ void bpf_jit_uncharge_modmem(u32 size)
 	atomic_long_sub(size, &bpf_jit_current);
 }
 
-void *__weak bpf_jit_alloc_exec(unsigned long size)
+void *bpf_jit_alloc_exec(unsigned long size)
 {
 	return execmem_alloc(EXECMEM_BPF, size);
 }
 
-void __weak bpf_jit_free_exec(void *addr)
+void bpf_jit_free_exec(void *addr)
 {
 	execmem_free(addr);
 }
@@ -1130,7 +1198,8 @@ bpf_jit_binary_pack_alloc(unsigned int proglen, u8 **image_ptr,
 			  unsigned int alignment,
 			  struct bpf_binary_header **rw_header,
 			  u8 **rw_image,
-			  bpf_jit_fill_hole_t bpf_fill_ill_insns)
+			  bpf_jit_fill_hole_t bpf_fill_ill_insns,
+			  bool was_classic)
 {
 	struct bpf_binary_header *ro_header;
 	u32 size, hole, start;
@@ -1143,7 +1212,7 @@ bpf_jit_binary_pack_alloc(unsigned int proglen, u8 **image_ptr,
 
 	if (bpf_jit_charge_modmem(size))
 		return NULL;
-	ro_header = bpf_prog_pack_alloc(size, bpf_fill_ill_insns);
+	ro_header = bpf_prog_pack_alloc(size, bpf_fill_ill_insns, was_classic);
 	if (!ro_header) {
 		bpf_jit_uncharge_modmem(size);
 		return NULL;
@@ -1297,10 +1366,10 @@ static int bpf_jit_blind_insn(const struct bpf_insn *from,
 {
 	struct bpf_insn *to = to_buff;
 	u32 imm_rnd = get_random_u32();
-	s16 off;
+	int off;
 
-	BUILD_BUG_ON(BPF_REG_AX  + 1 != MAX_BPF_JIT_REG);
-	BUILD_BUG_ON(MAX_BPF_REG + 1 != MAX_BPF_JIT_REG);
+	BUILD_BUG_ON(BPF_REG_PARAMS + 2 != MAX_BPF_JIT_REG);
+	BUILD_BUG_ON(BPF_REG_AX + 1 != MAX_BPF_JIT_REG);
 
 	/* Constraints on AX register:
 	 *
@@ -1373,6 +1442,8 @@ static int bpf_jit_blind_insn(const struct bpf_insn *from,
 		off = from->off;
 		if (off < 0)
 			off -= 2;
+		if (off < S16_MIN)
+			return -ERANGE;
 		*to++ = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ from->imm);
 		*to++ = BPF_ALU64_IMM(BPF_XOR, BPF_REG_AX, imm_rnd);
 		*to++ = BPF_JMP_REG(from->code, from->dst_reg, BPF_REG_AX, off);
@@ -1393,6 +1464,8 @@ static int bpf_jit_blind_insn(const struct bpf_insn *from,
 		off = from->off;
 		if (off < 0)
 			off -= 2;
+		if (off < S16_MIN)
+			return -ERANGE;
 		*to++ = BPF_ALU32_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ from->imm);
 		*to++ = BPF_ALU32_IMM(BPF_XOR, BPF_REG_AX, imm_rnd);
 		*to++ = BPF_JMP32_REG(from->code, from->dst_reg, BPF_REG_AX,
@@ -1486,8 +1559,7 @@ void bpf_jit_prog_release_other(struct bpf_prog *fp, struct bpf_prog *fp_other)
 	 * know whether fp here is the clone or the original.
 	 */
 	fp->aux->prog = fp;
-	if (fp->aux->offload)
-		fp->aux->offload->prog = fp;
+	bpf_prog_dev_bound_moved(fp);
 	bpf_prog_clone_free(fp_other);
 }
 
@@ -1541,7 +1613,9 @@ struct bpf_prog *bpf_jit_blind_constants(struct bpf_verifier_env *env, struct bp
 		if (!rewritten)
 			continue;
 
-		if (env)
+		if (rewritten < 0)
+			tmp = ERR_PTR(rewritten);
+		else if (env)
 			tmp = bpf_patch_insn_data(env, i, insn_buff, rewritten);
 		else
 			tmp = bpf_patch_insn_single(clone, i, insn_buff, rewritten);
@@ -1555,6 +1629,8 @@ struct bpf_prog *bpf_jit_blind_constants(struct bpf_verifier_env *env, struct bp
 			 * fix it up here on error.
 			 */
 			bpf_jit_prog_release_other(prog, clone);
+			if (env && fatal_signal_pending(current))
+				return ERR_PTR(-EINTR);
 			return IS_ERR(tmp) ? tmp : ERR_PTR(-ENOMEM);
 		}
 
@@ -1582,6 +1658,16 @@ bool bpf_insn_is_indirect_target(const struct bpf_verifier_env *env, const struc
 	insn_idx += prog->aux->subprog_start;
 	return env->insn_aux_data[insn_idx].indirect_target;
 }
+
+u16 bpf_out_stack_arg_cnt(const struct bpf_verifier_env *env, const struct bpf_prog *prog)
+{
+	const struct bpf_subprog_info *sub;
+
+	if (!env)
+		return 0;
+	sub = &env->subprog_info[prog->aux->func_idx];
+	return sub->stack_arg_cnt - bpf_in_stack_arg_cnt(sub);
+}
 #endif /* CONFIG_BPF_JIT */
 
 /* Base function for offset calculation. Needs to go into .text section,
@@ -1594,7 +1680,6 @@ noinline u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
 {
 	return 0;
 }
-EXPORT_SYMBOL_GPL(__bpf_call_base);
 
 /* All UAPI available opcodes. */
 #define BPF_INSN_MAP(INSN_2, INSN_3)		\
@@ -1757,6 +1842,7 @@ bool bpf_opcode_in_insntable(u8 code)
 		[BPF_LD | BPF_IND | BPF_H] = true,
 		[BPF_LD | BPF_IND | BPF_W] = true,
 		[BPF_JMP | BPF_JA | BPF_X] = true,
+		[BPF_JMP | BPF_CALL | BPF_X] = true,
 		[BPF_JMP | BPF_JCOND] = true,
 	};
 #undef BPF_INSN_3_TBL
@@ -2471,7 +2557,7 @@ static bool __bpf_prog_map_compatible(struct bpf_map *map,
 			cookie = aux->cgroup_storage[i] ?
 				 aux->cgroup_storage[i]->cookie : 0;
 			ret = map->owner->storage_cookie[i] == cookie ||
-			      !cookie;
+			      (!cookie && !aux->tail_call_reachable);
 		}
 		if (ret &&
 		    map->owner->attach_func_proto != aux->attach_func_proto) {
@@ -2551,40 +2637,86 @@ static bool bpf_prog_select_interpreter(struct bpf_prog *fp)
 	return select_interpreter;
 }
 
+/*
+ * Whether a function has an insn that works with the arena base, which a JIT
+ * sets up in the prologue when bpf_prog_uses_arena_insns() says so. Decided on
+ * the final insns of the function: an access through an arena pointer, or
+ * through a number in a program loaded with BPF_F_ARENA_SCALAR, has been
+ * rewritten to a BPF_PROBE_MEM32 form by then, a cast to the user address
+ * space keeps BPF_ADDR_SPACE_CAST, and a kfunc call with an __arena argument,
+ * which the JIT rebases, has a function model that says so. A load of an
+ * __arena struct member is rewritten with an immediate and needs none;
+ * dereferencing the result does.
+ */
+bool bpf_prog_has_arena_insns(const struct bpf_prog *prog)
+{
+	const struct bpf_insn *insn = prog->insnsi;
+	const struct btf_func_model *m;
+	int i, j;
+
+	if (!prog->aux->arena)
+		return false;
+
+	for (i = 0; i < prog->len; i++, insn++) {
+		switch (BPF_CLASS(insn->code)) {
+		case BPF_LDX:
+			if (BPF_MODE(insn->code) == BPF_PROBE_MEM32 ||
+			    BPF_MODE(insn->code) == BPF_PROBE_MEM32SX)
+				return true;
+			break;
+		case BPF_ST:
+			if (BPF_MODE(insn->code) == BPF_PROBE_MEM32)
+				return true;
+			break;
+		case BPF_STX:
+			if (BPF_MODE(insn->code) == BPF_PROBE_MEM32 ||
+			    BPF_MODE(insn->code) == BPF_PROBE_ATOMIC)
+				return true;
+			break;
+		case BPF_ALU64:
+			if (BPF_OP(insn->code) == BPF_MOV && BPF_SRC(insn->code) == BPF_X &&
+			    insn->off == BPF_ADDR_SPACE_CAST)
+				return true;
+			break;
+		case BPF_JMP:
+			if (!bpf_pseudo_kfunc_call(insn))
+				break;
+			m = bpf_jit_find_kfunc_model(prog, insn);
+			if (!m)
+				break;
+			for (j = 0; j < m->nr_args; j++)
+				if (m->arg_flags[j] & BTF_FMODEL_ARENA_ARG)
+					return true;
+			break;
+		}
+	}
+	return false;
+}
+
 static struct bpf_prog *bpf_prog_jit_compile(struct bpf_verifier_env *env, struct bpf_prog *prog)
 {
 #ifdef CONFIG_BPF_JIT
 	struct bpf_prog *orig_prog;
-	struct bpf_insn_aux_data *orig_insn_aux;
 
+	prog->aux->uses_arena_insns = bpf_prog_has_arena_insns(prog);
 	if (!bpf_prog_need_blind(prog))
 		return bpf_int_jit_compile(env, prog);
-
-	if (env) {
-		/*
-		 * If env is not NULL, we are called from the end of bpf_check(), at this
-		 * point, only insn_aux_data is used after failure, so it should be restored
-		 * on failure.
-		 */
-		orig_insn_aux = bpf_dup_insn_aux_data(env);
-		if (!orig_insn_aux)
-			return prog;
-	}
 
 	orig_prog = prog;
 	prog = bpf_jit_blind_constants(env, prog);
 	/*
-	 * If blinding was requested and we failed during blinding, we must fall
-	 * back to the interpreter.
+	 * Fall back to the interpreter after blinding failures, except when
+	 * the loader was killed.
 	 */
-	if (IS_ERR(prog))
+	if (IS_ERR(prog)) {
+		if (PTR_ERR(prog) == -EINTR)
+			return prog;
 		goto out_restore;
+	}
 
 	prog = bpf_int_jit_compile(env, prog);
 	if (prog->jited) {
 		bpf_jit_prog_release_other(prog, orig_prog);
-		if (env)
-			vfree(orig_insn_aux);
 		return prog;
 	}
 
@@ -2592,8 +2724,6 @@ static struct bpf_prog *bpf_prog_jit_compile(struct bpf_verifier_env *env, struc
 
 out_restore:
 	prog = orig_prog;
-	if (env)
-		bpf_restore_insn_aux_data(env, orig_insn_aux);
 #endif
 	return prog;
 }
@@ -2601,17 +2731,15 @@ out_restore:
 struct bpf_prog *__bpf_prog_select_runtime(struct bpf_verifier_env *env, struct bpf_prog *fp,
 					   int *err)
 {
+	struct bpf_prog *jit_prog;
+
 	/* In case of BPF to BPF calls, verifier did all the prep
 	 * work with regards to JITing, etc.
 	 */
-	bool jit_needed = false;
+	bool jit_needed = fp->jit_required;
 
 	if (fp->bpf_func)
 		goto finalize;
-
-	if (IS_ENABLED(CONFIG_BPF_JIT_ALWAYS_ON) ||
-	    bpf_prog_has_kfunc_call(fp))
-		jit_needed = true;
 
 	if (!bpf_prog_select_interpreter(fp))
 		jit_needed = true;
@@ -2627,7 +2755,12 @@ struct bpf_prog *__bpf_prog_select_runtime(struct bpf_verifier_env *env, struct 
 		if (*err)
 			return fp;
 
-		fp = bpf_prog_jit_compile(env, fp);
+		jit_prog = bpf_prog_jit_compile(env, fp);
+		if (IS_ERR(jit_prog)) {
+			*err = PTR_ERR(jit_prog);
+			return fp;
+		}
+		fp = jit_prog;
 		bpf_prog_jit_attempt_done(fp);
 		if (!fp->jited && jit_needed) {
 			*err = -ENOTSUPP;
@@ -2669,7 +2802,6 @@ struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
 {
 	return __bpf_prog_select_runtime(NULL, fp, err);
 }
-EXPORT_SYMBOL_GPL(bpf_prog_select_runtime);
 
 static unsigned int __bpf_prog_ret1(const void *ctx,
 				    const struct bpf_insn *insn)
@@ -2728,6 +2860,11 @@ void bpf_prog_array_free_sleepable(struct bpf_prog_array *progs)
 	if (!progs || progs == &bpf_empty_prog_array)
 		return;
 	call_rcu_tasks_trace(&progs->rcu, __bpf_prog_array_free_sleepable_cb);
+}
+
+struct bpf_prog *bpf_prog_dummy(void)
+{
+	return &dummy_bpf_prog.prog;
 }
 
 int bpf_prog_array_length(struct bpf_prog_array *array)
@@ -2962,13 +3099,18 @@ void __bpf_free_used_maps(struct bpf_prog_aux *aux,
 	bool sleepable;
 	u32 i;
 
-	sleepable = aux->prog->sleepable;
+	sleepable = bpf_prog_runs_sleepable(aux->prog);
 	for (i = 0; i < len; i++) {
 		map = used_maps[i];
 		if (map->ops->map_poke_untrack)
 			map->ops->map_poke_untrack(map, aux);
 		if (sleepable)
 			atomic64_dec(&map->sleepable_refcnt);
+		/*
+		 * The program that didn't load is not a user of the map. libbpf
+		 * loads the program again to get the log of the verifier.
+		 */
+		cmpxchg(&map->user, (unsigned long)aux, 0);
 		bpf_map_put(map);
 	}
 }
@@ -3000,31 +3142,12 @@ static void bpf_free_used_btfs(struct bpf_prog_aux *aux)
 	kfree(aux->used_btfs);
 }
 
-static void bpf_prog_free_deferred(struct work_struct *work)
+static void bpf_prog_free_images(struct work_struct *work)
 {
 	struct bpf_prog_aux *aux;
 	int i;
 
-	aux = container_of(work, struct bpf_prog_aux, work);
-#ifdef CONFIG_BPF_SYSCALL
-	bpf_free_kfunc_btf_tab(aux->kfunc_btf_tab);
-	bpf_prog_stream_free(aux->prog);
-#endif
-#ifdef CONFIG_CGROUP_BPF
-	if (aux->cgroup_atype != CGROUP_BPF_ATTACH_TYPE_INVALID)
-		bpf_cgroup_atype_put(aux->cgroup_atype);
-#endif
-	bpf_free_used_maps(aux);
-	bpf_free_used_btfs(aux);
-	bpf_prog_disassoc_struct_ops(aux->prog);
-	if (bpf_prog_is_dev_bound(aux))
-		bpf_prog_dev_bound_destroy(aux->prog);
-#ifdef CONFIG_PERF_EVENTS
-	if (aux->prog->has_callchain_buf)
-		put_callchain_buffers();
-#endif
-	if (aux->dst_trampoline)
-		bpf_trampoline_put(aux->dst_trampoline);
+	aux = container_of(to_rcu_work(work), struct bpf_prog_aux, rwork);
 	for (i = 0; i < aux->real_func_cnt; i++) {
 		/* We can just unlink the subprog poke descriptor table as
 		 * it was originally linked to the main program and is also
@@ -3041,6 +3164,44 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 	}
 }
 
+static void bpf_prog_free_deferred(struct work_struct *work)
+{
+	struct bpf_prog_aux *aux;
+	bool ksyms;
+
+	aux = container_of(work, struct bpf_prog_aux, work);
+	/*
+	 * A prog that still runs when its last reference goes needs its symbols,
+	 * by which its exception table is found.  It has ended by now.
+	 */
+	ksyms = aux->real_func_cnt || !list_empty(&aux->ksym.lnode);
+	bpf_prog_kallsyms_del_all(aux->prog);
+#ifdef CONFIG_BPF_SYSCALL
+	bpf_free_kfunc_btf_tab(aux->kfunc_btf_tab);
+#endif
+#ifdef CONFIG_CGROUP_BPF
+	if (aux->cgroup_atype != CGROUP_BPF_ATTACH_TYPE_INVALID)
+		bpf_cgroup_atype_put(aux->cgroup_atype);
+#endif
+	bpf_free_used_maps(aux);
+	bpf_free_used_btfs(aux);
+	bpf_prog_disassoc_struct_ops(aux->prog);
+	if (bpf_prog_is_dev_bound(aux))
+		bpf_prog_dev_bound_destroy(aux->prog);
+#ifdef CONFIG_PERF_EVENTS
+	if (aux->prog->has_callchain_buf)
+		put_callchain_buffers();
+#endif
+	if (aux->dst_trampoline)
+		bpf_trampoline_put(aux->dst_trampoline);
+	/* The symbols are looked up under rcu_read_lock() */
+	INIT_RCU_WORK(&aux->rwork, bpf_prog_free_images);
+	if (ksyms)
+		queue_rcu_work(system_percpu_wq, &aux->rwork);
+	else
+		bpf_prog_free_images(&aux->rwork.work);
+}
+
 void bpf_prog_free(struct bpf_prog *fp)
 {
 	struct bpf_prog_aux *aux = fp->aux;
@@ -3051,7 +3212,6 @@ void bpf_prog_free(struct bpf_prog *fp)
 	INIT_WORK(&aux->work, bpf_prog_free_deferred);
 	schedule_work(&aux->work);
 }
-EXPORT_SYMBOL_GPL(bpf_prog_free);
 
 /* RNG for unprivileged user space with separated state from prandom_u32(). */
 static DEFINE_PER_CPU(struct rnd_state, bpf_user_rnd_state);
@@ -3228,12 +3388,139 @@ bool __weak bpf_jit_supports_kfunc_call(void)
 	return false;
 }
 
+/* Return TRUE if the JIT backend supports callx (indirect call) instruction. */
+bool __weak bpf_jit_supports_callx(void)
+{
+	return false;
+}
+
+bool __weak bpf_jit_supports_kfunc_ret_reg_pair(void)
+{
+	return false;
+}
+
+/* unwind_goto and unwind_exit */
+bool __weak bpf_jit_supports_unwind(void)
+{
+	return false;
+}
+
+/*
+ * How this arch places a by-value kfunc argument, or NULL for one that has
+ * not opted in and so only takes an argument of a single eightbyte, which
+ * every convention places in slot order.
+ */
+const struct bpf_jit_arg_abi * __weak bpf_jit_arg_abi(void)
+{
+	return NULL;
+}
+
+u32 bpf_jit_place_args(const struct bpf_jit_arg_abi *abi,
+		       const struct btf_func_model *fm, u8 *pos_of_slot)
+{
+	u32 i, k, nslots, slot = 0, nregs_used = 0, stack_off = 0;
+	bool on_stack = false;
+
+	for (i = 0; i < fm->nr_args; i++) {
+		bool align16 = fm->arg_flags[i] & BTF_FMODEL_ALIGN16_ARG;
+		u32 pos;
+
+		nslots = btf_func_model_arg_slots(fm, i);
+
+		if (align16 && abi->even_reg_align)
+			nregs_used = round_up(nregs_used, 2);
+
+		if (!on_stack && nregs_used + nslots <= abi->nr_arg_regs) {
+			/* wholly in registers */
+			pos = nregs_used;
+			nregs_used += nslots;
+		} else if (!on_stack && abi->split_at_boundary) {
+			/* the last registers hold what fits, the stack the rest */
+			pos = nregs_used;
+			stack_off = (nregs_used + nslots - abi->nr_arg_regs) * BPF_REG_SIZE;
+			nregs_used = abi->nr_arg_regs;
+			on_stack = true;
+		} else {
+			/* wholly on the stack */
+			if (align16 && abi->even_stack_align)
+				stack_off = round_up(stack_off, 2 * BPF_REG_SIZE);
+			pos = abi->nr_arg_regs + stack_off / BPF_REG_SIZE;
+			stack_off += nslots * BPF_REG_SIZE;
+			if (!abi->backfill_after_stack)
+				on_stack = true;
+		}
+
+		for (k = 0; k < nslots; k++)
+			pos_of_slot[slot + k] = pos + k;
+		slot += nslots;
+	}
+
+	return slot;
+}
+
+u32 bpf_jit_plan_arg_moves(const struct bpf_jit_arg_abi *abi,
+			   const struct btf_func_model *fm,
+			   struct bpf_jit_arg_move *moves)
+{
+	u8 pos_of_slot[MAX_BPF_FUNC_ARG_SLOTS];
+	u32 nslots, n = 0, s, back;
+
+	nslots = bpf_jit_place_args(abi, fm, pos_of_slot);
+	back = nslots;
+
+	/*
+	 * An argument is two eightbytes at most, so it frees one register at
+	 * most and only one argument ever moves down. Its destination is
+	 * still in use, so carry it in the scratch. Only a lower slot can
+	 * take the one it leaves, so the walk reaches it first.
+	 */
+	for (s = nslots; s > 0; s--) {
+		u8 slot = s - 1, pos = pos_of_slot[slot];
+
+		if (pos == slot)
+			continue;
+
+		if (pos < slot) {
+			moves[n].dst = BPF_JIT_ARG_TMP;
+			back = slot;
+		} else {
+			moves[n].dst = pos;
+		}
+		moves[n].src = slot;
+		n++;
+	}
+
+	if (back < nslots) {
+		moves[n].dst = pos_of_slot[back];
+		moves[n].src = BPF_JIT_ARG_TMP;
+		n++;
+	}
+
+	return n;
+}
+
+bool __weak bpf_jit_supports_stack_args(void)
+{
+	return false;
+}
+
+bool __weak bpf_jit_supports_arena_args(void)
+{
+	return false;
+}
+
 bool __weak bpf_jit_supports_far_kfunc_call(void)
 {
 	return false;
 }
 
 bool __weak bpf_jit_supports_arena(void)
+{
+	return false;
+}
+
+/* Whether JIT takes BPF_REG_AX as the address of arena access */
+bool __weak bpf_jit_supports_arena_scalar(void)
 {
 	return false;
 }
@@ -3303,6 +3590,19 @@ bool __weak bpf_jit_supports_private_stack(void)
 	return false;
 }
 
+/*
+ * Return TRUE if the JIT lays out frames of up to MAX_BPF_STACK_JIT bytes.
+ * Its prologue, epilogue and tail call sequences must encode such frame
+ * sizes and a private stack must be sized from the program's depth. The
+ * budget is only granted alongside bpf_jit_supports_subprog_tailcalls(),
+ * whose tail calls land before the target sets up its own frame; see
+ * bpf_prog_stack_limit().
+ */
+bool __weak bpf_jit_supports_large_stack(void)
+{
+	return false;
+}
+
 void __weak arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie)
 {
 }
@@ -3363,6 +3663,12 @@ __weak u64 bpf_arena_get_kern_vm_start(struct bpf_arena *arena)
 }
 
 #ifdef CONFIG_BPF_SYSCALL
+__weak bool bpf_arena_handle_page_fault(unsigned long addr, bool is_write,
+					unsigned long fault_ip)
+{
+	return false;
+}
+
 static int __init bpf_global_ma_init(void)
 {
 	int ret;
@@ -3386,24 +3692,14 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(xdp_bulk_tx);
 
 #ifdef CONFIG_BPF_SYSCALL
 
-void bpf_get_linfo_file_line(struct btf *btf, const struct bpf_line_info *linfo,
-			     const char **filep, const char **linep, int *nump)
+void bpf_get_linfo_source(struct btf *btf, const struct bpf_line_info *linfo,
+			  struct bpf_linfo_source *src)
 {
-	/* Get base component of the file path. */
-	if (filep) {
-		*filep = btf_name_by_offset(btf, linfo->file_name_off);
-		*filep = kbasename(*filep);
-	}
-
-	/* Obtain the source line, and strip whitespace in prefix. */
-	if (linep) {
-		*linep = btf_name_by_offset(btf, linfo->line_off);
-		while (isspace(**linep))
-			*linep += 1;
-	}
-
-	if (nump)
-		*nump = BPF_LINE_INFO_LINE_NUM(linfo->line_col);
+	src->file = kbasename(btf_name_by_offset(btf, linfo->file_name_off));
+	src->line = btf_name_by_offset(btf, linfo->line_off);
+	src->file_name_off = linfo->file_name_off;
+	src->line_num = BPF_LINE_INFO_LINE_NUM(linfo->line_col);
+	src->line_col = BPF_LINE_INFO_LINE_COL(linfo->line_col);
 }
 
 const struct bpf_line_info *bpf_find_linfo(const struct bpf_prog *prog, u32 insn_off)
@@ -3446,6 +3742,7 @@ const struct bpf_line_info *bpf_find_linfo(const struct bpf_prog *prog, u32 insn
 int bpf_prog_get_file_line(struct bpf_prog *prog, unsigned long ip, const char **filep,
 			   const char **linep, int *nump)
 {
+	struct bpf_linfo_source src;
 	int idx = -1, insn_start, insn_end, len;
 	struct bpf_line_info *linfo;
 	void **jited_linfo;
@@ -3477,7 +3774,15 @@ int bpf_prog_get_file_line(struct bpf_prog *prog, unsigned long ip, const char *
 	if (idx == -1)
 		return -ENOENT;
 
-	bpf_get_linfo_file_line(btf, &linfo[idx], filep, linep, nump);
+	bpf_get_linfo_source(btf, &linfo[idx], &src);
+	while (isspace(*src.line))
+		src.line++;
+	if (filep)
+		*filep = src.file;
+	if (linep)
+		*linep = src.line;
+	if (nump)
+		*nump = src.line_num;
 	return 0;
 }
 

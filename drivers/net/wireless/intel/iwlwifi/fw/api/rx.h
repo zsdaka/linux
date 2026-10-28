@@ -263,6 +263,9 @@ enum iwl_rx_mpdu_reorder_data {
 
 enum iwl_rx_mpdu_phy_info {
 	IWL_RX_MPDU_PHY_EOF_INDICATION	= BIT(0),
+	IWL_RX_MPDU_PHY_UEQM		= BIT(1) | BIT(2),
+	IWL_RX_MPDU_PHY_2X_LDPC		= BIT(3),
+	IWL_RX_MPDU_PHY_NPCA		= BIT(4),
 	IWL_RX_MPDU_PHY_AMPDU		= BIT(5),
 	IWL_RX_MPDU_PHY_AMPDU_TOGGLE	= BIT(6),
 	IWL_RX_MPDU_PHY_SHORT_PREAMBLE	= BIT(7),
@@ -580,7 +583,11 @@ struct iwl_rx_mpdu_desc_v3 {
 	/**
 	 * @reserved_xsum: reserved high bits in the raw checksum
 	 */
-	__le16 reserved_xsum;
+	u8 reserved_xsum;
+	/**
+	 * @mac_context: MAC context mask, in this DW only from API version 10
+	 */
+	u8 mac_context;
 	/* DW11 */
 	/**
 	 * @rate_n_flags: RX rate/flags encoding
@@ -600,9 +607,10 @@ struct iwl_rx_mpdu_desc_v3 {
 	 */
 	u8 channel;
 	/**
-	 * @mac_context: MAC context mask
+	 * @ru: RU/MRU/DRU used for the frame, in trigger-like format;
+	 *	only from API version 10, this byte held @mac_context before
 	 */
-	u8 mac_context;
+	u8 ru;
 	/* DW13 */
 	/**
 	 * @gp2_on_air_rise: GP2 timer value on air rise (INA)
@@ -644,7 +652,11 @@ struct iwl_rx_mpdu_desc_v3 {
 	__le32 reserved[1];
 } __packed; /* RX_MPDU_RES_START_API_S_VER_3,
 	     * RX_MPDU_RES_START_API_S_VER_5,
-	     * RX_MPDU_RES_START_API_S_VER_6
+	     * RX_MPDU_RES_START_API_S_VER_6,
+	     * RX_MPDU_RES_START_API_S_VER_7,
+	     * RX_MPDU_RES_START_API_S_VER_8,
+	     * RX_MPDU_RES_START_API_S_VER_9,
+	     * RX_MPDU_RES_START_API_S_VER_10
 	     */
 
 /**
@@ -732,6 +744,10 @@ struct iwl_rx_mpdu_desc {
 	     * RX_MPDU_RES_START_API_S_VER_4,
 	     * RX_MPDU_RES_START_API_S_VER_5,
 	     * RX_MPDU_RES_START_API_S_VER_6
+	     * RX_MPDU_RES_START_API_S_VER_7
+	     * RX_MPDU_RES_START_API_S_VER_8
+	     * RX_MPDU_RES_START_API_S_VER_9
+	     * RX_MPDU_RES_START_API_S_VER_10
 	     */
 
 #define IWL_RX_DESC_SIZE_V1 offsetofend(struct iwl_rx_mpdu_desc, v1)
@@ -1169,8 +1185,14 @@ struct iwl_he_tb_sigs {
 #define OFDM_UCODE_TRIG_BASE_RX_BANDWIDTH		0x00007000
 #define OFDM_UCODE_TRIG_BASE_PS160			0x00008000
 #define OFDM_UCODE_EHT_TRIG_CONTROL_CHANNEL		0x000f0000
+/* for UHR, since PE RF: */
+#define OFDM_UCODE_TRIG_BASE_RX_MCS_UHR_AND_LATER	0x01f00000
+#define OFDM_UCODE_RX_IS_DRU				0x02000000
+#define OFDM_UCODE_RX_IS_2XLDPC_ENABLED			0x04000000
+#define OFDM_UCODE_RX_DRU_DBW				0x60000000
 	__le32 tb_rx0;
-#define OFDM_UCODE_TRIG_BASE_RX_MCS			0x0000000f
+/* prior to PE RF, cannot have 5 bits needed for UHR: */
+#define OFDM_UCODE_TRIG_BASE_RX_MCS_PRE_UHR		0x0000000f
 #define OFDM_UCODE_TRIG_BASE_RX_DCM			0x00000010
 #define OFDM_UCODE_TRIG_BASE_RX_GI_LTF_TYPE		0x00000060
 #define OFDM_UCODE_TRIG_BASE_RX_NSTS			0x00000380
@@ -1275,15 +1297,16 @@ struct iwl_uhr_sigs {
 	__le32 usig_a1;
 #define OFDM_RX_FRAME_UHR_BSS_COLOR2			0x0000003f
 	__le32 usig_a1_uhr;
-#define	OFDM_RX_FRAME_UHR_PPDU_TYPE			0x00000003
-#define	OFDM_RX_FRAME_UHR_COBF_CSR_DISABLE		0x00000004
-#define	OFDM_RX_FRAME_UHR_PUNC_CHANNEL			0x000000f8
-#define	OFDM_RX_FRAME_UHR_USIG2_VALIDATE_B8		0x00000100
-#define	OFDM_RX_FRAME_UHR_SIG_MCS			0x00000600
-#define	OFDM_RX_FRAME_UHR_SIG_SYM_NUM			0x0000f800
-#define	OFDM_RX_FRAME_UHR_TRIG_SPATIAL_REUSE_1		0x000f0000
-#define	OFDM_RX_FRAME_UHR_TRIG_SPATIAL_REUSE_2		0x00f00000
-#define	OFDM_RX_FRAME_UHR_TRIG_USIG2_DISREGARD		0x1f000000
+#define OFDM_RX_FRAME_UHR_PPDU_TYPE			0x00000003
+#define OFDM_RX_FRAME_UHR_COBF_CSR_DISABLE		0x00000004
+#define OFDM_RX_FRAME_UHR_PUNC_CHANNEL			0x000000f8
+#define OFDM_RX_FRAME_UHR_USIG2_VALIDATE_B8		0x00000100
+#define OFDM_RX_FRAME_UHR_SIG_MCS			0x00000600
+#define OFDM_RX_FRAME_UHR_SIG_SYM_NUM			0x0000f800
+#define OFDM_RX_FRAME_UHR_TRIG_SPATIAL_REUSE_1		0x000f0000
+#define OFDM_RX_FRAME_UHR_TRIG_SPATIAL_REUSE_2		0x00f00000
+#define OFDM_RX_FRAME_UHR_TRIG_USIG2_DISREGARD		0x1f000000
+#define OFDM_RX_FRAME_UHR_USIG_CRC_OK			0x40000000
 	__le32 usig_a2_uhr;
 #define OFDM_RX_FRAME_UHR_SPATIAL_REUSE			0x0000000f
 #define OFDM_RX_FRAME_UHR_GI_LTF_TYPE			0x00000030
@@ -1305,6 +1328,7 @@ struct iwl_uhr_sigs {
 #define OFDM_RX_FRAME_UHR_CODING			0x00000200
 #define OFDM_RX_FRAME_UHR_SPATIAL_CONFIG		0x00003c00
 #define OFDM_RX_FRAME_UHR_STA_RU			0x003fc000
+#define OFDM_RX_FRAME_UHR_STA_RU_P80			0x00004000
 #define OFDM_RX_FRAME_UHR_STA_RU_PS160			0x00400000
 #define OFDM_RX_FRAME_UHR_UEQM				0x00800000
 #define OFDM_RX_FRAME_UHR_2XLDPC			0x01000000
@@ -1330,7 +1354,12 @@ struct iwl_uhr_tb_sigs {
 
 struct iwl_uhr_elr_sigs {
 	/* same as UHR above */
-	__le32 usig_a1, usig_a2_uhr;
+	__le32 usig_a1;
+#define OFDM_RX_VECTOR_UHR_ELR_PPDU_TYPE		0x00000003
+#define OFDM_RX_VECTOR_UHR_ELR_USIG_STA_ID		0x00001ffc
+#define OFDM_RX_VECTOR_UHR_ELR_VALIDATE			0x0000e000
+#define OFDM_RX_VECTOR_UHR_ELR_CRC_OK			0x40000000
+	__le32 usig_a2_uhr_elr;
 #define OFDM_RX_VECTOR_UHR_ELR_VER_ID			0x00000007
 #define OFDM_RX_VECTOR_UHR_ELR_UPLINK_FLAG		0x00000008
 #define OFDM_RX_VECTOR_UHR_ELR_MCS			0x00000010
@@ -1345,7 +1374,7 @@ struct iwl_uhr_elr_sigs {
 #define OFDM_RX_VECTOR_UHR_ELR_SIG_ID_INDX		0x00000e00
 #define OFDM_RX_VECTOR_UHR_ELR_STA_RU			0x000ff000
 #define OFDM_RX_VECTOR_UHR_ELR_STA_RU_PS160		0x00100000
-#define OFDM_RX_VECTOR_UHR_ELR_SIG2_CRC_OK		0x00200000
+#define OFDM_RX_VECTOR_UHR_ELR_SIG2_CRC_OK		0x40000000
 	__le32 uhr_sig_elr2;
 };
 

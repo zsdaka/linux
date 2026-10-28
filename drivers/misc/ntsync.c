@@ -19,6 +19,7 @@
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/time_namespace.h>
 #include <uapi/linux/ntsync.h>
 
 #define NTSYNC_NAME	"ntsync"
@@ -723,9 +724,9 @@ static int ntsync_obj_get_fd(struct ntsync_obj *obj)
 {
 	FD_PREPARE(fdf, O_CLOEXEC,
 		   anon_inode_getfile("ntsync", &ntsync_obj_fops, obj, O_RDWR));
-	if (fdf.err)
-		return fdf.err;
-	obj->file = fd_prepare_file(fdf);
+	if (fdf->fd < 0)
+		return fdf->fd;
+	obj->file = fdf->file;
 	return fd_publish(fdf);
 }
 
@@ -836,6 +837,8 @@ static int ntsync_schedule(const struct ntsync_q *q, const struct ntsync_wait_ar
 
 	if (args->flags & NTSYNC_WAIT_REALTIME)
 		clock = CLOCK_REALTIME;
+	else
+		timeout = timens_ktime_to_host(clock, timeout);
 
 	do {
 		if (signal_pending(current)) {
@@ -870,6 +873,9 @@ static int setup_wait(struct ntsync_device *dev,
 	__u32 i, j;
 
 	if (args->pad || (args->flags & ~NTSYNC_WAIT_REALTIME))
+		return -EINVAL;
+
+	if (!args->owner)
 		return -EINVAL;
 
 	if (size >= sizeof(fds))

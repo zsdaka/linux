@@ -8,33 +8,41 @@
 #define LINUX_IEEE80211_UHR_H
 
 #include <linux/types.h>
+#include <linux/bitfield.h>
 #include <linux/if_ether.h>
+#include "ieee80211-eht.h"
 
 #define IEEE80211_UHR_OPER_PARAMS_DPS_ENA		0x0001
 #define IEEE80211_UHR_OPER_PARAMS_NPCA_ENA		0x0002
 #define IEEE80211_UHR_OPER_PARAMS_PEDCA_ENA		0x0004
 #define IEEE80211_UHR_OPER_PARAMS_DBE_ENA		0x0008
+#define IEEE80211_UHR_OPER_PARAMS_DBE_BW		0x0070
+#define IEEE80211_UHR_OPER_PARAMS_ELR_RX		0x0080
+#define IEEE80211_UHR_OPER_PARAMS_DUO_PRES		0x0100
+#define IEEE80211_UHR_OPER_PARAMS_DPS_PRES		0x0200
+#define IEEE80211_UHR_OPER_PARAMS_NPCA_PRES		0x0400
+#define IEEE80211_UHR_OPER_PARAMS_PEDCA_PRES		0x0800
+#define IEEE80211_UHR_OPER_PARAMS_DBE_PRES		0x1000
 
 struct ieee80211_uhr_operation {
 	__le16 params;
-	u8 basic_mcs_nss_set[4];
 	u8 variable[];
 } __packed;
 
-#define IEEE80211_UHR_NPCA_PARAMS_PRIMARY_CHAN_OFFS	0x0000000F
-#define IEEE80211_UHR_NPCA_PARAMS_MIN_DUR_THRESH	0x000000F0
-#define IEEE80211_UHR_NPCA_PARAMS_SWITCH_DELAY		0x00003F00
-#define IEEE80211_UHR_NPCA_PARAMS_SWITCH_BACK_DELAY	0x000FC000
-#define IEEE80211_UHR_NPCA_PARAMS_INIT_QSRC		0x00300000
-#define IEEE80211_UHR_NPCA_PARAMS_MOPLEN		0x00400000
-#define IEEE80211_UHR_NPCA_PARAMS_DIS_SUBCH_BMAP_PRES	0x00800000
+#define IEEE80211_UHR_NPCA_PARAMS_PRIMARY_CHAN		0x000000FF
+#define IEEE80211_UHR_NPCA_PARAMS_MIN_DUR_THRESH	0x00000F00
+#define IEEE80211_UHR_NPCA_PARAMS_SWITCH_DELAY		0x0003F000
+#define IEEE80211_UHR_NPCA_PARAMS_SWITCH_BACK_DELAY	0x00FC0000
+#define IEEE80211_UHR_NPCA_PARAMS_INIT_QSRC		0x03000000
+#define IEEE80211_UHR_NPCA_PARAMS_MOPLEN		0x04000000
+#define IEEE80211_UHR_NPCA_PARAMS_DIS_SUBCH_BMAP_PRES	0x08000000
 
 /**
  * struct ieee80211_uhr_npca_info - npca operation information
  *
  * This structure is the "NPCA Operation Parameters field format" of "UHR
- * Operation Element" fields as described in P802.11bn_D1.3
- * subclause 9.4.2.353. See Figure 9-aa4.
+ * Operation Element" fields as described in P802.11bn_D1.5
+ * subclause 9.4.2.355.2, see Figure 9-aa6.
  *
  * Refer to IEEE80211_UHR_NPCA*
  * @params:
@@ -89,7 +97,7 @@ struct ieee80211_uhr_npca_info {
  * struct ieee80211_uhr_dps_info - DPS operation information
  *
  * This structure is the "DPS Operation Parameter field" of "UHR
- * Operation Element" fields as described in P802.11bn_D1.3
+ * Operation Element" fields as described in P802.11bn_D1.5
  * subclause 9.4.1.87. See Figure 9-207u.
  *
  * Refer to IEEE80211_UHR_DPS*
@@ -177,11 +185,34 @@ enum ieee80211_uhr_dbe_oper_bw {
 };
 
 /**
+ * ieee80211_uhr_dbe_bw_mhz - get bandwidth in MHz from UHR DBE bandwidth
+ * @bw: UHR DBE bandwidth
+ *
+ * Return: the bandwidth in MHz, or -1 for invalid values
+ */
+static inline int ieee80211_uhr_dbe_bw_mhz(enum ieee80211_uhr_dbe_oper_bw bw)
+{
+	switch (bw) {
+	case IEEE80211_UHR_DBE_OPER_BW_40:
+		return 40;
+	case IEEE80211_UHR_DBE_OPER_BW_80:
+		return 80;
+	case IEEE80211_UHR_DBE_OPER_BW_160:
+		return 160;
+	case IEEE80211_UHR_DBE_OPER_BW_320_1:
+	case IEEE80211_UHR_DBE_OPER_BW_320_2:
+		return 320;
+	default:
+		return -1;
+	}
+}
+
+/**
  * struct ieee80211_uhr_dbe_info - DBE operation information
  *
  * This structure is the "DBE Operation Parameters field" of
- * "UHR Operation Element" fields as described in P802.11bn_D1.3
- * subclause 9.4.2.353. See Figure 9-aa6.
+ * "UHR Operation Element" fields as described in P802.11bn_D1.5
+ * subclause 9.4.2.355.4, see Figure 9-aa9.
  *
  * Refer to IEEE80211_UHR_DBE_OPER*
  * @params:
@@ -203,25 +234,23 @@ struct ieee80211_uhr_dbe_info {
 	__le16 dis_subch_bmap[];
 } __packed;
 
-#define IEEE80211_UHR_P_EDCA_ECWMIN		0x0F
-#define IEEE80211_UHR_P_EDCA_ECWMAX		0xF0
-#define IEEE80211_UHR_P_EDCA_AIFSN		0x000F
-#define IEEE80211_UHR_P_EDCA_CW_DS		0x0030
-#define IEEE80211_UHR_P_EDCA_PSRC_THRESHOLD	0x01C0
-#define IEEE80211_UHR_P_EDCA_QSRC_THRESHOLD	0x0600
+#define IEEE80211_UHR_P_EDCA_ECWMIN		0x0007
+#define IEEE80211_UHR_P_EDCA_ECWMAX		0x0038
+#define IEEE80211_UHR_P_EDCA_AIFSN		0x01C0
+#define IEEE80211_UHR_P_EDCA_CW_DS		0x0600
+#define IEEE80211_UHR_P_EDCA_PSRC_THRESHOLD	0x3800
+#define IEEE80211_UHR_P_EDCA_QSRC_THRESHOLD	0xC000
 
 /**
  * struct ieee80211_uhr_p_edca_info - P-EDCA operation information
  *
  * This structure is the "P-EDCA Operation Parameters field" of
- * "UHR Operation Element" fields as described in P802.11bn_D1.3
- * subclause 9.4.2.353. See Figure 9-aa5.
+ * "UHR Operation Element" fields as described in P802.11bn_D1.5
+ * subclause 9.4.2.355.3, see Figure 9-aa8.
  *
  * Refer to IEEE80211_UHR_P_EDCA*
- * @p_edca_ec: P-EDCA ECWmin and ECWmax.
- *	These fields indicate the CWmin and CWmax values used by a
- *	P-EDCA STA during P-EDCA contention.
- * @params: AIFSN, CW DS, PSRC threshold, and QSRC threshold.
+ * @params: ECWmin, ECWmax, AIFSN, CW DS, PSRC threshold, and QSRC threshold.
+ *	- CWmin/CWmax values used by a P-EDCA STA during P-EDCA contention.
  *	- The AIFSN field indicates the AIFSN value used by a P-EDCA STA
  *	  during P-EDCA contention.
  *	- The CW DS field indicates the value used for randomization of the
@@ -235,12 +264,10 @@ struct ieee80211_uhr_dbe_info {
  *	  value 0 is reserved.
  */
 struct ieee80211_uhr_p_edca_info {
-	u8 p_edca_ec;
 	__le16 params;
 } __packed;
 
-static inline bool ieee80211_uhr_oper_size_ok(const u8 *data, u8 len,
-					      bool beacon)
+static inline bool ieee80211_uhr_oper_size_ok(const u8 *data, u8 len)
 {
 	const struct ieee80211_uhr_operation *oper = (const void *)data;
 	u8 needed = sizeof(*oper);
@@ -248,19 +275,15 @@ static inline bool ieee80211_uhr_oper_size_ok(const u8 *data, u8 len,
 	if (len < needed)
 		return false;
 
-	/* nothing else present in beacons */
-	if (beacon)
-		return true;
-
 	/* DPS Operation Parameters (fixed 4 bytes) */
-	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DPS_ENA)) {
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DPS_PRES)) {
 		needed += sizeof(struct ieee80211_uhr_dps_info);
 		if (len < needed)
 			return false;
 	}
 
 	/* NPCA Operation Parameters (fixed 4 bytes + optional 2 bytes) */
-	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_NPCA_ENA)) {
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_NPCA_PRES)) {
 		const struct ieee80211_uhr_npca_info *npca =
 			(const void *)(data + needed);
 
@@ -276,15 +299,15 @@ static inline bool ieee80211_uhr_oper_size_ok(const u8 *data, u8 len,
 		}
 	}
 
-	/* P-EDCA Operation Parameters (fixed 3 bytes) */
-	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_PEDCA_ENA)) {
+	/* P-EDCA Operation Parameters */
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_PEDCA_PRES)) {
 		needed += sizeof(struct ieee80211_uhr_p_edca_info);
 		if (len < needed)
 			return false;
 	}
 
 	/* DBE Operation Parameters (fixed 1 byte + optional 2 bytes) */
-	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DBE_ENA)) {
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DBE_PRES)) {
 		const struct ieee80211_uhr_dbe_info *dbe =
 			(const void *)(data + needed);
 
@@ -303,19 +326,22 @@ static inline bool ieee80211_uhr_oper_size_ok(const u8 *data, u8 len,
 	return len >= needed;
 }
 
-/*
- * Note: cannot call this on the element coming from a beacon,
- * must ensure ieee80211_uhr_oper_size_ok(..., false) first
- */
+/* Note: must ensure ieee80211_uhr_oper_size_ok(...) first */
 static inline const struct ieee80211_uhr_npca_info *
 ieee80211_uhr_npca_info(const struct ieee80211_uhr_operation *oper)
 {
 	const u8 *pos = oper->variable;
 
+	if (!(oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_NPCA_PRES)))
+		return NULL;
+
 	if (!(oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_NPCA_ENA)))
 		return NULL;
 
-	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DPS_ENA))
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DUO_PRES))
+		pos += 1;
+
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DPS_PRES))
 		pos += sizeof(struct ieee80211_uhr_dps_info);
 
 	return (const void *)pos;
@@ -332,6 +358,38 @@ ieee80211_uhr_npca_dis_subch_bitmap(const struct ieee80211_uhr_operation *oper)
 	if (!(npca->params & cpu_to_le32(IEEE80211_UHR_NPCA_PARAMS_DIS_SUBCH_BMAP_PRES)))
 		return NULL;
 	return npca->dis_subch_bmap;
+}
+
+/* Note: must ensure ieee80211_uhr_oper_size_ok(...) first */
+static inline const struct ieee80211_uhr_dbe_info *
+ieee80211_uhr_oper_dbe_info(const struct ieee80211_uhr_operation *oper)
+{
+	const u8 *pos = oper->variable;
+
+	if (!(oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DBE_PRES)))
+		return NULL;
+
+	if (!(oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DBE_ENA)))
+		return NULL;
+
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DUO_PRES))
+		pos += 1;
+
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_DPS_PRES))
+		pos += sizeof(struct ieee80211_uhr_dps_info);
+
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_NPCA_PRES)) {
+		const struct ieee80211_uhr_npca_info *npca = (const void *)pos;
+
+		pos += sizeof(*npca);
+		if (npca->params & cpu_to_le32(IEEE80211_UHR_NPCA_PARAMS_DIS_SUBCH_BMAP_PRES))
+			pos += sizeof(npca->dis_subch_bmap[0]);
+	}
+
+	if (oper->params & cpu_to_le16(IEEE80211_UHR_OPER_PARAMS_PEDCA_PRES))
+		pos += sizeof(struct ieee80211_uhr_p_edca_info);
+
+	return (const void *)pos;
 }
 
 #define IEEE80211_UHR_MAC_CAP0_DPS_SUPP			0x01
@@ -360,22 +418,42 @@ ieee80211_uhr_npca_dis_subch_bitmap(const struct ieee80211_uhr_operation *oper)
 #define IEEE80211_UHR_MAC_CAP2_UHR_OM_PU_TO_LOW		0xC0
 
 #define IEEE80211_UHR_MAC_CAP3_UHR_OM_PU_TO_HIGH	0x03
-#define IEEE80211_UHR_MAC_CAP3_PARAM_UPD_ADV_NOTIF_INTV	0x1C
-#define IEEE80211_UHR_MAC_CAP3_UPD_IND_TIM_INTV_LOW	0xE0
+#define IEEE80211_UHR_MAC_CAP3_PARAM_UPD_ADV_NOTIF_INTV	0x7C
+#define IEEE80211_UHR_MAC_CAP3_UPD_IND_TIM_INTV_LOW	0x80
 
-#define IEEE80211_UHR_MAC_CAP4_UPD_IND_TIM_INTV_HIGH	0x03
-#define IEEE80211_UHR_MAC_CAP4_BOUNDED_ESS		0x04
-#define IEEE80211_UHR_MAC_CAP4_BTM_ASSURANCE		0x08
-#define IEEE80211_UHR_MAC_CAP4_CO_BF_SUPP		0x10
+#define IEEE80211_UHR_MAC_CAP4_UPD_IND_TIM_INTV_HIGH	0x0F
+#define IEEE80211_UHR_MAC_CAP4_BOUNDED_ESS		0x10
+#define IEEE80211_UHR_MAC_CAP4_BTM_ASSURANCE		0x20
+#define IEEE80211_UHR_MAC_CAP4_CO_BF_SUPP		0x40
+#define IEEE80211_UHR_MAC_CAP4_CO_SR_SUPP		0x80
+
+#define IEEE80211_UHR_MAC_CAP5_MAPC_ENH_MSRMT_SUPP	0x01
 
 #define IEEE80211_UHR_MAC_CAP_DBE_MAX_BW		0x07
 #define IEEE80211_UHR_MAC_CAP_DBE_EHT_MCS_MAP_160_PRES	0x08
 #define IEEE80211_UHR_MAC_CAP_DBE_EHT_MCS_MAP_320_PRES	0x10
 
+/* struct ieee80211_uhr_cap_dbe::bwcap[].cap */
+#define IEEE80211_UHR_MAC_CAP_DBE_CAP_NUM_SND_DIMS		0x07
+#define IEEE80211_UHR_MAC_CAP_DBE_CAP_NON_OFDMA_UL_MUMIMO	0x08
+#define IEEE80211_UHR_MAC_CAP_DBE_CAP_MU_BEAMFORMER		0x10
+#define IEEE80211_UHR_MAC_CAP_DBE_CAP_BEAMFORMEE_SS		0xe0
+
+struct ieee80211_uhr_cap_dbe {
+	u8 cap;
+	u8 max_switch_time_period;
+	u8 mode_change_intvl;
+	/* present 0, 1 or 2 times depending on _PRES bits */
+	struct {
+		struct ieee80211_eht_mcs_nss_supp_bw eht_mcs_map;
+		u8 cap;
+	} __packed bwcap[];
+} __packed;
+
 /**
  * enum ieee80211_uhr_dbe_max_supported_bw - DBE Maximum Supported Bandwidth
  *
- * As per spec P802.11bn_D1.3 "Table 9-bb5—Encoding of the DBE Maximum
+ * As per spec P802.11bn_D1.5 Table 9-bb8 "Encoding of the DBE Maximum
  * Supported Bandwidth field".
  *
  * @IEEE80211_UHR_DBE_MAX_BW_40: Indicates 40 MHz DBE max supported bw
@@ -391,33 +469,56 @@ enum ieee80211_uhr_dbe_max_supported_bw {
 };
 
 struct ieee80211_uhr_cap_mac {
-	u8 mac_cap[5];
+	u8 mac_cap[6];
+} __packed;
+
+#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_SND_NDP_LE80	0x00000001
+#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_DL_MU_LE80	0x00000002
+#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_SND_NDP_160	0x00000004
+#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_DL_MU_160	0x00000008
+#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_SND_NDP_320	0x00000010
+#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_DL_MU_320	0x00000020
+#define IEEE80211_UHR_PHY_CAP_ELR_TX			0x00000040
+#define IEEE80211_UHR_PHY_CAP_ELR_RX			0x00000080
+#define IEEE80211_UHR_PHY_CAP_PART_BW_DL_MUMIMO		0x00000100
+#define IEEE80211_UHR_PHY_CAP_PART_BW_UL_MUMIMO		0x00000200
+#define IEEE80211_UHR_PHY_CAP_MCS15			0x00000400
+#define IEEE80211_UHR_PHY_CAP_2XLDPC_TX			0x00000800
+#define IEEE80211_UHR_PHY_CAP_2XLDPC_RX			0x00001000
+#define IEEE80211_UHR_PHY_CAP_UEQM_TX_MAX_NSS		0x00006000
+#define IEEE80211_UHR_PHY_CAP_UEQM_RX_MAX_NSS		0x00018000
+#define IEEE80211_UHR_PHY_CAP_CO_BF_JOINT_SOUNDING	0x00040000
+#define IEEE80211_UHR_PHY_CAP_IM_TX			0x00080000
+#define IEEE80211_UHR_PHY_CAP_IM_RX			0x00100000
+#define IEEE80211_UHR_PHY_CAP_CO_SR_MODE_1		0x00200000
+#define IEEE80211_UHR_PHY_CAP_CO_SR_MODE_2		0x00400000
+#define IEEE80211_UHR_PHY_CAP_DRU_DBW_20_IN_PBW_20	0x00800000
+#define IEEE80211_UHR_PHY_CAP_DRU_DBW_40_IN_PBW_40	0x01000000
+#define IEEE80211_UHR_PHY_CAP_DRU_DBW_80_IN_PBW_80	0x02000000
+#define IEEE80211_UHR_PHY_CAP_DRU_DBW_80_IN_PBW_160	0x04000000
+#define IEEE80211_UHR_PHY_CAP_DRU_DBW_80_IN_PBW_320	0x08000000
+#define IEEE80211_UHR_PHY_CAP_DRU_DBW_20_IN_PBW_GE80	0x10000000
+#define IEEE80211_UHR_PHY_CAP_DRU_DBW_40_IN_PBW_GE80	0x20000000
+#define IEEE80211_UHR_PHY_CAP_DRU_DBW_60_IN_PBW_GE80	0x40000000
+#define IEEE80211_UHR_PHY_CAP_DRU_RRU_HYBRID_MODE	0x80000000
+
+struct ieee80211_uhr_cap_phy {
+	__le32 cap;
+	u8 reserved;
 } __packed;
 
 struct ieee80211_uhr_cap {
 	struct ieee80211_uhr_cap_mac mac;
-	/* DBE, PHY capabilities */
+	struct ieee80211_uhr_cap_phy phy;
+	/* optional DBE capabilities */
 	u8 variable[];
-} __packed;
-
-#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_SND_NDP_LE80	0x01
-#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_DL_MU_LE80	0x02
-#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_SND_NDP_160	0x04
-#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_DL_MU_160	0x08
-#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_SND_NDP_320	0x10
-#define IEEE80211_UHR_PHY_CAP_MAX_NSS_RX_DL_MU_320	0x20
-#define IEEE80211_UHR_PHY_CAP_ELR_RX			0x40
-#define IEEE80211_UHR_PHY_CAP_ELR_TX			0x80
-
-struct ieee80211_uhr_cap_phy {
-	u8 cap;
 } __packed;
 
 static inline bool ieee80211_uhr_capa_size_ok(const u8 *data, u8 len,
 					      bool from_ap)
 {
 	const struct ieee80211_uhr_cap *cap = (const void *)data;
-	size_t needed = sizeof(*cap) + sizeof(struct ieee80211_uhr_cap_phy);
+	size_t needed = sizeof(*cap);
 
 	if (len < needed)
 		return false;
@@ -427,42 +528,60 @@ static inline bool ieee80211_uhr_capa_size_ok(const u8 *data, u8 len,
 	 * in the UHR MAC Capabilities Information field.
 	 */
 	if (from_ap && cap->mac.mac_cap[1] & IEEE80211_UHR_MAC_CAP1_DBE_SUPP) {
-		u8 dbe;
+		const struct ieee80211_uhr_cap_dbe *dbe;
 
-		needed += 1;
+		needed += sizeof(struct ieee80211_uhr_cap_dbe);
 		if (len < needed)
 			return false;
 
-		dbe = cap->variable[0];
+		dbe = (const void *)cap->variable;
 
-		if (dbe & IEEE80211_UHR_MAC_CAP_DBE_EHT_MCS_MAP_160_PRES)
-			needed += 3;
+		if (dbe->cap & IEEE80211_UHR_MAC_CAP_DBE_EHT_MCS_MAP_160_PRES)
+			needed += sizeof(dbe->bwcap[0]);
 
-		if (dbe & IEEE80211_UHR_MAC_CAP_DBE_EHT_MCS_MAP_320_PRES)
-			needed += 3;
+		if (dbe->cap & IEEE80211_UHR_MAC_CAP_DBE_EHT_MCS_MAP_320_PRES)
+			needed += sizeof(dbe->bwcap[0]);
 	}
 
 	return len >= needed;
 }
 
-static inline const struct ieee80211_uhr_cap_phy *
-ieee80211_uhr_phy_cap(const struct ieee80211_uhr_cap *cap, bool from_ap)
+#define IEEE80211_UHR_OM_PU_TO_128TU	11
+
+/**
+ * ieee80211_uhr_capa_get_om_pu_to_us - get OM parameter update timeout in usec
+ * @cap: the UHR capability element, size must be validated
+ *
+ * Return: the OM parameter update timeout in usec, or -1 if it's not valid
+ */
+static inline int
+ieee80211_uhr_capa_get_om_pu_to_us(const struct ieee80211_uhr_cap *cap)
 {
-	u8 offs = 0;
+	u8 timeout;
 
-	if (from_ap && cap->mac.mac_cap[1] & IEEE80211_UHR_MAC_CAP1_DBE_SUPP) {
-		u8 dbe = cap->variable[0];
+	timeout = u8_get_bits(cap->mac.mac_cap[3],
+			      IEEE80211_UHR_MAC_CAP3_UHR_OM_PU_TO_HIGH);
+	timeout <<= 2;
+	timeout |= u8_get_bits(cap->mac.mac_cap[2],
+			       IEEE80211_UHR_MAC_CAP2_UHR_OM_PU_TO_LOW);
 
-		offs += 1;
+	if (timeout > IEEE80211_UHR_OM_PU_TO_128TU)
+		return -1;
 
-		if (dbe & IEEE80211_UHR_MAC_CAP_DBE_EHT_MCS_MAP_160_PRES)
-			offs += 3;
+	if (!timeout)
+		return 0;
 
-		if (dbe & IEEE80211_UHR_MAC_CAP_DBE_EHT_MCS_MAP_320_PRES)
-			offs += 3;
-	}
+	return 128 << (timeout - 1);
+}
 
-	return (const void *)&cap->variable[offs];
+/* only valid from AP, must check ieee80211_uhr_capa_size_ok(..., true) */
+static inline const struct ieee80211_uhr_cap_dbe *
+ieee80211_uhr_dbe_cap(const struct ieee80211_uhr_cap *cap)
+{
+	if (!(cap->mac.mac_cap[1] & IEEE80211_UHR_MAC_CAP1_DBE_SUPP))
+		return NULL;
+
+	return (const void *)cap->variable;
 }
 
 #define IEEE80211_SMD_INFO_CAPA_DL_DATA_FWD		0x01
@@ -475,5 +594,71 @@ struct ieee80211_smd_info {
 	u8 capa;
 	__le16 timeout;
 } __packed;
+
+enum ieee80211_protected_uhr_action {
+	IEEE80211_PROTECTED_UHR_ACTION_LINK_RECONFIG_REQUEST	= 0,
+	IEEE80211_PROTECTED_UHR_ACTION_LINK_RECONFIG_RESPONSE	= 1,
+	IEEE80211_PROTECTED_UHR_ACTION_LINK_RECONFIG_NOTIFY	= 2,
+};
+
+enum ieee80211_uhr_link_reconfig_request_type {
+	IEEE80211_UHR_LINK_RECONFIG_REQUEST_ST_PREP		= 0,
+	IEEE80211_UHR_LINK_RECONFIG_REQUEST_ST_EXEC		= 1,
+	IEEE80211_UHR_LINK_RECONFIG_REQUEST_OMP_REQUEST		= 3,
+};
+
+enum ieee80211_uhr_link_reconfig_response_type {
+	IEEE80211_UHR_LINK_RECONFIG_RESPONSE_ST_PREP		= 0,
+	IEEE80211_UHR_LINK_RECONFIG_RESPONSE_ST_EXEC		= 1,
+};
+
+enum ieee80211_uhr_link_reconfig_notify_type {
+	IEEE80211_UHR_LINK_RECONFIG_NOTIFY_DL_DRAINED		= 2,
+	IEEE80211_UHR_LINK_RECONFIG_NOTIFY_OMP_RESPONSE		= 3,
+};
+
+enum ieee80211_uhr_mode_change_control {
+	IEEE80211_UHR_MODE_CHANGE_CONTROL_MODE_ID		= 0x003f,
+	IEEE80211_UHR_MODE_CHANGE_CONTROL_MODE_ENABLE		= 0x0040,
+	IEEE80211_UHR_MODE_CHANGE_CONTROL_MODE_UPDATE		= 0x0080,
+	IEEE80211_UHR_MODE_CHANGE_CONTROL_MODE_LENGTH		= 0x0f00,
+	IEEE80211_UHR_MODE_CHANGE_CONTROL_MODE_SPECIFIC		= 0xf000,
+};
+
+enum ieee80211_uhr_mode_change_mode_id {
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_DPS			= 0,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_NPCA			= 1,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_DUO			= 2,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_DSO			= 3,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_P_EDCA		= 4,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_ELR_RX		= 5,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_AOM			= 6,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_LLI			= 7,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_CO_BF			= 8,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_CO_SR			= 9,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_EMLSR			= 10,
+	IEEE80211_UHR_MODE_CHANGE_MODE_ID_DBE			= 11,
+};
+
+struct ieee80211_uhr_mode_change_tuple {
+	__le16 control;
+	u8 variable[];
+} __packed;
+
+static inline int
+ieee80211_uhr_mode_change_tuple_size(const struct ieee80211_uhr_mode_change_tuple *tuple)
+{
+	return sizeof(*tuple) +
+	       le16_get_bits(tuple->control,
+			     IEEE80211_UHR_MODE_CHANGE_CONTROL_MODE_LENGTH);
+}
+
+#define for_each_uhr_mode_change_tuple(data, len, tuple)		\
+	for (tuple = (const void *)(data);				\
+	     (len) - ((const u8 *)tuple - (data)) >= sizeof(*tuple) &&	\
+	     (len) - ((const u8 *)tuple - (data)) >=			\
+		ieee80211_uhr_mode_change_tuple_size(tuple);		\
+	     tuple = (const void *)((const u8 *)tuple +			\
+				    ieee80211_uhr_mode_change_tuple_size(tuple)))
 
 #endif /* LINUX_IEEE80211_UHR_H */

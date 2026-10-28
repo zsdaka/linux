@@ -39,6 +39,10 @@
 #define IPU_PCI_BAR		0
 #define IPU_PCI_PBBAR		4
 
+static int force_probe = !IS_BUILTIN(CONFIG_VIDEO_INTEL_IPU6_IPU7);
+module_param(force_probe, int, 0644);
+MODULE_PARM_DESC(force_probe, "Probe ipu7 and ipu7.5 with this driver instead of ipu6");
+
 static const unsigned int ipu7_csi_offsets[] = {
 	IPU_CSI_PORT_A_ADDR_OFFSET,
 	IPU_CSI_PORT_B_ADDR_OFFSET,
@@ -2169,21 +2173,18 @@ ipu7_isys_init(struct pci_dev *pdev, struct device *parent,
 	isys_adev->mmu = ipu7_mmu_init(dev, base, ISYS_MMID,
 				       &ipdata->hw_variant);
 	if (IS_ERR(isys_adev->mmu)) {
-		dev_err_probe(dev, PTR_ERR(isys_adev->mmu),
-			      "ipu7_mmu_init(isys_adev->mmu) failed\n");
+		ret = dev_err_probe(dev, PTR_ERR(isys_adev->mmu),
+				    "ipu7_mmu_init(isys_adev->mmu) failed\n");
 		put_device(&isys_adev->auxdev.dev);
-		kfree(pdata);
-		return ERR_CAST(isys_adev->mmu);
+		return ERR_PTR(ret);
 	}
 
 	isys_adev->mmu->dev = &isys_adev->auxdev.dev;
 	isys_adev->subsys = IPU_IS;
 
 	ret = ipu7_bus_add_device(isys_adev);
-	if (ret) {
-		kfree(pdata);
+	if (ret)
 		return ERR_PTR(ret);
-	}
 
 	return isys_adev;
 }
@@ -2216,21 +2217,18 @@ ipu7_psys_init(struct pci_dev *pdev, struct device *parent,
 	psys_adev->mmu = ipu7_mmu_init(&pdev->dev, base, PSYS_MMID,
 				       &ipdata->hw_variant);
 	if (IS_ERR(psys_adev->mmu)) {
-		dev_err_probe(&pdev->dev, PTR_ERR(psys_adev->mmu),
-			      "ipu7_mmu_init(psys_adev->mmu) failed\n");
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(psys_adev->mmu),
+				    "ipu7_mmu_init(psys_adev->mmu) failed\n");
 		put_device(&psys_adev->auxdev.dev);
-		kfree(pdata);
-		return ERR_CAST(psys_adev->mmu);
+		return ERR_PTR(ret);
 	}
 
 	psys_adev->mmu->dev = &psys_adev->auxdev.dev;
 	psys_adev->subsys = IPU_PS;
 
 	ret = ipu7_bus_add_device(psys_adev);
-	if (ret) {
-		kfree(pdata);
+	if (ret)
 		return ERR_PTR(ret);
-	}
 
 	return psys_adev;
 }
@@ -2349,7 +2347,7 @@ static int ipu7_init_fw_code_region_by_sys(struct ipu7_bus_device *sys,
 		return ret;
 	}
 
-	ret = pm_runtime_get_sync(dev);
+	ret = pm_runtime_resume_and_get(dev);
 	if (ret < 0) {
 		dev_err(dev, "Failed to get runtime PM\n");
 		return ret;
@@ -2419,6 +2417,9 @@ static int ipu7_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct ipu7_device *isp;
 	u32 is_es;
 	int ret;
+
+	if (!force_probe)
+		return -ENODEV;
 
 	if (!fwnode || fwnode_property_read_u32(fwnode, "is_es", &is_es))
 		is_es = 0;
@@ -2708,7 +2709,7 @@ static int ipu7_resume(struct device *dev)
 	if (ret)
 		dev_err(dev, "IPC reset protocol failed!\n");
 
-	ret = pm_runtime_get_sync(&isp->psys->auxdev.dev);
+	ret = pm_runtime_resume_and_get(&isp->psys->auxdev.dev);
 	if (ret < 0) {
 		dev_err(dev, "Failed to get runtime PM\n");
 		return 0;

@@ -10,12 +10,11 @@
 #include <asm/posted_intr.h>
 
 #include "capabilities.h"
-#include "../kvm_cache_regs.h"
+#include "../regs.h"
 #include "pmu_intel.h"
 #include "vmcs.h"
 #include "vmx_ops.h"
 #include "../cpuid.h"
-#include "run_flags.h"
 #include "../mmu.h"
 #include "common.h"
 
@@ -161,6 +160,13 @@ struct nested_vmx {
 	bool preemption_timer_expired;
 
 	/*
+	 * Used to restore L1's CR3 if hardware detects a VM-Fail Consistency
+	 * Check that KVM does not, in which case KVM needs to unwind CR3 back
+	 * to its pre-VM-Enter state, NOT to vmcs01.HOST_CR3.
+	 */
+	unsigned long pre_vmenter_cr3;
+
+	/*
 	 * Used to snapshot MSRs that are conditionally loaded on VM-Enter in
 	 * order to propagate the guest's pre-VM-Enter value into vmcs02.  For
 	 * emulation of VMLAUNCH/VMRESUME, the snapshot will be of L1's value.
@@ -259,13 +265,6 @@ struct vcpu_vmx {
 	unsigned int ple_window;
 	bool ple_window_dirty;
 
-	/* Support for PML */
-#define PML_LOG_NR_ENTRIES	512
-	/* PML is written backwards: this is the first entry written by the CPU */
-#define PML_HEAD_INDEX		(PML_LOG_NR_ENTRIES-1)
-
-	struct page *pml_pg;
-
 	/* apic deadline value in host tsc */
 	u64 hv_deadline_tsc;
 
@@ -297,43 +296,6 @@ struct kvm_vmx {
 	/* Posted Interrupt Descriptor (PID) table for IPI virtualization */
 	u64 *pid_table;
 };
-
-static __always_inline struct vcpu_vt *to_vt(struct kvm_vcpu *vcpu)
-{
-	return &(container_of(vcpu, struct vcpu_vmx, vcpu)->vt);
-}
-
-static __always_inline struct kvm_vcpu *vt_to_vcpu(struct vcpu_vt *vt)
-{
-	return &(container_of(vt, struct vcpu_vmx, vt)->vcpu);
-}
-
-static __always_inline union vmx_exit_reason vmx_get_exit_reason(struct kvm_vcpu *vcpu)
-{
-	return to_vt(vcpu)->exit_reason;
-}
-
-static __always_inline unsigned long vmx_get_exit_qual(struct kvm_vcpu *vcpu)
-{
-	struct vcpu_vt *vt = to_vt(vcpu);
-
-	if (!kvm_register_test_and_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_1) &&
-	    !WARN_ON_ONCE(is_td_vcpu(vcpu)))
-		vt->exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
-
-	return vt->exit_qualification;
-}
-
-static __always_inline u32 vmx_get_intr_info(struct kvm_vcpu *vcpu)
-{
-	struct vcpu_vt *vt = to_vt(vcpu);
-
-	if (!kvm_register_test_and_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_2) &&
-	    !WARN_ON_ONCE(is_td_vcpu(vcpu)))
-		vt->exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
-
-	return vt->exit_intr_info;
-}
 
 void vmx_vcpu_load_vmcs(struct kvm_vcpu *vcpu, int cpu);
 int allocate_vpid(void);
@@ -368,10 +330,8 @@ void vmx_set_virtual_apic_mode(struct kvm_vcpu *vcpu);
 struct vmx_uret_msr *vmx_find_uret_msr(struct vcpu_vmx *vmx, u32 msr);
 void pt_update_intercept_for_msr(struct kvm_vcpu *vcpu);
 void vmx_update_host_rsp(struct vcpu_vmx *vmx, unsigned long host_rsp);
-void vmx_spec_ctrl_restore_host(struct vcpu_vmx *vmx, unsigned int flags);
-unsigned int __vmx_vcpu_run_flags(struct vcpu_vmx *vmx);
-bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned long *regs,
-		    unsigned int flags);
+unsigned int __vmx_vcpu_enter_flags(struct vcpu_vmx *vmx);
+bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned int flags);
 void vmx_ept_load_pdptrs(struct kvm_vcpu *vcpu);
 
 void vmx_set_intercept_for_msr(struct kvm_vcpu *vcpu, u32 msr, int type, bool set);
@@ -393,7 +353,7 @@ u64 vmx_get_l2_tsc_multiplier(struct kvm_vcpu *vcpu);
 
 gva_t vmx_get_untagged_addr(struct kvm_vcpu *vcpu, gva_t gva, unsigned int flags);
 
-void vmx_update_cpu_dirty_logging(struct kvm_vcpu *vcpu);
+void vmx_update_cpu_dirty_logging(struct kvm_vcpu *vcpu, bool enable);
 
 u64 vmx_get_supported_debugctl(struct kvm_vcpu *vcpu, bool host_initiated);
 bool vmx_is_valid_debugctl(struct kvm_vcpu *vcpu, u64 data, bool host_initiated);
@@ -567,6 +527,7 @@ static inline u8 vmx_get_rvi(void)
 	 SECONDARY_EXEC_ENABLE_VMFUNC |					\
 	 SECONDARY_EXEC_BUS_LOCK_DETECTION |				\
 	 SECONDARY_EXEC_NOTIFY_VM_EXITING |				\
+	 SECONDARY_EXEC_MODE_BASED_EPT_EXEC |				\
 	 SECONDARY_EXEC_ENCLS_EXITING |					\
 	 SECONDARY_EXEC_EPT_VIOLATION_VE)
 
@@ -620,16 +581,16 @@ BUILD_CONTROLS_SHADOW(tertiary_exec, TERTIARY_VM_EXEC_CONTROL, 64)
  * cache on demand.  Other registers not listed here are synced to
  * the cache immediately after VM-Exit.
  */
-#define VMX_REGS_LAZY_LOAD_SET	((1 << VCPU_REGS_RIP) |         \
-				(1 << VCPU_REGS_RSP) |          \
-				(1 << VCPU_EXREG_RFLAGS) |      \
-				(1 << VCPU_EXREG_PDPTR) |       \
-				(1 << VCPU_EXREG_SEGMENTS) |    \
-				(1 << VCPU_EXREG_CR0) |         \
-				(1 << VCPU_EXREG_CR3) |         \
-				(1 << VCPU_EXREG_CR4) |         \
-				(1 << VCPU_EXREG_EXIT_INFO_1) | \
-				(1 << VCPU_EXREG_EXIT_INFO_2))
+#define VMX_REGS_LAZY_LOAD_SET	(BIT(VCPU_REGS_RSP) |		\
+				 BIT(VCPU_REG_RIP) |		\
+				 BIT(VCPU_REG_RFLAGS) |		\
+				 BIT(VCPU_REG_PDPTR) |		\
+				 BIT(VCPU_REG_SEGMENTS) |	\
+				 BIT(VCPU_REG_CR0) |		\
+				 BIT(VCPU_REG_CR3) |		\
+				 BIT(VCPU_REG_CR4) |		\
+				 BIT(VCPU_REG_EXIT_INFO_1) |	\
+				 BIT(VCPU_REG_EXIT_INFO_2))
 
 static inline unsigned long vmx_l1_guest_owned_cr0_bits(void)
 {
@@ -659,7 +620,20 @@ static __always_inline struct vcpu_vmx *to_vmx(struct kvm_vcpu *vcpu)
 	return container_of(vcpu, struct vcpu_vmx, vcpu);
 }
 
-void intel_pmu_cross_mapped_check(struct kvm_pmu *pmu);
+u64 __intel_pmu_compute_pebs_enable(struct kvm_pmu *pmu);
+
+static inline u64 intel_pmu_compute_pebs_enable(struct kvm_pmu *pmu)
+{
+	/*
+	 * Avoid the function call overhead in the common case that the guest
+	 * isn't using PEBS.
+	 */
+	if (!(pmu->pebs_enable & pmu->global_ctrl))
+		return 0;
+
+	return __intel_pmu_compute_pebs_enable(pmu);
+}
+
 int intel_pmu_create_guest_lbr_event(struct kvm_vcpu *vcpu);
 void vmx_passthrough_lbr_msrs(struct kvm_vcpu *vcpu);
 

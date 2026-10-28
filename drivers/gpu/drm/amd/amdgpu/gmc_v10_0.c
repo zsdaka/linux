@@ -26,6 +26,7 @@
 #include <drm/drm_cache.h>
 
 #include "amdgpu.h"
+#include "amdgpu_ip.h"
 #include "amdgpu_atomfirmware.h"
 #include "gmc_v10_0.h"
 #include "umc_v8_7.h"
@@ -640,10 +641,6 @@ static int gmc_v10_0_late_init(struct amdgpu_ip_block *ip_block)
 	if (r)
 		return r;
 
-	r = amdgpu_gmc_ras_late_init(adev);
-	if (r)
-		return r;
-
 	return amdgpu_irq_get(adev, &adev->gmc.vm_fault, 0);
 }
 
@@ -707,20 +704,16 @@ static int gmc_v10_0_mc_init(struct amdgpu_device *adev)
 	adev->gmc.visible_vram_size = adev->gmc.aper_size;
 
 	/* set the gart size */
-	if (amdgpu_gart_size == -1) {
-		switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
-		default:
-			adev->gmc.gart_size = 512ULL << 20;
-			break;
-		case IP_VERSION(10, 3, 1):   /* DCE SG support */
-		case IP_VERSION(10, 3, 3):   /* DCE SG support */
-		case IP_VERSION(10, 3, 6):   /* DCE SG support */
-		case IP_VERSION(10, 3, 7):   /* DCE SG support */
-			adev->gmc.gart_size = 1024ULL << 20;
-			break;
-		}
-	} else {
-		adev->gmc.gart_size = (u64)amdgpu_gart_size << 20;
+	switch (amdgpu_ip_version(adev, GC_HWIP, 0)) {
+	case IP_VERSION(10, 3, 1):   /* DCE SG support */
+	case IP_VERSION(10, 3, 3):   /* DCE SG support */
+	case IP_VERSION(10, 3, 6):   /* DCE SG support */
+	case IP_VERSION(10, 3, 7):   /* DCE SG support */
+		amdgpu_gmc_set_gart_size(adev, SZ_1G);
+		break;
+	default:
+		amdgpu_gmc_set_gart_size(adev, SZ_512M);
+		break;
 	}
 
 	gmc_v10_0_vram_gtt_location(adev, &adev->gmc);
@@ -847,6 +840,7 @@ static int gmc_v10_0_sw_init(struct amdgpu_ip_block *ip_block)
 	 * internal address space.
 	 */
 	adev->gmc.mc_mask = 0xffffffffffffULL; /* 48 bit MC */
+	adev->gmc.pte_addr_mask = 0x0000FFFFFFFFF000ULL; /* 48 bit PA */
 
 	r = dma_set_mask_and_coherent(adev->dev, DMA_BIT_MASK(44));
 	if (r) {
@@ -876,6 +870,10 @@ static int gmc_v10_0_sw_init(struct amdgpu_ip_block *ip_block)
 	 * amdkfd will use VMIDs 8-15
 	 */
 	adev->vm_manager.first_kfd_vmid = 8;
+	amdgpu_vmid_mgr_set_vmid_mask(adev,
+				      GENMASK(adev->vm_manager.first_kfd_vmid - 1, 1),
+				      false);
+	amdgpu_vmid_mgr_set_vmid_mask(adev, GENMASK(AMDGPU_NUM_VMID - 1, 1), true);
 
 	amdgpu_vm_manager_init(adev);
 
@@ -1050,12 +1048,6 @@ static int gmc_v10_0_resume(struct amdgpu_ip_block *ip_block)
 	return 0;
 }
 
-static bool gmc_v10_0_is_idle(struct amdgpu_ip_block *ip_block)
-{
-	/* MC is always ready in GMC v10.*/
-	return true;
-}
-
 static int gmc_v10_0_wait_for_idle(struct amdgpu_ip_block *ip_block)
 {
 	/* There is no need to wait for MC idle in GMC v10.*/
@@ -1121,7 +1113,6 @@ const struct amd_ip_funcs gmc_v10_0_ip_funcs = {
 	.hw_fini = gmc_v10_0_hw_fini,
 	.suspend = gmc_v10_0_suspend,
 	.resume = gmc_v10_0_resume,
-	.is_idle = gmc_v10_0_is_idle,
 	.wait_for_idle = gmc_v10_0_wait_for_idle,
 	.set_clockgating_state = gmc_v10_0_set_clockgating_state,
 	.set_powergating_state = gmc_v10_0_set_powergating_state,

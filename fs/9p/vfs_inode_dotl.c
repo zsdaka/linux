@@ -29,7 +29,7 @@
 #include "acl.h"
 
 static int
-v9fs_vfs_mknod_dotl(struct mnt_idmap *idmap, struct inode *dir,
+v9fs_vfs_mknod_dotl(const struct mnt_idmap *idmap, struct inode *dir,
 		    struct dentry *dentry, umode_t omode, dev_t rdev);
 
 /**
@@ -213,12 +213,11 @@ int v9fs_open_to_dotl_flags(int flags)
  * @dir: directory inode that is being created
  * @dentry:  dentry that is being deleted
  * @omode: create permissions
- * @excl: True if the file must not yet exist
  *
  */
 static int
-v9fs_vfs_create_dotl(struct mnt_idmap *idmap, struct inode *dir,
-		     struct dentry *dentry, umode_t omode, bool excl)
+v9fs_vfs_create_dotl(const struct mnt_idmap *idmap, struct inode *dir,
+		     struct dentry *dentry, umode_t omode)
 {
 	return v9fs_vfs_mknod_dotl(idmap, dir, dentry, omode, 0);
 }
@@ -345,11 +344,11 @@ out:
  *
  */
 
-static struct dentry *v9fs_vfs_mkdir_dotl(struct mnt_idmap *idmap,
+static struct dentry *v9fs_vfs_mkdir_dotl(const struct mnt_idmap *idmap,
 					  struct inode *dir, struct dentry *dentry,
 					  umode_t omode)
 {
-	int err;
+	int err = 0;
 	struct v9fs_session_info *v9ses;
 	struct p9_fid *fid = NULL, *dfid = NULL;
 	kgid_t gid;
@@ -362,7 +361,6 @@ static struct dentry *v9fs_vfs_mkdir_dotl(struct mnt_idmap *idmap,
 	p9_debug(P9_DEBUG_VFS, "name %pd\n", dentry);
 	v9ses = v9fs_inode2v9ses(dir);
 
-	omode |= S_IFDIR;
 	if (dir->i_mode & S_ISGID)
 		omode |= S_ISGID;
 
@@ -412,11 +410,11 @@ error:
 	p9_fid_put(fid);
 	v9fs_put_acl(dacl, pacl);
 	p9_fid_put(dfid);
-	return ERR_PTR(err);
+	return err ? ERR_PTR(err) : NULL;
 }
 
 static int
-v9fs_vfs_getattr_dotl(struct mnt_idmap *idmap,
+v9fs_vfs_getattr_dotl(const struct mnt_idmap *idmap,
 		      const struct path *path, struct kstat *stat,
 		      u32 request_mask, unsigned int flags)
 {
@@ -510,7 +508,7 @@ static int v9fs_mapped_iattr_valid(int iattr_valid)
  *
  */
 
-int v9fs_vfs_setattr_dotl(struct mnt_idmap *idmap,
+int v9fs_vfs_setattr_dotl(const struct mnt_idmap *idmap,
 			  struct dentry *dentry, struct iattr *iattr)
 {
 	int retval, use_dentry = 0;
@@ -521,6 +519,9 @@ int v9fs_vfs_setattr_dotl(struct mnt_idmap *idmap,
 		.uid = INVALID_UID,
 		.gid = INVALID_GID,
 	};
+#ifdef CONFIG_9P_FSCACHE
+	uoff_t old_size = i_size_read(inode);
+#endif
 
 	p9_debug(P9_DEBUG_VFS, "\n");
 
@@ -582,7 +583,7 @@ int v9fs_vfs_setattr_dotl(struct mnt_idmap *idmap,
 #ifdef CONFIG_9P_FSCACHE
 		if (v9ses->cache & CACHE_FSCACHE)
 			fscache_resize_cookie(v9fs_inode_cookie(V9FS_I(inode)),
-				iattr->ia_size);
+					      iattr->ia_size, iattr->ia_size < old_size);
 #endif
 	}
 
@@ -684,15 +685,17 @@ v9fs_stat2inode_dotl(struct p9_stat_dotl *stat, struct inode *inode,
 }
 
 static int
-v9fs_vfs_symlink_dotl(struct mnt_idmap *idmap, struct inode *dir,
+v9fs_vfs_symlink_dotl(const struct mnt_idmap *idmap, struct inode *dir,
 		      struct dentry *dentry, const char *symname)
 {
 	int err;
 	kgid_t gid;
 	const unsigned char *name;
+	struct v9fs_session_info *v9ses;
 	struct p9_qid qid;
 	struct p9_fid *dfid;
 	struct p9_fid *fid = NULL;
+	struct inode *inode;
 
 	name = dentry->d_name.name;
 	p9_debug(P9_DEBUG_VFS, "%llu,%s,%s\n", dir->i_ino, name, symname);
@@ -716,6 +719,26 @@ v9fs_vfs_symlink_dotl(struct mnt_idmap *idmap, struct inode *dir,
 
 	v9fs_invalidate_inode_attr(dir);
 
+	/* instantiate inode and assign the unopened fid to the dentry */
+	fid = p9_client_walk(dfid, 1, &name, 1);
+	if (IS_ERR(fid)) {
+		err = PTR_ERR(fid);
+		p9_debug(P9_DEBUG_VFS, "p9_client_walk failed %d\n",
+			 err);
+		goto error;
+	}
+
+	v9ses = v9fs_inode2v9ses(dir);
+	inode = v9fs_get_new_inode_from_fid(v9ses, fid, dir->i_sb);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		p9_debug(P9_DEBUG_VFS, "inode creation failed %d\n",
+			 err);
+		goto error;
+	}
+	v9fs_fid_add(dentry, &fid);
+	d_instantiate(dentry, inode);
+	err = 0;
 error:
 	p9_fid_put(fid);
 	p9_fid_put(dfid);
@@ -789,7 +812,7 @@ v9fs_vfs_link_dotl(struct dentry *old_dentry, struct inode *dir,
  *
  */
 static int
-v9fs_vfs_mknod_dotl(struct mnt_idmap *idmap, struct inode *dir,
+v9fs_vfs_mknod_dotl(const struct mnt_idmap *idmap, struct inode *dir,
 		    struct dentry *dentry, umode_t omode, dev_t rdev)
 {
 	int err;
@@ -857,16 +880,18 @@ error:
 }
 
 /**
- * v9fs_vfs_get_link_dotl - follow a symlink path
+ * v9fs_vfs_get_link_nocache_dotl - Resolve a symlink directly.
+ *
+ * To be used when symlink caching is not enabled.
+ *
  * @dentry: dentry for symlink
  * @inode: inode for symlink
  * @done: destructor for return value
  */
-
 static const char *
-v9fs_vfs_get_link_dotl(struct dentry *dentry,
-		       struct inode *inode,
-		       struct delayed_call *done)
+v9fs_vfs_get_link_nocache_dotl(struct dentry *dentry,
+			       struct inode *inode,
+			       struct delayed_call *done)
 {
 	struct p9_fid *fid;
 	char *target;
@@ -886,6 +911,26 @@ v9fs_vfs_get_link_dotl(struct dentry *dentry,
 		return ERR_PTR(retval);
 	set_delayed_call(done, kfree_link, target);
 	return target;
+}
+
+/**
+ * v9fs_vfs_get_link_dotl - follow a symlink path
+ * @dentry: dentry for symlink
+ * @inode: inode for symlink
+ * @done: destructor for return value
+ */
+static const char *
+v9fs_vfs_get_link_dotl(struct dentry *dentry,
+		       struct inode *inode,
+		       struct delayed_call *done)
+{
+	struct v9fs_session_info *v9ses;
+
+	v9ses = v9fs_inode2v9ses(inode);
+	if (v9ses->cache & (CACHE_META|CACHE_LOOSE))
+		return page_get_link(dentry, inode, done);
+
+	return v9fs_vfs_get_link_nocache_dotl(dentry, inode, done);
 }
 
 int v9fs_refresh_inode_dotl(struct p9_fid *fid, struct inode *inode)

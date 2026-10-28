@@ -7,6 +7,7 @@
 #define pr_fmt(fmt) "riscv-imsic: " fmt
 #include <linux/acpi.h>
 #include <linux/cpu.h>
+#include <linux/bits.h>
 #include <linux/bitmap.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
@@ -739,6 +740,14 @@ static int __init imsic_parse_fwnode(struct fwnode_handle *fwnode,
 		return -EINVAL;
 	}
 
+	/* Group index bits must not overlap guest and HART index bits. */
+	i = IMSIC_MMIO_PAGE_SHIFT + global->guest_index_bits +
+	    global->hart_index_bits;
+	if (global->group_index_bits && global->group_index_shift < i) {
+		pr_err("%pfwP: group index shift too small\n", fwnode);
+		return -EINVAL;
+	}
+
 	/* Sanity check group index shift */
 	i = global->group_index_bits + global->group_index_shift - 1;
 	if (i >= BITS_PER_LONG) {
@@ -769,9 +778,9 @@ static int __init imsic_parse_fwnode(struct fwnode_handle *fwnode,
 		return -EINVAL;
 	}
 	global->base_addr = res.start;
-	global->base_addr &= ~(BIT(global->guest_index_bits +
-				   global->hart_index_bits +
-				   IMSIC_MMIO_PAGE_SHIFT) - 1);
+	global->base_addr &= ~GENMASK(global->guest_index_bits +
+				       global->hart_index_bits +
+				       IMSIC_MMIO_PAGE_SHIFT - 1, 0);
 	global->base_addr &= ~((BIT(global->group_index_bits) - 1) <<
 			       global->group_index_shift);
 
@@ -813,9 +822,9 @@ int __init imsic_setup_state(struct fwnode_handle *fwnode, void *opaque)
 	imsic = kzalloc_obj(*imsic);
 	if (!imsic)
 		return -ENOMEM;
-	imsic->fwnode = fwnode;
 	global = &imsic->global;
 
+	global->fwnode = fwnode;
 	global->local = alloc_percpu(typeof(*global->local));
 	if (!global->local) {
 		rc = -ENOMEM;
@@ -850,9 +859,9 @@ int __init imsic_setup_state(struct fwnode_handle *fwnode, void *opaque)
 		}
 
 		base_addr = mmios[i].start;
-		base_addr &= ~(BIT(global->guest_index_bits +
-				   global->hart_index_bits +
-				   IMSIC_MMIO_PAGE_SHIFT) - 1);
+		base_addr &= ~GENMASK(global->guest_index_bits +
+				      global->hart_index_bits +
+				      IMSIC_MMIO_PAGE_SHIFT - 1, 0);
 		base_addr &= ~((BIT(global->group_index_bits) - 1) <<
 			       global->group_index_shift);
 		if (base_addr != global->base_addr) {
@@ -920,13 +929,12 @@ int __init imsic_setup_state(struct fwnode_handle *fwnode, void *opaque)
 		local->msi_va = mmios_va[index] + reloff;
 
 		/*
-		 * KVM uses global->nr_guest_files to determine the available guest
-		 * interrupt files on each CPU. Take the minimum number of guest
-		 * interrupt files across all CPUs to avoid KVM incorrectly allocating
-		 * an unexisted or unmapped guest interrupt file on some CPUs.
+		 * KVM uses both local->nr_guest_files and global->nr_guest_files
+		 * to determine the available guest interrupt files on each CPU.
 		 */
 		nr_guest_files = (resource_size(&mmios[index]) - reloff) / IMSIC_MMIO_PAGE_SZ - 1;
-		global->nr_guest_files = min(global->nr_guest_files, nr_guest_files);
+		local->nr_guest_files = min((BIT(global->guest_index_bits) - 1), nr_guest_files);
+		global->nr_guest_files = min(global->nr_guest_files, local->nr_guest_files);
 
 		nr_handlers++;
 	}

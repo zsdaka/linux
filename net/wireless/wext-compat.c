@@ -16,6 +16,7 @@
 #include <linux/if_arp.h>
 #include <linux/etherdevice.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <net/iw_handler.h>
 #include <net/cfg80211.h>
 #include <net/cfg80211-wext.h>
@@ -27,7 +28,7 @@ int cfg80211_wext_giwname(struct net_device *dev,
 			  struct iw_request_info *info,
 			  union iwreq_data *wrqu, char *extra)
 {
-	strcpy(wrqu->name, "IEEE 802.11");
+	strscpy(wrqu->name, "IEEE 802.11");
 	return 0;
 }
 
@@ -400,6 +401,8 @@ static int cfg80211_set_encryption(struct cfg80211_registered_device *rdev,
 				   int idx, struct key_params *params)
 {
 	struct wireless_dev *wdev = dev->ieee80211_ptr;
+	enum nl80211_key_type key_type =
+		pairwise ? NL80211_KEYTYPE_PAIRWISE : NL80211_KEYTYPE_GROUP;
 	int err, i;
 	bool rejoin = false;
 
@@ -453,12 +456,11 @@ static int cfg80211_set_encryption(struct cfg80211_registered_device *rdev,
 				rejoin = true;
 			}
 
-			if (!pairwise && addr &&
-			    !(rdev->wiphy.flags & WIPHY_FLAG_IBSS_RSN))
+			if (!cfg80211_valid_key_idx(wdev, idx, key_type, addr))
 				err = -ENOENT;
 			else
-				err = rdev_del_key(rdev, wdev, -1, idx, pairwise,
-						   addr);
+				err = rdev_del_key(rdev, wdev, -1, idx,
+						   key_type, addr);
 		}
 		wdev->wext.connect.privacy = false;
 		/*
@@ -489,7 +491,8 @@ static int cfg80211_set_encryption(struct cfg80211_registered_device *rdev,
 	if (addr)
 		tx_key = false;
 
-	if (cfg80211_validate_key_settings(rdev, params, idx, pairwise, addr))
+	if (cfg80211_validate_key_settings(rdev, wdev, params, idx,
+					   pairwise, addr))
 		return -EINVAL;
 
 	err = 0;

@@ -163,6 +163,8 @@
 		reg = <0>;
 		interrupts-extended = <&gpio2 11 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&gpio2 10 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <10000>;
+		reset-deassert-us = <300>;
 	};
 };
 
@@ -221,7 +223,7 @@
 		asahi-kasei,out6-single-end;
 	};
 
-	cs2000: clk-multiplier@4f {
+	cs2000: clock-controller@4f {
 		#clock-cells = <0>;
 		compatible = "cirrus,cs2000-cp";
 		reg = <0x4f>;
@@ -309,12 +311,12 @@
 			function = "avb";
 		};
 
-		pins_mdio {
+		pins-mdio {
 			groups = "avb_mdio";
 			drive-strength = <24>;
 		};
 
-		pins_mii_tx {
+		pins-mii-tx {
 			pins = "PIN_AVB_TX_CTL", "PIN_AVB_TXC", "PIN_AVB_TD0",
 			       "PIN_AVB_TD1", "PIN_AVB_TD2", "PIN_AVB_TD3";
 			drive-strength = <12>;
@@ -336,7 +338,7 @@
 		function = "scif2";
 	};
 
-	scif_clk_pins: scif_clk {
+	scif_clk_pins: scif-clk {
 		groups = "scif_clk_a";
 		function = "scif_clk";
 	};
@@ -347,7 +349,7 @@
 		power-source = <3300>;
 	};
 
-	sdhi0_pins_uhs: sd0_uhs {
+	sdhi0_pins_uhs: sd0-uhs {
 		groups = "sdhi0_data4", "sdhi0_ctrl";
 		function = "sdhi0";
 		power-source = <1800>;

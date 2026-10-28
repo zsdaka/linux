@@ -159,7 +159,7 @@ static void pm_qos_flags_remove_req(struct pm_qos_flags *pqf,
 	list_for_each_entry(req, &pqf->list, node)
 		val |= req->flags;
 
-	pqf->effective_flags = val;
+	WRITE_ONCE(pqf->effective_flags, val);
 }
 
 /**
@@ -193,7 +193,7 @@ bool pm_qos_update_flags(struct pm_qos_flags *pqf,
 		req->flags = val;
 		INIT_LIST_HEAD(&req->node);
 		list_add_tail(&req->node, &pqf->list);
-		pqf->effective_flags |= val;
+		WRITE_ONCE(pqf->effective_flags, pqf->effective_flags | val);
 		break;
 	default:
 		/* no action */
@@ -519,18 +519,23 @@ static int __init cpu_latency_qos_init(void)
 	int ret;
 
 	ret = misc_register(&cpu_latency_qos_miscdev);
-	if (ret < 0)
+	if (ret < 0) {
 		pr_err("%s: %s setup failed\n", __func__,
 		       cpu_latency_qos_miscdev.name);
+		return ret;
+	}
 
 #ifdef CONFIG_PM_QOS_CPU_SYSTEM_WAKEUP
 	ret = misc_register(&cpu_wakeup_latency_qos_miscdev);
-	if (ret < 0)
+	if (ret < 0) {
 		pr_err("%s: %s setup failed\n", __func__,
 		       cpu_wakeup_latency_qos_miscdev.name);
+		misc_deregister(&cpu_latency_qos_miscdev);
+		return ret;
+	}
 #endif
 
-	return ret;
+	return 0;
 }
 late_initcall(cpu_latency_qos_init);
 #endif /* CONFIG_CPU_IDLE */

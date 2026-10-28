@@ -78,7 +78,7 @@ static int alloc_info_private(struct snd_info_entry *entry,
 	if (!entry || !entry->p)
 		return -ENODEV;
 	if (!try_module_get(entry->module))
-		return -EFAULT;
+		return -ENODEV;
 	data = kzalloc_obj(*data);
 	if (!data) {
 		module_put(entry->module);
@@ -528,6 +528,8 @@ int snd_info_card_register(struct snd_card *card)
 void snd_info_card_id_change(struct snd_card *card)
 {
 	guard(mutex)(&info_mutex);
+	if (card->shutdown)
+		return;
 	if (card->proc_root_link) {
 		proc_remove(card->proc_root_link);
 		card->proc_root_link = NULL;
@@ -555,7 +557,6 @@ void snd_info_card_disconnect(struct snd_card *card)
 	if (card->proc_root)
 		snd_info_clear_entries(card->proc_root);
 	card->proc_root_link = NULL;
-	card->proc_root = NULL;
 }
 
 /*

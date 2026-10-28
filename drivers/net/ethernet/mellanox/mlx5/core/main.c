@@ -40,6 +40,7 @@
 #include <linux/interrupt.h>
 #include <linux/delay.h>
 #include <linux/mlx5/driver.h>
+#include <linux/mlx5/data_direct.h>
 #include <linux/mlx5/cq.h>
 #include <linux/mlx5/qp.h>
 #include <linux/debugfs.h>
@@ -184,12 +185,8 @@ static int set_dma_caps(struct pci_dev *pdev)
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err) {
-		dev_warn(&pdev->dev, "Warning: couldn't set 64-bit PCI DMA mask\n");
-		err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-		if (err) {
-			dev_err(&pdev->dev, "Can't set PCI DMA mask, aborting\n");
-			return err;
-		}
+		dev_err(&pdev->dev, "Can't set PCI DMA mask, aborting\n");
+		return err;
 	}
 
 	dma_set_max_seg_size(&pdev->dev, 2u * 1024 * 1024 * 1024);
@@ -527,7 +524,6 @@ static int handle_hca_cap(struct mlx5_core_dev *dev, void *set_ctx)
 {
 	struct mlx5_profile *prof = &dev->profile;
 	void *set_hca_cap;
-	int max_uc_list;
 	int err;
 
 	err = mlx5_core_get_caps(dev, MLX5_CAP_GENERAL);
@@ -597,6 +593,9 @@ static int handle_hca_cap(struct mlx5_core_dev *dev, void *set_ctx)
 	if (MLX5_CAP_GEN_MAX(dev, release_all_pages))
 		MLX5_SET(cmd_hca_cap, set_hca_cap, release_all_pages, 1);
 
+	if (MLX5_CAP_GEN_MAX(dev, icm_mng_function_id_mode))
+		MLX5_SET(cmd_hca_cap, set_hca_cap, icm_mng_function_id_mode, 1);
+
 	if (MLX5_CAP_GEN_MAX(dev, mkey_by_name))
 		MLX5_SET(cmd_hca_cap, set_hca_cap, mkey_by_name, 1);
 
@@ -610,10 +609,13 @@ static int handle_hca_cap(struct mlx5_core_dev *dev, void *set_ctx)
 		MLX5_SET(cmd_hca_cap, set_hca_cap, roce,
 			 mlx5_is_roce_on(dev));
 
-	max_uc_list = max_uc_list_get_devlink_param(dev);
-	if (max_uc_list > 0)
-		MLX5_SET(cmd_hca_cap, set_hca_cap, log_max_current_uc_list,
-			 ilog2(max_uc_list));
+	if (MLX5_CAP_GEN_MAX(dev, log_max_current_uc_list)) {
+		int max_uc_list = max_uc_list_get_devlink_param(dev);
+
+		if (max_uc_list > 0)
+			MLX5_SET(cmd_hca_cap, set_hca_cap,
+				 log_max_current_uc_list, ilog2(max_uc_list));
+	}
 
 	/* enable absolute native port num */
 	if (MLX5_CAP_GEN_MAX(dev, abs_native_port_num))
@@ -987,11 +989,12 @@ static int mlx5_init_once(struct mlx5_core_dev *dev)
 		mlx5_core_err(dev, "Failed to init eswitch %d\n", err);
 		goto err_sriov_cleanup;
 	}
+	mlx5_pages_by_func_type_debugfs_init(dev);
 
 	err = mlx5_fpga_init(dev);
 	if (err) {
 		mlx5_core_err(dev, "Failed to init fpga device %d\n", err);
-		goto err_eswitch_cleanup;
+		goto err_page_debugfs_cleanup;
 	}
 
 	err = mlx5_vhca_event_init(dev);
@@ -1034,7 +1037,8 @@ err_sf_hw_table_cleanup:
 	mlx5_vhca_event_cleanup(dev);
 err_fpga_cleanup:
 	mlx5_fpga_cleanup(dev);
-err_eswitch_cleanup:
+err_page_debugfs_cleanup:
+	mlx5_pages_by_func_type_debugfs_cleanup(dev);
 	mlx5_eswitch_cleanup(dev->priv.eswitch);
 err_sriov_cleanup:
 	mlx5_sriov_cleanup(dev);
@@ -1072,6 +1076,7 @@ static void mlx5_cleanup_once(struct mlx5_core_dev *dev)
 	mlx5_sf_hw_table_cleanup(dev);
 	mlx5_vhca_event_cleanup(dev);
 	mlx5_fpga_cleanup(dev);
+	mlx5_pages_by_func_type_debugfs_cleanup(dev);
 	mlx5_eswitch_cleanup(dev->priv.eswitch);
 	mlx5_sriov_cleanup(dev);
 	mlx5_mpfs_cleanup(dev);
@@ -1331,8 +1336,14 @@ static int mlx5_load(struct mlx5_core_dev *dev)
 	if (err)
 		goto err_traps_reg;
 
+	err = mlx5_data_direct_init(dev);
+	if (err)
+		goto err_data_direct;
+
 	return 0;
 
+err_data_direct:
+	mlx5_devlink_traps_unregister(priv_to_devlink(dev));
 err_traps_reg:
 	mlx5_sf_dev_table_destroy(dev);
 	mlx5_sriov_detach(dev);
@@ -1363,7 +1374,7 @@ err_irq_table:
 
 static void mlx5_unload(struct mlx5_core_dev *dev)
 {
-	mlx5_eswitch_disable(dev->priv.eswitch);
+	mlx5_data_direct_cleanup(dev);
 	mlx5_devlink_traps_unregister(priv_to_devlink(dev));
 	mlx5_vhca_event_stop(dev);
 	mlx5_sf_dev_table_destroy(dev);
@@ -1478,6 +1489,7 @@ void mlx5_uninit_one(struct mlx5_core_dev *dev)
 
 	mlx5_hwmon_dev_unregister(dev);
 	mlx5_crdump_disable(dev);
+	mlx5_eswitch_disable(dev->priv.eswitch);
 	mlx5_unregister_device(dev);
 
 	if (!test_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state)) {
@@ -1562,6 +1574,7 @@ void mlx5_unload_one_devl_locked(struct mlx5_core_dev *dev, bool suspend)
 	devl_assert_locked(priv_to_devlink(dev));
 	mutex_lock(&dev->intf_state_mutex);
 
+	mlx5_eswitch_disable(dev->priv.eswitch);
 	mlx5_detach_device(dev, suspend);
 
 	if (!test_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state)) {
@@ -1810,12 +1823,18 @@ int mlx5_mdev_init(struct mlx5_core_dev *dev, int profile_idx)
 	INIT_LIST_HEAD(&priv->bfregs.wc_head.list);
 
 	mutex_init(&priv->alloc_mutex);
-	mutex_init(&priv->pgdir_mutex);
-	INIT_LIST_HEAD(&priv->pgdir_list);
 
 	priv->numa_node = dev_to_node(mlx5_core_dma_dev(dev));
 	priv->dbg.dbg_root = debugfs_create_dir(dev_name(dev->device),
 						mlx5_debugfs_root);
+
+	err = mlx5_frag_buf_pools_init(dev);
+	if (err)
+		goto err_frag_buf_pools_init;
+
+	err = mlx5_db_pools_init(dev);
+	if (err)
+		goto err_db_pools_init;
 
 	INIT_LIST_HEAD(&priv->traps);
 
@@ -1878,8 +1897,11 @@ err_health_init:
 err_timeout_init:
 	mlx5_cmd_cleanup(dev);
 err_cmd_init:
+	mlx5_db_pools_cleanup(dev);
+err_db_pools_init:
+	mlx5_frag_buf_pools_cleanup(dev);
+err_frag_buf_pools_init:
 	debugfs_remove(dev->priv.dbg.dbg_root);
-	mutex_destroy(&priv->pgdir_mutex);
 	mutex_destroy(&priv->alloc_mutex);
 	mutex_destroy(&priv->bfregs.wc_head.lock);
 	mutex_destroy(&priv->bfregs.reg_head.lock);
@@ -1902,8 +1924,9 @@ void mlx5_mdev_uninit(struct mlx5_core_dev *dev)
 	mlx5_health_cleanup(dev);
 	mlx5_tout_cleanup(dev);
 	mlx5_cmd_cleanup(dev);
+	mlx5_db_pools_cleanup(dev);
+	mlx5_frag_buf_pools_cleanup(dev);
 	debugfs_remove_recursive(dev->priv.dbg.dbg_root);
-	mutex_destroy(&priv->pgdir_mutex);
 	mutex_destroy(&priv->alloc_mutex);
 	mutex_destroy(&priv->bfregs.wc_head.lock);
 	mutex_destroy(&priv->bfregs.reg_head.lock);
@@ -2203,19 +2226,26 @@ static int mlx5_resume(struct pci_dev *pdev)
 
 static const struct pci_device_id mlx5_core_pci_table[] = {
 	{ PCI_VDEVICE(MELLANOX, PCI_DEVICE_ID_MELLANOX_CONNECTIB) },
-	{ PCI_VDEVICE(MELLANOX, 0x1012), MLX5_PCI_DEV_IS_VF},	/* Connect-IB VF */
+	{ PCI_VDEVICE(MELLANOX, 0x1012),
+	  .driver_data = MLX5_PCI_DEV_IS_VF },			/* Connect-IB VF */
 	{ PCI_VDEVICE(MELLANOX, PCI_DEVICE_ID_MELLANOX_CONNECTX4) },
-	{ PCI_VDEVICE(MELLANOX, 0x1014), MLX5_PCI_DEV_IS_VF},	/* ConnectX-4 VF */
+	{ PCI_VDEVICE(MELLANOX, 0x1014),
+	  .driver_data = MLX5_PCI_DEV_IS_VF },			/* ConnectX-4 VF */
 	{ PCI_VDEVICE(MELLANOX, PCI_DEVICE_ID_MELLANOX_CONNECTX4_LX) },
-	{ PCI_VDEVICE(MELLANOX, 0x1016), MLX5_PCI_DEV_IS_VF},	/* ConnectX-4LX VF */
+	{ PCI_VDEVICE(MELLANOX, 0x1016),
+	  .driver_data = MLX5_PCI_DEV_IS_VF },			/* ConnectX-4LX VF */
 	{ PCI_VDEVICE(MELLANOX, 0x1017) },			/* ConnectX-5, PCIe 3.0 */
-	{ PCI_VDEVICE(MELLANOX, 0x1018), MLX5_PCI_DEV_IS_VF},	/* ConnectX-5 VF */
+	{ PCI_VDEVICE(MELLANOX, 0x1018),
+	  .driver_data = MLX5_PCI_DEV_IS_VF },			/* ConnectX-5 VF */
 	{ PCI_VDEVICE(MELLANOX, 0x1019) },			/* ConnectX-5 Ex */
-	{ PCI_VDEVICE(MELLANOX, 0x101a), MLX5_PCI_DEV_IS_VF},	/* ConnectX-5 Ex VF */
+	{ PCI_VDEVICE(MELLANOX, 0x101a),
+	  .driver_data = MLX5_PCI_DEV_IS_VF },			/* ConnectX-5 Ex VF */
 	{ PCI_VDEVICE(MELLANOX, 0x101b) },			/* ConnectX-6 */
-	{ PCI_VDEVICE(MELLANOX, 0x101c), MLX5_PCI_DEV_IS_VF},	/* ConnectX-6 VF */
+	{ PCI_VDEVICE(MELLANOX, 0x101c),
+	  .driver_data = MLX5_PCI_DEV_IS_VF },			/* ConnectX-6 VF */
 	{ PCI_VDEVICE(MELLANOX, 0x101d) },			/* ConnectX-6 Dx */
-	{ PCI_VDEVICE(MELLANOX, 0x101e), MLX5_PCI_DEV_IS_VF},	/* ConnectX Family mlx5Gen Virtual Function */
+	{ PCI_VDEVICE(MELLANOX, 0x101e),
+	  .driver_data = MLX5_PCI_DEV_IS_VF },			/* ConnectX Family mlx5Gen Virtual Function */
 	{ PCI_VDEVICE(MELLANOX, 0x101f) },			/* ConnectX-6 LX */
 	{ PCI_VDEVICE(MELLANOX, 0x1021) },			/* ConnectX-7 */
 	{ PCI_VDEVICE(MELLANOX, 0x1023) },			/* ConnectX-8 */
@@ -2223,11 +2253,12 @@ static const struct pci_device_id mlx5_core_pci_table[] = {
 	{ PCI_VDEVICE(MELLANOX, 0x1027) },			/* ConnectX-10 */
 	{ PCI_VDEVICE(MELLANOX, 0x2101) },			/* ConnectX-10 NVLink-C2C */
 	{ PCI_VDEVICE(MELLANOX, 0xa2d2) },			/* BlueField integrated ConnectX-5 network controller */
-	{ PCI_VDEVICE(MELLANOX, 0xa2d3), MLX5_PCI_DEV_IS_VF},	/* BlueField integrated ConnectX-5 network controller VF */
+	{ PCI_VDEVICE(MELLANOX, 0xa2d3),
+	  .driver_data = MLX5_PCI_DEV_IS_VF },			/* BlueField integrated ConnectX-5 network controller VF */
 	{ PCI_VDEVICE(MELLANOX, 0xa2d6) },			/* BlueField-2 integrated ConnectX-6 Dx network controller */
 	{ PCI_VDEVICE(MELLANOX, 0xa2dc) },			/* BlueField-3 integrated ConnectX-7 network controller */
 	{ PCI_VDEVICE(MELLANOX, 0xa2df) },			/* BlueField-4 integrated ConnectX-8 network controller */
-	{ 0, }
+	{ }
 };
 
 MODULE_DEVICE_TABLE(pci, mlx5_core_pci_table);
@@ -2336,6 +2367,10 @@ static int __init mlx5_init(void)
 	if (err)
 		goto err_sf;
 
+	err = mlx5_data_direct_driver_register();
+	if (err)
+		goto err_dd;
+
 	err = pci_register_driver(&mlx5_core_driver);
 	if (err)
 		goto err_pci;
@@ -2343,6 +2378,8 @@ static int __init mlx5_init(void)
 	return 0;
 
 err_pci:
+	mlx5_data_direct_driver_unregister();
+err_dd:
 	mlx5_sf_driver_unregister();
 err_sf:
 	mlx5e_cleanup();
@@ -2354,6 +2391,7 @@ err_debug:
 static void __exit mlx5_cleanup(void)
 {
 	pci_unregister_driver(&mlx5_core_driver);
+	mlx5_data_direct_driver_unregister();
 	mlx5_sf_driver_unregister();
 	mlx5e_cleanup();
 	mlx5_unregister_debugfs();

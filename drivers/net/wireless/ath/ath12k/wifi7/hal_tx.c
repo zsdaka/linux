@@ -36,7 +36,7 @@ void ath12k_wifi7_hal_tx_cmd_desc_setup(struct ath12k_base *ab,
 	tcl_cmd->buf_addr_info.info0 =
 		le32_encode_bits(ti->paddr, BUFFER_ADDR_INFO0_ADDR);
 	tcl_cmd->buf_addr_info.info1 =
-		le32_encode_bits(((uint64_t)ti->paddr >> HAL_ADDR_MSB_REG_SHIFT),
+		le32_encode_bits(((u64)ti->paddr >> HAL_ADDR_MSB_REG_SHIFT),
 				 BUFFER_ADDR_INFO1_ADDR);
 	tcl_cmd->buf_addr_info.info1 |=
 		le32_encode_bits((ti->rbm_id), BUFFER_ADDR_INFO1_RET_BUF_MGR) |
@@ -59,7 +59,9 @@ void ath12k_wifi7_hal_tx_cmd_desc_setup(struct ath12k_base *ab,
 		le32_encode_bits(ti->lmac_id, HAL_TCL_DATA_CMD_INFO3_PMAC_ID) |
 		le32_encode_bits(ti->vdev_id, HAL_TCL_DATA_CMD_INFO3_VDEV_ID);
 
-	tcl_cmd->info4 = le32_encode_bits(ti->bss_ast_idx,
+	tcl_cmd->info4 = le32_encode_bits(ti->lookup_override,
+					  HAL_TCL_DATA_CMD_INFO4_IDX_LOOKUP_OVERRIDE) |
+			 le32_encode_bits(ti->bss_ast_idx,
 					  HAL_TCL_DATA_CMD_INFO4_SEARCH_INDEX) |
 			 le32_encode_bits(ti->bss_ast_hash,
 					  HAL_TCL_DATA_CMD_INFO4_CACHE_SET_NUM);

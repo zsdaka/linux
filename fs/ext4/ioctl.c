@@ -373,7 +373,7 @@ void ext4_reset_inode_seed(struct inode *inode)
  *
  */
 static long swap_inode_boot_loader(struct super_block *sb,
-				struct mnt_idmap *idmap,
+				const struct mnt_idmap *idmap,
 				struct inode *inode)
 {
 	handle_t *handle;
@@ -830,11 +830,17 @@ int ext4_force_shutdown(struct super_block *sb, u32 flags)
 		bdev_thaw(sb->s_bdev);
 		break;
 	case EXT4_GOING_FLAGS_LOGFLUSH:
+		/*
+		 * Call ext4_force_commit() before setting EXT4_FLAGS_SHUTDOWN.
+		 * This is because in data=ordered mode, journal commit
+		 * triggers data writeback which fails if shutdown is already
+		 * set, causing the journal to be aborted prematurely before
+		 * the commit succeeds.
+		 */
+		(void) ext4_force_commit(sb);
 		set_bit(EXT4_FLAGS_SHUTDOWN, &sbi->s_ext4_flags);
-		if (sbi->s_journal && !is_journal_aborted(sbi->s_journal)) {
-			(void) ext4_force_commit(sb);
+		if (sbi->s_journal && !is_journal_aborted(sbi->s_journal))
 			jbd2_journal_abort(sbi->s_journal, -ESHUTDOWN);
-		}
 		break;
 	case EXT4_GOING_FLAGS_NOLOGFLUSH:
 		set_bit(EXT4_FLAGS_SHUTDOWN, &sbi->s_ext4_flags);
@@ -1002,7 +1008,7 @@ int ext4_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
 	return 0;
 }
 
-int ext4_fileattr_set(struct mnt_idmap *idmap,
+int ext4_fileattr_set(const struct mnt_idmap *idmap,
 		      struct dentry *dentry, struct file_kattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
@@ -1356,7 +1362,8 @@ static void ext4_sb_setparams(struct ext4_sb_info *sbi,
 		es->s_encoding = cpu_to_le16(params->encoding);
 	if (params->set_flags & EXT4_TUNE_FL_ENCODING_FLAGS)
 		es->s_encoding_flags = cpu_to_le16(params->encoding_flags);
-	strscpy_pad(es->s_mount_opts, params->mount_opts);
+	if (params->set_flags & EXT4_TUNE_FL_MOUNT_OPTS)
+		strscpy_pad(es->s_mount_opts, params->mount_opts);
 	if (params->set_flags & EXT4_TUNE_FL_EDIT_FEATURES) {
 		es->s_feature_compat |=
 			cpu_to_le32(params->set_feature_compat_mask);
@@ -1533,7 +1540,7 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct inode *inode = file_inode(filp);
 	struct super_block *sb = inode->i_sb;
-	struct mnt_idmap *idmap = file_mnt_idmap(filp);
+	const struct mnt_idmap *idmap = file_mnt_idmap(filp);
 
 	ext4_debug("cmd = %u, arg = %lu\n", cmd, arg);
 
@@ -1649,6 +1656,9 @@ group_extend_out:
 
 		if (!(fd_file(donor)->f_mode & FMODE_WRITE))
 			return -EBADF;
+
+		if (file_inode(filp)->i_sb != file_inode(fd_file(donor))->i_sb)
+			return -EXDEV;
 
 		err = mnt_want_write_file(filp);
 		if (err)

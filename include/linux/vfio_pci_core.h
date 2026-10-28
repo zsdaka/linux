@@ -8,6 +8,7 @@
  * Author: Tom Lyon, pugs@cisco.com
  */
 
+#include <linux/device.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/vfio.h>
@@ -16,6 +17,7 @@
 #include <linux/types.h>
 #include <linux/uuid.h>
 #include <linux/notifier.h>
+#include <linux/pm.h>
 
 #ifndef VFIO_PCI_CORE_H
 #define VFIO_PCI_CORE_H
@@ -101,6 +103,9 @@ struct vfio_pci_core_device {
 	const struct vfio_pci_device_ops *pci_ops;
 	void __iomem		*barmap[PCI_STD_NUM_BARS];
 	bool			bar_mmap_supported[PCI_STD_NUM_BARS];
+	/* Flags modified at runtime - dedicated storage unit */
+	bool			virq_disabled;
+	bool			bardirty;
 	u8			*pci_config_map;
 	u8			*vconfig;
 	struct perm_bits	*msi_perm;
@@ -115,18 +120,22 @@ struct vfio_pci_core_device {
 	u16			msix_size;
 	u32			msix_offset;
 	u32			rbar[7];
+	/* Flags only modified on setup/release - bitfield ok */
 	bool			has_dyn_msix:1;
 	bool			pci_2_3:1;
-	bool			virq_disabled:1;
 	bool			reset_works:1;
 	bool			extended_caps:1;
-	bool			bardirty:1;
 	bool			has_vga:1;
-	bool			needs_reset:1;
 	bool			nointx:1;
 	bool			needs_pm_restore:1;
-	bool			pm_intx_masked:1;
-	bool			pm_runtime_engaged:1;
+	bool			disable_idle_d3:1;
+	bool			nointxmask:1;
+	bool			disable_vga:1;
+	/* Flags modified at runtime - dedicated storage unit */
+	bool			needs_reset;
+	bool			pm_intx_masked;
+	bool			pm_runtime_engaged;
+	bool			sriov_active;
 	struct pci_saved_state	*pci_saved_state;
 	struct pci_saved_state	*pm_save;
 	int			ioeventfds_nr;
@@ -156,14 +165,11 @@ int vfio_pci_core_register_dev_region(struct vfio_pci_core_device *vdev,
 				      unsigned int type, unsigned int subtype,
 				      const struct vfio_pci_regops *ops,
 				      size_t size, u32 flags, void *data);
-void vfio_pci_core_set_params(bool nointxmask, bool is_disable_vga,
-			      bool is_disable_idle_d3);
 void vfio_pci_core_close_device(struct vfio_device *core_vdev);
 int vfio_pci_core_init_dev(struct vfio_device *core_vdev);
 void vfio_pci_core_release_dev(struct vfio_device *core_vdev);
 int vfio_pci_core_register_device(struct vfio_pci_core_device *vdev);
 void vfio_pci_core_unregister_device(struct vfio_pci_core_device *vdev);
-extern const struct pci_error_handlers vfio_pci_core_err_handlers;
 int vfio_pci_core_sriov_configure(struct vfio_pci_core_device *vdev,
 				  int nr_virtfn);
 long vfio_pci_core_ioctl(struct vfio_device *core_vdev, unsigned int cmd,
@@ -188,9 +194,6 @@ int vfio_pci_core_match_token_uuid(struct vfio_device *core_vdev,
 int vfio_pci_core_enable(struct vfio_pci_core_device *vdev);
 void vfio_pci_core_disable(struct vfio_pci_core_device *vdev);
 void vfio_pci_core_finish_enable(struct vfio_pci_core_device *vdev);
-int vfio_pci_core_setup_barmap(struct vfio_pci_core_device *vdev, int bar);
-pci_ers_result_t vfio_pci_core_aer_err_detected(struct pci_dev *pdev,
-						pci_channel_state_t state);
 ssize_t vfio_pci_core_do_io_rw(struct vfio_pci_core_device *vdev, bool test_mem,
 			       void __iomem *io, char __user *buf,
 			       loff_t off, size_t count, size_t x_start,
@@ -234,7 +237,62 @@ static inline bool is_aligned_for_order(struct vm_area_struct *vma,
 			   !IS_ALIGNED(pfn, 1 << order)));
 }
 
+/*
+ * Returns a BAR's iomap base or an ERR_PTR() if, for example, the
+ * BAR isn't valid, its resource wasn't acquired, or its iomap
+ * failed.  This shall only be used after vfio_pci_core_enable()
+ * has set up the BAR maps and before vfio_pci_core_disable()
+ * tears them down.
+ */
+static inline void __iomem __must_check *
+vfio_pci_core_get_iomap(struct vfio_pci_core_device *vdev, unsigned int bar)
+{
+	if (WARN_ON_ONCE(bar >= PCI_STD_NUM_BARS))
+		return IOMEM_ERR_PTR(-EINVAL);
+
+	if (WARN_ON_ONCE(!vdev->barmap[bar]))
+		return IOMEM_ERR_PTR(-ENODEV);
+
+	return vdev->barmap[bar];
+}
+
 int vfio_pci_dma_buf_iommufd_map(struct dma_buf_attachment *attachment,
 				 struct phys_vec *phys);
+
+int vfio_pci_core_runtime_suspend(struct vfio_pci_core_device *vdev);
+int vfio_pci_core_runtime_resume(struct vfio_pci_core_device *vdev);
+pci_ers_result_t vfio_pci_core_aer_err_detected(struct vfio_pci_core_device *vdev);
+
+/*
+ * Per-driver PM/AER trampolines. driver_data points to the driver's private
+ * structure, which embeds a struct vfio_pci_core_device.
+ *
+ * @name: prefix for <name>_pm_ops and <name>_aer_err_detected
+ * @drv_type: type of the driver's private structure, including struct
+ * @member: member containing the struct vfio_pci_core_device
+ */
+#define VFIO_PCI_CORE_DEFINE_CALLBACKS(name, drv_type, member)                \
+static int __maybe_unused name##_pm_suspend(struct device *dev)               \
+{                                                                             \
+	drv_type *drvdata = dev_get_drvdata(dev);                             \
+									      \
+	return vfio_pci_core_runtime_suspend(&drvdata->member);               \
+}                                                                             \
+static int __maybe_unused name##_pm_resume(struct device *dev)                \
+{                                                                             \
+	drv_type *drvdata = dev_get_drvdata(dev);                             \
+									      \
+	return vfio_pci_core_runtime_resume(&drvdata->member);                \
+}                                                                             \
+static const struct dev_pm_ops name##_pm_ops = {                              \
+	SET_RUNTIME_PM_OPS(name##_pm_suspend, name##_pm_resume, NULL)         \
+};                                                                            \
+static pci_ers_result_t name##_aer_err_detected(struct pci_dev *pdev,         \
+					     pci_channel_state_t state)       \
+{                                                                             \
+	drv_type *drvdata = pci_get_drvdata(pdev);                            \
+									      \
+	return vfio_pci_core_aer_err_detected(&drvdata->member);              \
+}
 
 #endif /* VFIO_PCI_CORE_H */

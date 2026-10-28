@@ -18,7 +18,7 @@
 #include "overlayfs.h"
 
 
-int ovl_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+int ovl_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 		struct iattr *attr)
 {
 	int err;
@@ -26,9 +26,17 @@ int ovl_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	bool full_copy_up = false;
 	struct dentry *upperdentry;
 
-	err = setattr_prepare(&nop_mnt_idmap, dentry, attr);
+	err = setattr_prepare(idmap, dentry, attr);
 	if (err)
 		return err;
+
+	/* Rebase ownership from the mount idmap into overlay id space. */
+	if (attr->ia_valid & ATTR_UID)
+		attr->ia_vfsuid = VFSUIDT_INIT(from_vfsuid(idmap,
+				i_user_ns(d_inode(dentry)), attr->ia_vfsuid));
+	if (attr->ia_valid & ATTR_GID)
+		attr->ia_vfsgid = VFSGIDT_INIT(from_vfsgid(idmap,
+				i_user_ns(d_inode(dentry)), attr->ia_vfsgid));
 
 	if (attr->ia_valid & ATTR_SIZE) {
 		/* Truncate should trigger data copy up as well */
@@ -160,7 +168,7 @@ static inline int ovl_real_getattr_nosec(struct super_block *sb,
 		return vfs_getattr_nosec(path, stat, request_mask, flags);
 }
 
-int ovl_getattr(struct mnt_idmap *idmap, const struct path *path,
+int ovl_getattr(const struct mnt_idmap *idmap, const struct path *path,
 		struct kstat *stat, u32 request_mask, unsigned int flags)
 {
 	struct dentry *dentry = path->dentry;
@@ -172,6 +180,8 @@ int ovl_getattr(struct mnt_idmap *idmap, const struct path *path,
 	int fsid = 0;
 	int err;
 	bool metacopy_blocks = false;
+	vfsuid_t vfsuid;
+	vfsgid_t vfsgid;
 
 	metacopy_blocks = ovl_is_metacopy_dentry(dentry);
 
@@ -284,10 +294,16 @@ int ovl_getattr(struct mnt_idmap *idmap, const struct path *path,
 	if (!is_dir && ovl_test_flag(OVL_INDEX, d_inode(dentry)))
 		stat->nlink = dentry->d_inode->i_nlink;
 
+	/* Map ownership of the real inode through the overlay mount idmap. */
+	vfsuid = make_vfsuid(idmap, i_user_ns(inode), stat->uid);
+	vfsgid = make_vfsgid(idmap, i_user_ns(inode), stat->gid);
+	stat->uid = vfsuid_into_kuid(vfsuid);
+	stat->gid = vfsgid_into_kgid(vfsgid);
+
 	return err;
 }
 
-int ovl_permission(struct mnt_idmap *idmap,
+int ovl_permission(const struct mnt_idmap *idmap,
 		   struct inode *inode, int mask)
 {
 	struct inode *upperinode = ovl_inode_upper(inode);
@@ -306,7 +322,7 @@ int ovl_permission(struct mnt_idmap *idmap,
 	 * Check overlay inode with the creds of task and underlying inode
 	 * with creds of mounter
 	 */
-	err = generic_permission(&nop_mnt_idmap, inode, mask);
+	err = generic_permission(idmap, inode, mask);
 	if (err)
 		return err;
 
@@ -339,7 +355,7 @@ static const char *ovl_get_link(struct dentry *dentry,
  * alter the POSIX ACLs for the underlying filesystem.
  */
 static void ovl_idmap_posix_acl(const struct inode *realinode,
-				struct mnt_idmap *idmap,
+				const struct mnt_idmap *idmap,
 				struct posix_acl *acl)
 {
 	struct user_namespace *fs_userns = i_user_ns(realinode);
@@ -390,7 +406,7 @@ struct posix_acl *ovl_get_acl_path(const struct path *path,
 				   const char *acl_name, bool noperm)
 {
 	struct posix_acl *real_acl, *clone;
-	struct mnt_idmap *idmap;
+	const struct mnt_idmap *idmap;
 	struct inode *realinode = d_inode(path->dentry);
 
 	idmap = mnt_idmap(path->mnt);
@@ -431,7 +447,7 @@ struct posix_acl *ovl_get_acl_path(const struct path *path,
  *
  * This is obviously only relevant when idmapped layers are used.
  */
-struct posix_acl *do_ovl_get_acl(struct mnt_idmap *idmap,
+struct posix_acl *do_ovl_get_acl(const struct mnt_idmap *idmap,
 				 struct inode *inode, int type,
 				 bool rcu, bool noperm)
 {
@@ -520,7 +536,7 @@ out:
 	return err;
 }
 
-int ovl_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+int ovl_set_acl(const struct mnt_idmap *idmap, struct dentry *dentry,
 		struct posix_acl *acl, int type)
 {
 	int err;
@@ -534,7 +550,7 @@ int ovl_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 		return -EOPNOTSUPP;
 	if (type == ACL_TYPE_DEFAULT && !S_ISDIR(inode->i_mode))
 		return acl ? -EACCES : 0;
-	if (!inode_owner_or_capable(&nop_mnt_idmap, inode))
+	if (!inode_owner_or_capable(idmap, inode))
 		return -EPERM;
 
 	/*
@@ -542,8 +558,8 @@ int ovl_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 	 * be done with mounter's capabilities and so that won't do it for us).
 	 */
 	if (unlikely(inode->i_mode & S_ISGID) && type == ACL_TYPE_ACCESS &&
-	    !in_group_p(inode->i_gid) &&
-	    !capable_wrt_inode_uidgid(&nop_mnt_idmap, inode, CAP_FSETID)) {
+	    !in_group_or_capable(idmap, inode,
+				 i_gid_into_vfsgid(idmap, inode))) {
 		struct iattr iattr = { .ia_valid = ATTR_KILL_SGID };
 
 		err = ovl_setattr(&nop_mnt_idmap, dentry, &iattr);
@@ -634,7 +650,7 @@ int ovl_real_fileattr_set(const struct path *realpath, struct file_kattr *fa)
 	return vfs_fileattr_set(mnt_idmap(realpath->mnt), realpath->dentry, fa);
 }
 
-int ovl_fileattr_set(struct mnt_idmap *idmap,
+int ovl_fileattr_set(const struct mnt_idmap *idmap,
 		     struct dentry *dentry, struct file_kattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
@@ -783,8 +799,8 @@ static const struct address_space_operations ovl_aops = {
  *
  * This chain is valid:
  * - inode->i_rwsem			(inode_lock[2])
- * - upper_mnt->mnt_sb->s_writers	(ovl_want_write[0])
  * - OVL_I(inode)->lock			(ovl_inode_lock[2])
+ * - upper_mnt->mnt_sb->s_writers	(ovl_want_write[0])
  * - OVL_I(lowerinode)->lock		(ovl_inode_lock[1])
  *
  * And this chain is valid:
@@ -797,10 +813,9 @@ static const struct address_space_operations ovl_aops = {
  * held, because it is in reverse order of the non-nested case using the same
  * upper fs:
  * - inode->i_rwsem			(inode_lock[1])
- * - upper_mnt->mnt_sb->s_writers	(ovl_want_write[0])
  * - OVL_I(inode)->lock			(ovl_inode_lock[1])
+ * - upper_mnt->mnt_sb->s_writers	(ovl_want_write[0])
  */
-#define OVL_MAX_NESTING FILESYSTEM_MAX_STACK_DEPTH
 
 static inline void ovl_lockdep_annotate_inode_mutex_key(struct inode *inode)
 {

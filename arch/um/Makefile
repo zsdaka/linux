@@ -71,7 +71,8 @@ USER_CFLAGS = $(patsubst $(KERNEL_DEFINES),,$(patsubst -I%,,$(KBUILD_CFLAGS))) \
 		-D_FILE_OFFSET_BITS=64 -idirafter $(srctree)/include \
 		-idirafter $(objtree)/include -D__KERNEL__ -D__UM_HOST__ \
 		-include $(srctree)/include/linux/compiler-version.h \
-		-include $(srctree)/include/linux/kconfig.h
+		-include $(srctree)/include/linux/kconfig.h \
+		-idirafter $(ARCH_DIR)/include/generated
 
 #This will adjust *FLAGS accordingly to the platform.
 include $(srctree)/$(ARCH_DIR)/Makefile-os-Linux
@@ -133,9 +134,10 @@ LINK_WRAPS = -Wl,--wrap,malloc -Wl,--wrap,free -Wl,--wrap,calloc
 # Avoid binutils 2.39+ warnings by marking the stack non-executable and
 # ignorning warnings for the kallsyms sections.
 LDFLAGS_EXECSTACK = -z noexecstack
-ifeq ($(CONFIG_LD_IS_BFD),y)
-LDFLAGS_EXECSTACK += $(call ld-option,--no-warn-rwx-segments)
-endif
+# check --no-warn-rwx-segments with CC-as-linker since that gets used
+# for vmlinux and is where we need the option, in particular with LLVM=1
+# it might be different links (ld.bfd vs. ld.lld)
+LDFLAGS_EXECSTACK += $(call try-run,$(CC) -Wl$(comma)--no-warn-rwx-segments -shared -x c /dev/null -o "$$TMP",--no-warn-rwx-segments)
 
 LD_FLAGS_CMDLINE = $(foreach opt,$(KBUILD_LDFLAGS) $(LDFLAGS_EXECSTACK),-Wl,$(opt))
 

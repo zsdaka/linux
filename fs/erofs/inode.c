@@ -191,8 +191,9 @@ static int erofs_read_inode(struct inode *inode)
 		err = -EFSCORRUPTED;
 		goto err_out;
 	} else {
-		inode->i_blocks = le32_to_cpu(copied.i_u.blocks_lo) <<
-				(sb->s_blocksize_bits - 9);
+		inode->i_blocks = (le32_to_cpu(copied.i_u.blocks_lo) |
+			((u64)le16_to_cpu(copied.i_nb.blocks_hi) << 32)) <<
+				  (sb->s_blocksize_bits - 9);
 	}
 
 	if (vi->datalayout == EROFS_INODE_CHUNK_BASED) {
@@ -255,7 +256,7 @@ static int erofs_fill_inode(struct inode *inode)
 	}
 
 	mapping_set_large_folios(inode->i_mapping);
-	aops = erofs_get_aops(inode, false);
+	aops = erofs_get_aops(inode);
 	if (IS_ERR(aops))
 		return PTR_ERR(aops);
 	inode->i_mapping->a_ops = aops;
@@ -310,7 +311,7 @@ struct inode *erofs_iget(struct super_block *sb, erofs_nid_t nid)
 	return inode;
 }
 
-int erofs_getattr(struct mnt_idmap *idmap, const struct path *path,
+int erofs_getattr(const struct mnt_idmap *idmap, const struct path *path,
 		  struct kstat *stat, u32 request_mask,
 		  unsigned int query_flags)
 {

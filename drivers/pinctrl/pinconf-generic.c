@@ -43,6 +43,7 @@ static const struct pin_config_item conf_items[] = {
 	PCONFDUMP(PIN_CONFIG_DRIVE_STRENGTH, "output drive strength", "mA", true),
 	PCONFDUMP(PIN_CONFIG_DRIVE_STRENGTH_UA, "output drive strength", "uA", true),
 	PCONFDUMP(PIN_CONFIG_INPUT_DEBOUNCE, "input debounce", "usec", true),
+	PCONFDUMP(PIN_CONFIG_INPUT_DEBOUNCE_NS, "input debounce", "nsec", true),
 	PCONFDUMP(PIN_CONFIG_INPUT_ENABLE, "input enabled", NULL, false),
 	PCONFDUMP(PIN_CONFIG_INPUT_SCHMITT, "input schmitt trigger", NULL, false),
 	PCONFDUMP(PIN_CONFIG_INPUT_SCHMITT_UV, "input schmitt threshold", "uV", true),
@@ -185,6 +186,7 @@ static const struct pinconf_generic_params dt_params[] = {
 	{ "drive-strength", PIN_CONFIG_DRIVE_STRENGTH, 0 },
 	{ "drive-strength-microamp", PIN_CONFIG_DRIVE_STRENGTH_UA, 0 },
 	{ "input-debounce", PIN_CONFIG_INPUT_DEBOUNCE, 0 },
+	{ "input-debounce-ns", PIN_CONFIG_INPUT_DEBOUNCE_NS, 0 },
 	{ "input-disable", PIN_CONFIG_INPUT_ENABLE, 0 },
 	{ "input-enable", PIN_CONFIG_INPUT_ENABLE, 1 },
 	{ "input-schmitt", PIN_CONFIG_INPUT_SCHMITT, 0 },
@@ -225,10 +227,9 @@ static int parse_fw_cfg(struct fwnode_handle *fwnode,
 			unsigned int count, unsigned long *cfg,
 			unsigned int *ncfg)
 {
-	unsigned long *properties;
 	int i, test;
 
-	properties = bitmap_zalloc(count, GFP_KERNEL);
+	unsigned long *properties __free(bitmap) = bitmap_zalloc(count, GFP_KERNEL);
 
 	for (i = 0; i < count; i++) {
 		u32 val;
@@ -263,7 +264,6 @@ static int parse_fw_cfg(struct fwnode_handle *fwnode,
 			if (ret) {
 				pr_err("%pfw: conflicting setting detected for %s\n",
 				       fwnode, par->property);
-				bitmap_free(properties);
 				return -EINVAL;
 			}
 		}
@@ -295,7 +295,6 @@ static int parse_fw_cfg(struct fwnode_handle *fwnode,
 		pr_err("%pfw: cannot have multiple drive configurations\n",
 		       fwnode);
 
-	bitmap_free(properties);
 	return 0;
 }
 
@@ -419,7 +418,7 @@ int pinconf_generic_parse_dt_config(struct device_node *np,
 	 * Now limit the number of configs to the real number of
 	 * found properties.
 	 */
-	*configs = kmemdup(cfg, ncfg * sizeof(unsigned long), GFP_KERNEL);
+	*configs = kmemdup_array(cfg, ncfg, sizeof(unsigned long), GFP_KERNEL);
 	if (!*configs) {
 		ret = -ENOMEM;
 		goto out;

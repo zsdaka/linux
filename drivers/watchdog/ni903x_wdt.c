@@ -9,6 +9,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/stringify.h>
 #include <linux/watchdog.h>
 
 #define NIWD_CONTROL	0x01
@@ -46,13 +47,13 @@ static unsigned int timeout;
 module_param(timeout, uint, 0);
 MODULE_PARM_DESC(timeout,
 		 "Watchdog timeout in seconds. (default="
-		 __MODULE_STRING(NIWD_DEFAULT_TIMEOUT) ")");
+		 __stringify(NIWD_DEFAULT_TIMEOUT) ")");
 
 static int nowayout = WATCHDOG_NOWAYOUT;
 module_param(nowayout, int, S_IRUGO);
 MODULE_PARM_DESC(nowayout,
 		 "Watchdog cannot be stopped once started (default="
-		 __MODULE_STRING(WATCHDOG_NOWAYOUT) ")");
+		 __stringify(WATCHDOG_NOWAYOUT) ")");
 
 static void ni903x_start(struct ni903x_wdt *wdt)
 {
@@ -183,8 +184,13 @@ static int ni903x_acpi_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct watchdog_device *wdd;
 	struct ni903x_wdt *wdt;
+	acpi_handle handle;
 	acpi_status status;
 	int ret;
+
+	handle = ACPI_HANDLE(dev);
+	if (!handle)
+		return -ENODEV;
 
 	wdt = devm_kzalloc(dev, sizeof(*wdt), GFP_KERNEL);
 	if (!wdt)
@@ -193,7 +199,7 @@ static int ni903x_acpi_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, wdt);
 	wdt->dev = dev;
 
-	status = acpi_walk_resources(ACPI_HANDLE(dev), METHOD_NAME__CRS,
+	status = acpi_walk_resources(handle, METHOD_NAME__CRS,
 				     ni903x_resources, wdt);
 	if (ACPI_FAILURE(status) || wdt->io_base == 0) {
 		dev_err(dev, "failed to get resources\n");

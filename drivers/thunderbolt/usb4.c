@@ -294,7 +294,12 @@ int usb4_switch_setup(struct tb_switch *sw)
 	/* TBT3 supported by the CM */
 	val &= ~ROUTER_CS_5_CNS;
 
-	return tb_sw_write(sw, &val, TB_CFG_SWITCH, ROUTER_CS_5, 1);
+	ret = tb_sw_write(sw, &val, TB_CFG_SWITCH, ROUTER_CS_5, 1);
+	if (ret)
+		return ret;
+
+	return tb_switch_wait_for_bit(sw, ROUTER_CS_6, ROUTER_CS_6_RR,
+				      ROUTER_CS_6_RR, 500);
 }
 
 /**
@@ -304,7 +309,7 @@ int usb4_switch_setup(struct tb_switch *sw)
  * Sets configuration valid bit for the router. Must be called before
  * any tunnels can be set through the router and after
  * usb4_switch_setup() has been called. Can be called to host and device
- * routers (does nothing for the latter).
+ * routers (does nothing for the former).
  *
  * Return: %0 on success, negative errno otherwise.
  */
@@ -327,7 +332,7 @@ int usb4_switch_configuration_valid(struct tb_switch *sw)
 		return ret;
 
 	return tb_switch_wait_for_bit(sw, ROUTER_CS_6, ROUTER_CS_6_CR,
-				      ROUTER_CS_6_CR, 50);
+				      ROUTER_CS_6_CR, 500);
 }
 
 /**
@@ -1821,23 +1826,27 @@ int usb4_port_sw_margin(struct tb_port *port, enum usb4_sb_target target,
  * @target: Sideband target
  * @index: Retimer index if target is %USB4_SB_TARGET_RETIMER
  * @errors: Error metadata is copied here.
+ * @dwords: Number of dwords to read error counter values
  *
  * This reads back the software margining error counters from the port.
  *
  * Return: %0 on success, negative errno otherwise.
  */
 int usb4_port_sw_margin_errors(struct tb_port *port, enum usb4_sb_target target,
-			       u8 index, u32 *errors)
+			       u8 index, u32 *errors, size_t dwords)
 {
 	int ret;
+	u8 reg;
 
 	ret = usb4_port_sb_op(port, target, index,
 			      USB4_SB_OPCODE_READ_SW_MARGIN_ERR, 150);
 	if (ret)
 		return ret;
 
-	return usb4_port_sb_read(port, target, index, USB4_SB_METADATA, errors,
-				 sizeof(*errors));
+	reg = (dwords > 1) ? USB4_SB_DATA : USB4_SB_METADATA;
+
+	return usb4_port_sb_read(port, target, index, reg, errors,
+				 sizeof(*errors) * dwords);
 }
 
 static inline int usb4_port_retimer_op(struct tb_port *port, u8 index,
@@ -3144,4 +3153,28 @@ int usb4_pci_port_set_ext_encapsulation(struct tb_port *port, bool enable)
 
 	return tb_port_write(port, &val, TB_CFG_PORT,
 			     port->cap_adap + ADP_PCIE_CS_1, 1);
+}
+
+/**
+ * usb4_pci_port_ltssm_state() - Read PCIe adapter LTSSM state
+ * @port: PCIe adapter
+ *
+ * Return:
+ * * LTSSM state of @port.
+ * * Negative errno - On failure.
+ */
+int usb4_pci_port_ltssm_state(struct tb_port *port)
+{
+	u32 val;
+	int ret;
+
+	if (!tb_port_is_pcie_down(port) && !tb_port_is_pcie_up(port))
+		return -EINVAL;
+
+	ret = tb_port_read(port, &val, TB_CFG_PORT,
+			   port->cap_adap + ADP_PCIE_CS_0, 1);
+	if (ret)
+		return ret;
+
+	return FIELD_GET(ADP_PCIE_CS_0_LTSSM_MASK, val);
 }

@@ -165,8 +165,6 @@ static u64 mesh_set_ht_prot_mode(struct ieee80211_sub_if_data *sdata)
 
 	switch (sdata->vif.bss_conf.chanreq.oper.width) {
 	case NL80211_CHAN_WIDTH_20_NOHT:
-	case NL80211_CHAN_WIDTH_5:
-	case NL80211_CHAN_WIDTH_10:
 		return 0;
 	default:
 		break;
@@ -401,11 +399,13 @@ u64 mesh_plink_deactivate(struct sta_info *sta)
 {
 	struct ieee80211_sub_if_data *sdata = sta->sdata;
 	u64 changed;
+	bool send_close;
 
 	spin_lock_bh(&sta->mesh->plink_lock);
+	send_close = sta->mesh->plink_state != NL80211_PLINK_LISTEN;
 	changed = __mesh_plink_deactivate(sta);
 
-	if (!sdata->u.mesh.user_mpm) {
+	if (!sdata->u.mesh.user_mpm && send_close) {
 		sta->mesh->reason = WLAN_REASON_MESH_PEER_CANCELED;
 		mesh_plink_frame_tx(sdata, sta, WLAN_SP_MESH_PEERING_CLOSE,
 				    sta->sta.addr, sta->mesh->llid,
@@ -469,6 +469,9 @@ static void mesh_sta_info_init(struct ieee80211_sub_if_data *sdata,
 					    elems->he_cap_len,
 					    elems->eht_cap, elems->eht_cap_len,
 					    &sta->deflink);
+
+	ieee80211_sta_init_nss_bw_capa(&sta->deflink,
+				       &sdata->deflink.conf->chanreq.oper);
 
 	if (bw != sta->sta.deflink.bandwidth)
 		changed |= IEEE80211_RC_BW_CHANGED;

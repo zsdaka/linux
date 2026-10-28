@@ -4,6 +4,10 @@
 #include "ice.h"
 #include "ice_lib.h"
 #include "ice_trace.h"
+#include "ice_tspll.h"
+#include "ice_txclk.h"
+
+#define ICE_TSPLL_LOG_INTERVAL		120
 
 static const char ice_pin_names[][64] = {
 	"SDP0",
@@ -53,11 +57,6 @@ static const struct ice_ptp_pin_desc ice_pin_desc_dpll[] = {
 	{  SDP2, { -1,  2 }, { 0, 1 }},
 	{  SDP3, {  3, -1 }, { 0, 0 }},
 };
-
-static struct ice_pf *ice_get_ctrl_pf(struct ice_pf *pf)
-{
-	return !pf->adapter ? NULL : pf->adapter->ctrl_pf;
-}
 
 static struct ice_ptp *ice_get_ctrl_ptp(struct ice_pf *pf)
 {
@@ -350,7 +349,7 @@ static u64 ice_ptp_extend_40b_ts(struct ice_pf *pf, u64 in_tstamp)
 		return 0;
 	}
 
-	return ice_ptp_extend_32b_ts(pf->ptp.cached_phc_time,
+	return ice_ptp_extend_32b_ts(READ_ONCE(pf->ptp.cached_phc_time),
 				     (in_tstamp >> 8) & mask);
 }
 
@@ -1328,6 +1327,9 @@ void ice_ptp_link_change(struct ice_pf *pf, bool linkup)
 			}
 		}
 		mutex_unlock(&pf->dplls.lock);
+
+		if (linkup)
+			ice_txclk_update_and_notify(pf);
 	}
 
 	switch (hw->mac_type) {
@@ -2065,11 +2067,13 @@ static const struct ice_crosststamp_cfg ice_crosststamp_cfg_e830 = {
 /**
  * struct ice_crosststamp_ctx - Device cross timestamp context
  * @snapshot: snapshot of system clocks for historic interpolation
+ * @snapshot_clock_id: System clock ID for @snapshot
  * @pf: pointer to the PF private structure
  * @cfg: pointer to hardware configuration for cross timestamp
  */
 struct ice_crosststamp_ctx {
 	struct system_time_snapshot snapshot;
+	clockid_t snapshot_clock_id;
 	struct ice_pf *pf;
 	const struct ice_crosststamp_cfg *cfg;
 };
@@ -2115,7 +2119,7 @@ static int ice_capture_crosststamp(ktime_t *device,
 	}
 
 	/* Snapshot system time for historic interpolation */
-	ktime_get_snapshot(&ctx->snapshot);
+	ktime_get_snapshot_id(ctx->snapshot_clock_id, &ctx->snapshot);
 
 	/* Program cmd to master timer */
 	ice_ptp_src_cmd(hw, ICE_PTP_READ_TIME);
@@ -2176,6 +2180,7 @@ static int ice_ptp_getcrosststamp(struct ptp_clock_info *info,
 {
 	struct ice_pf *pf = ptp_info_to_pf(info);
 	struct ice_crosststamp_ctx ctx = {
+		.snapshot_clock_id = cts->clock_id,
 		.pf = pf,
 	};
 
@@ -2324,6 +2329,8 @@ u64 ice_ptp_get_rx_hwts(const union ice_32b_rx_flex_desc *rx_desc,
 	 */
 	ts_high = le32_to_cpu(rx_desc->wb.flex_ts.ts_high);
 	ts_ns = ice_ptp_extend_32b_ts(cached_time, ts_high);
+
+	ice_trace(rx_hwtstamp, cached_time, ts_high, ts_ns);
 
 	return ts_ns;
 }
@@ -2847,6 +2854,79 @@ static void ice_ptp_maybe_trigger_tx_interrupt(struct ice_pf *pf)
 	}
 }
 
+/**
+ * ice_ptp_tspll_monitor - poll and recover TSPLL lock on E825 owner PFs
+ * @pf: Board private structure
+ *
+ * Called from the PTP periodic worker. On E825 devices that own the source
+ * timer, poll the TSPLL lock status via CGU registers and trigger a restart
+ * if the lock has been lost. The result is cached in @pf->ptp.tspll_locked
+ * so it can be consumed by the DPLL periodic worker via READ_ONCE().
+ *
+ * TSPLL lock is critical for PHC operation and must be monitored regardless
+ * of whether DPLL init succeeded or CONFIG_DPLL is enabled. Placing the
+ * monitor here makes recovery independent of the dpll subsystem.
+ *
+ * AQ read errors are rate-limited and do not stop monitoring. Lock-lost
+ * events are logged every 120 retries (~60 s at normal poll rate) to
+ * surface persistent failures without flooding the log.
+ */
+static void ice_ptp_tspll_monitor(struct ice_pf *pf)
+{
+	bool lock_lost;
+	int err;
+
+	if (pf->hw.mac_type != ICE_MAC_GENERIC_3K_E825 ||
+	    !ice_pf_src_tmr_owned(pf))
+		return;
+
+	/* Serialize the entire monitor tick against TSPLL userspace reconfig
+	 * (ice_dpll_tspll_state_on_dpll_set()). Both paths read HW state and
+	 * write pf->ptp.tspll_locked; without holding pf->dplls.lock across
+	 * the HW read here, a preempted monitor could observe stale HW state
+	 * and then overwrite an accurate cache update from the DPLL callback.
+	 * pf->dplls.lock is initialized in ice_init_features() before the PTP
+	 * kworker starts and destroyed in ice_deinit_features() only after
+	 * ice_ptp_release() has drained the kworker, so it is always valid.
+	 */
+	mutex_lock(&pf->dplls.lock);
+	err = ice_tspll_lost_lock_e825c(&pf->hw, &lock_lost);
+	if (err) {
+		mutex_unlock(&pf->dplls.lock);
+		dev_err_ratelimited(ice_pf_to_dev(pf),
+				    "Failed reading TimeSync PLL lock status (err: %d). Retrying.\n",
+				    err);
+		return;
+	}
+
+	if (lock_lost) {
+		WRITE_ONCE(pf->ptp.tspll_locked, false);
+		if (!(pf->ptp.tspll_lock_retries % ICE_TSPLL_LOG_INTERVAL))
+			dev_warn(ice_pf_to_dev(pf),
+				 "TimeSync PLL lock lost. Retrying to acquire lock.\n");
+		err = ice_tspll_restart_e825c(&pf->hw);
+		if (err)
+			dev_err_ratelimited(ice_pf_to_dev(pf),
+					    "Failed to restart TimeSync PLL (err: %d).\n",
+					    err);
+		pf->ptp.tspll_lock_retries++;
+	} else {
+		if (pf->ptp.tspll_lock_retries) {
+			const char *src_str = "unknown";
+			enum ice_clk_src clk_src;
+
+			if (!ice_tspll_get_clk_src(&pf->hw, &clk_src))
+				src_str = ice_tspll_clk_src_str(clk_src);
+			dev_info(ice_pf_to_dev(pf),
+				 "TimeSync PLL lock acquired with %s clock source after %u retries.\n",
+				 src_str, pf->ptp.tspll_lock_retries);
+		}
+		WRITE_ONCE(pf->ptp.tspll_locked, true);
+		pf->ptp.tspll_lock_retries = 0;
+	}
+	mutex_unlock(&pf->dplls.lock);
+}
+
 static void ice_ptp_periodic_work(struct kthread_work *work)
 {
 	struct ice_ptp *ptp = container_of(work, struct ice_ptp, work.work);
@@ -2855,6 +2935,8 @@ static void ice_ptp_periodic_work(struct kthread_work *work)
 
 	if (pf->ptp.state != ICE_PTP_READY)
 		return;
+
+	ice_ptp_tspll_monitor(pf);
 
 	err = ice_ptp_update_cached_phctime(pf);
 
@@ -2973,6 +3055,9 @@ static int ice_ptp_rebuild_owner(struct ice_pf *pf)
 	err = ice_tspll_init(hw);
 	if (err)
 		return err;
+	/* Rebuild reinitialized TSPLL, so reset monitor retry state. */
+	WRITE_ONCE(ptp->tspll_locked, true);
+	ptp->tspll_lock_retries = 0;
 
 	/* Acquire the global hardware lock */
 	if (!ice_ptp_lock(hw)) {
@@ -3035,6 +3120,11 @@ void ice_ptp_rebuild(struct ice_pf *pf, enum ice_reset_req reset_type)
 	struct ice_ptp *ptp = &pf->ptp;
 	int err;
 
+	if (ptp->state == ICE_PTP_UNINIT) {
+		dev_dbg(ice_pf_to_dev(pf), "PTP was not initialized, skipping rebuild\n");
+		return;
+	}
+
 	if (ptp->state == ICE_PTP_READY) {
 		ice_ptp_prepare_for_reset(pf, reset_type);
 	} else if (ptp->state != ICE_PTP_RESETTING) {
@@ -3059,14 +3149,9 @@ err:
 	dev_err(ice_pf_to_dev(pf), "PTP reset failed %d\n", err);
 }
 
-static int ice_ptp_setup_adapter(struct ice_pf *pf)
+static void ice_ptp_setup_adapter(struct ice_pf *pf)
 {
-	if (!ice_pf_src_tmr_owned(pf) || !ice_is_primary(&pf->hw))
-		return -EPERM;
-
 	pf->adapter->ctrl_pf = pf;
-
-	return 0;
 }
 
 static int ice_ptp_setup_pf(struct ice_pf *pf)
@@ -3089,6 +3174,21 @@ static int ice_ptp_setup_pf(struct ice_pf *pf)
 	list_add(&ptp->port.list_node,
 		 &pf->adapter->ports.ports);
 	mutex_unlock(&pf->adapter->ports.lock);
+
+	/* Seed the per-PHY Tx reference clock usage map for this port.
+	 * Only meaningful on E825 (other MAC types don't expose tx-clk
+	 * selection). No locking is needed because this runs during
+	 * ice_ptp_init() before pf->dplls.lock exists and before any
+	 * link event or DPLL callback can observe the map.
+	 */
+	if (pf->hw.mac_type == ICE_MAC_GENERIC_3K_E825) {
+		u8 port_num, phy;
+
+		port_num = ptp->port.port_num;
+		phy = port_num / pf->hw.ptp.ports_per_phy;
+		set_bit(port_num,
+			&ctrl_ptp->tx_refclks[phy][pf->ptp.port.tx_clk]);
+	}
 
 	return 0;
 }
@@ -3302,6 +3402,7 @@ void ice_ptp_init(struct ice_pf *pf)
 	}
 	ptp->port.port_num = hw->lane_num;
 
+	ptp->tspll_locked = true;
 	ice_ptp_init_hw(hw);
 
 	ice_ptp_init_tx_interrupt_mode(pf);
@@ -3309,13 +3410,25 @@ void ice_ptp_init(struct ice_pf *pf)
 	/* If this function owns the clock hardware, it must allocate and
 	 * configure the PTP clock device to represent it.
 	 */
-	if (ice_pf_src_tmr_owned(pf) && ice_is_primary(hw)) {
-		err = ice_ptp_setup_adapter(pf);
-		if (err)
-			goto err_exit;
+	if (ice_pf_src_tmr_owned(pf)) {
+		ice_ptp_setup_adapter(pf);
+
 		err = ice_ptp_init_owner(pf);
 		if (err)
 			goto err_exit;
+	}
+
+	ptp->port.tx_clk = ICE_REF_CLK_ENET;
+	ptp->port.tx_clk_req = ICE_REF_CLK_ENET;
+	if (hw->mac_type == ICE_MAC_GENERIC_3K_E825) {
+		enum ice_e825c_ref_clk tx_ref_clk;
+
+		err = ice_get_serdes_ref_sel_e825c(hw, ptp->port.port_num,
+						   &tx_ref_clk);
+		if (!err) {
+			ptp->port.tx_clk = tx_ref_clk;
+			ptp->port.tx_clk_req = tx_ref_clk;
+		}
 	}
 
 	err = ice_ptp_setup_pf(pf);

@@ -25,6 +25,7 @@
 #include "aldebaran.h"
 #include "sienna_cichlid.h"
 #include "smu_v13_0_10.h"
+#include "soc_v1_0.h"
 
 static int amdgpu_reset_xgmi_reset_on_init_suspend(struct amdgpu_device *adev)
 {
@@ -90,6 +91,7 @@ static int amdgpu_reset_xgmi_reset_on_init_restore_hwctxt(
 			kgd2kfd_init_zone_device(tmp_adev);
 			amdgpu_amdkfd_device_init(tmp_adev);
 			amdgpu_amdkfd_drm_client_create(tmp_adev);
+			amdgpu_ptl_sysfs_init(tmp_adev);
 		}
 	}
 
@@ -193,6 +195,9 @@ int amdgpu_reset_init(struct amdgpu_device *adev)
 	case IP_VERSION(13, 0, 10):
 		ret = smu_v13_0_10_reset_init(adev);
 		break;
+	case IP_VERSION(15, 0, 8):
+		ret = soc_v1_0_reset_init(adev);
+		break;
 	default:
 		break;
 	}
@@ -216,6 +221,9 @@ int amdgpu_reset_fini(struct amdgpu_device *adev)
 		break;
 	case IP_VERSION(13, 0, 10):
 		ret = smu_v13_0_10_reset_fini(adev);
+		break;
+	case IP_VERSION(15, 0, 8):
+		ret = soc_v1_0_reset_fini(adev);
 		break;
 	default:
 		break;

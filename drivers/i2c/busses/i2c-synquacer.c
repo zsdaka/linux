@@ -576,7 +576,7 @@ static int synquacer_i2c_probe(struct platform_device *pdev)
 	ret = devm_request_irq(&pdev->dev, i2c->irq, synquacer_i2c_isr,
 			       0, dev_name(&pdev->dev), i2c);
 	if (ret < 0)
-		return dev_err_probe(&pdev->dev, ret, "cannot claim IRQ %d\n", i2c->irq);
+		return ret;
 
 	i2c->state = STATE_IDLE;
 	i2c->dev = &pdev->dev;
@@ -622,8 +622,8 @@ MODULE_DEVICE_TABLE(of, synquacer_i2c_dt_ids);
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id synquacer_i2c_acpi_ids[] = {
-	{ "SCX0003" },
-	{ /* sentinel */ }
+	{ .id = "SCX0003" },
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, synquacer_i2c_acpi_ids);
 #endif

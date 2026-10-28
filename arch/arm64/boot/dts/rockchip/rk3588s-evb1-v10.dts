@@ -457,6 +457,7 @@
 
 &pwm12 {
 	pinctrl-0 = <&pwm12m1_pins>;
+	pinctrl-names = "default";
 	status = "okay";
 };
 
@@ -477,7 +478,6 @@
 
 &sdmmc {
 	bus-width = <4>;
-	cap-mmc-highspeed;
 	cap-sd-highspeed;
 	cd-gpios = <&gpio0 RK_PA4 GPIO_ACTIVE_LOW>;
 	disable-wp;

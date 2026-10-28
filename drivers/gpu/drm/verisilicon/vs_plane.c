@@ -6,13 +6,15 @@
 #include <linux/errno.h>
 #include <linux/printk.h>
 
+#include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_print.h>
 
 #include "vs_plane.h"
 
-void drm_format_to_vs_format(u32 drm_format, struct vs_format *vs_format)
+int drm_format_to_vs_format(u32 drm_format, struct vs_format *vs_format)
 {
 	switch (drm_format) {
 	case DRM_FORMAT_XRGB4444:
@@ -62,7 +64,7 @@ void drm_format_to_vs_format(u32 drm_format, struct vs_format *vs_format)
 		vs_format->color = VSDC_COLOR_FORMAT_A2R10G10B10;
 		break;
 	default:
-		pr_warn("Unexpected drm format!\n");
+		return -EINVAL;
 	}
 
 	switch (drm_format) {
@@ -101,24 +103,48 @@ void drm_format_to_vs_format(u32 drm_format, struct vs_format *vs_format)
 
 	/* N/A for non-YUV formats */
 	vs_format->uv_swizzle = false;
+
+	return 0;
 }
 
-dma_addr_t vs_fb_get_dma_addr(struct drm_framebuffer *fb,
-			      const struct drm_rect *src_rect)
+struct drm_plane_state *vs_plane_duplicate_state(struct drm_plane *plane)
 {
-	struct drm_gem_dma_object *gem;
-	dma_addr_t dma_addr;
+	struct vs_plane_state *vs_state, *vs_state_old;
 
-	/* Get the physical address of the buffer in memory */
-	gem = drm_fb_dma_get_gem_obj(fb, 0);
+	if (drm_WARN_ON(plane->dev, !plane->state))
+		return NULL;
 
-	/* Compute the start of the displayed memory */
-	dma_addr = gem->dma_addr + fb->offsets[0];
+	vs_state_old = to_vs_plane_state(plane->state);
 
-	/* Fixup framebuffer address for src coordinates */
-	dma_addr += drm_format_info_min_pitch(fb->format, 0,
-					      src_rect->x1 >> 16);
-	dma_addr += (src_rect->y1 >> 16) * fb->pitches[0];
+	vs_state = kzalloc_obj(*vs_state);
+	if (!vs_state)
+		return NULL;
 
-	return dma_addr;
+	__drm_atomic_helper_plane_duplicate_state(plane, &vs_state->base);
+
+	memcpy(&vs_state->format, &vs_state_old->format,
+	       sizeof(struct vs_format));
+
+	return &vs_state->base;
+}
+
+void vs_plane_destroy_state(struct drm_plane *plane,
+			    struct drm_plane_state *state)
+{
+	__drm_atomic_helper_plane_destroy_state(state);
+	kfree(state);
+}
+
+/* Called during init to allocate the plane's atomic state. */
+struct drm_plane_state *vs_plane_create_state(struct drm_plane *plane)
+{
+	struct vs_plane_state *vs_state;
+
+	vs_state = kzalloc_obj(*vs_state);
+	if (!vs_state)
+		return ERR_PTR(-ENOMEM);
+
+	__drm_atomic_helper_plane_state_init(&vs_state->base, plane);
+
+	return &vs_state->base;
 }

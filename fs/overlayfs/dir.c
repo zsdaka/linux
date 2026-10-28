@@ -188,7 +188,6 @@ struct dentry *ovl_create_real(struct ovl_fs *ofs, struct dentry *parent,
 			if (!err && ofs->casefold != ovl_dentry_casefolded(newdentry)) {
 				pr_warn_ratelimited("wrong inherited casefold (%pd2)\n",
 						    newdentry);
-				end_creating(newdentry);
 				err = -EINVAL;
 			}
 			break;
@@ -689,8 +688,8 @@ static int ovl_create_or_link(struct dentry *dentry, struct inode *inode,
 	return err;
 }
 
-static int ovl_create_object(struct dentry *dentry, int mode, dev_t rdev,
-			     const char *link)
+static int ovl_create_object(const struct mnt_idmap *idmap, struct dentry *dentry,
+			     int mode, dev_t rdev, const char *link)
 {
 	int err;
 	struct inode *inode;
@@ -717,7 +716,7 @@ static int ovl_create_object(struct dentry *dentry, int mode, dev_t rdev,
 	inode_state_set(inode, I_CREATING);
 	spin_unlock(&inode->i_lock);
 
-	inode_init_owner(&nop_mnt_idmap, inode, dentry->d_parent->d_inode, mode);
+	inode_init_owner(idmap, inode, dentry->d_parent->d_inode, mode);
 	attr.mode = inode->i_mode;
 
 	err = ovl_create_or_link(dentry, inode, &attr, false);
@@ -731,32 +730,32 @@ out:
 	return err;
 }
 
-static int ovl_create(struct mnt_idmap *idmap, struct inode *dir,
-		      struct dentry *dentry, umode_t mode, bool excl)
+static int ovl_create(const struct mnt_idmap *idmap, struct inode *dir,
+		      struct dentry *dentry, umode_t mode)
 {
-	return ovl_create_object(dentry, (mode & 07777) | S_IFREG, 0, NULL);
+	return ovl_create_object(idmap, dentry, (mode & 07777) | S_IFREG, 0, NULL);
 }
 
-static struct dentry *ovl_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+static struct dentry *ovl_mkdir(const struct mnt_idmap *idmap, struct inode *dir,
 				struct dentry *dentry, umode_t mode)
 {
-	return ERR_PTR(ovl_create_object(dentry, (mode & 07777) | S_IFDIR, 0, NULL));
+	return ERR_PTR(ovl_create_object(idmap, dentry, (mode & 07777) | S_IFDIR, 0, NULL));
 }
 
-static int ovl_mknod(struct mnt_idmap *idmap, struct inode *dir,
+static int ovl_mknod(const struct mnt_idmap *idmap, struct inode *dir,
 		     struct dentry *dentry, umode_t mode, dev_t rdev)
 {
 	/* Don't allow creation of "whiteout" on overlay */
 	if (S_ISCHR(mode) && rdev == WHITEOUT_DEV)
 		return -EPERM;
 
-	return ovl_create_object(dentry, mode, rdev, NULL);
+	return ovl_create_object(idmap, dentry, mode, rdev, NULL);
 }
 
-static int ovl_symlink(struct mnt_idmap *idmap, struct inode *dir,
+static int ovl_symlink(const struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, const char *link)
 {
-	return ovl_create_object(dentry, S_IFLNK, 0, link);
+	return ovl_create_object(idmap, dentry, S_IFLNK, 0, link);
 }
 
 static int ovl_set_link_redirect(struct dentry *dentry)
@@ -1345,7 +1344,7 @@ static void ovl_rename_end(struct ovl_renamedata *ovlrd)
 		ovl_drop_write(ovlrd->old_dentry);
 }
 
-static int ovl_rename(struct mnt_idmap *idmap, struct inode *olddir,
+static int ovl_rename(const struct mnt_idmap *idmap, struct inode *olddir,
 		      struct dentry *old, struct inode *newdir,
 		      struct dentry *new, unsigned int flags)
 {
@@ -1421,7 +1420,7 @@ static int ovl_dummy_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int ovl_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
+static int ovl_tmpfile(const struct mnt_idmap *idmap, struct inode *dir,
 		       struct file *file, umode_t mode)
 {
 	int err;
@@ -1444,7 +1443,7 @@ static int ovl_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	if (!inode)
 		goto drop_write;
 
-	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
+	inode_init_owner(idmap, inode, dir, mode);
 	err = ovl_create_tmpfile(file, dentry, inode, inode->i_mode);
 	if (err)
 		goto put_inode;

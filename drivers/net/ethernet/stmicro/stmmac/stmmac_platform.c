@@ -16,6 +16,7 @@
 #include <linux/of.h>
 #include <linux/of_net.h>
 #include <linux/of_mdio.h>
+#include <linux/phy.h>
 
 #include "stmmac.h"
 #include "stmmac_platform.h"
@@ -130,7 +131,6 @@ static struct stmmac_axi *stmmac_axi_setup(struct platform_device *pdev)
 static int stmmac_mtl_setup(struct platform_device *pdev,
 			    struct plat_stmmacenet_data *plat)
 {
-	struct device_node *q_node;
 	struct device_node *rx_node;
 	struct device_node *tx_node;
 	u8 queue = 0;
@@ -156,8 +156,8 @@ static int stmmac_mtl_setup(struct platform_device *pdev,
 
 	/* Processing RX queues common config */
 	if (!of_property_read_u32(rx_node, "snps,rx-queues-to-use", &value)) {
-		if (value > U8_MAX)
-			value = U8_MAX;
+		if (value > MTL_MAX_RX_QUEUES)
+			value = MTL_MAX_RX_QUEUES;
 		plat->rx_queues_to_use = value;
 	}
 
@@ -169,7 +169,7 @@ static int stmmac_mtl_setup(struct platform_device *pdev,
 		plat->rx_sched_algorithm = MTL_RX_ALGORITHM_SP;
 
 	/* Processing individual RX queue config */
-	for_each_child_of_node(rx_node, q_node) {
+	for_each_child_of_node_scoped(rx_node, q_node) {
 		if (queue >= plat->rx_queues_to_use)
 			break;
 
@@ -210,8 +210,8 @@ static int stmmac_mtl_setup(struct platform_device *pdev,
 
 	/* Processing TX queues common config */
 	if (!of_property_read_u32(tx_node, "snps,tx-queues-to-use", &value)) {
-		if (value > U8_MAX)
-			value = U8_MAX;
+		if (value > MTL_MAX_TX_QUEUES)
+			value = MTL_MAX_TX_QUEUES;
 		plat->tx_queues_to_use = value;
 	}
 
@@ -227,7 +227,7 @@ static int stmmac_mtl_setup(struct platform_device *pdev,
 	queue = 0;
 
 	/* Processing individual TX queue config */
-	for_each_child_of_node(tx_node, q_node) {
+	for_each_child_of_node_scoped(tx_node, q_node) {
 		if (queue >= plat->tx_queues_to_use)
 			break;
 
@@ -276,7 +276,6 @@ static int stmmac_mtl_setup(struct platform_device *pdev,
 out:
 	of_node_put(rx_node);
 	of_node_put(tx_node);
-	of_node_put(q_node);
 
 	return ret;
 }
@@ -849,6 +848,16 @@ int stmmac_pltfr_probe(struct platform_device *pdev,
 		       struct plat_stmmacenet_data *plat,
 		       struct stmmac_resources *res)
 {
+	if (plat->has_internal_tx_delay || plat->has_internal_rx_delay) {
+		plat->phy_interface =
+			phy_fix_phy_mode_for_mac_delays(plat->phy_interface,
+							plat->has_internal_tx_delay,
+							plat->has_internal_rx_delay);
+		if (plat->phy_interface == PHY_INTERFACE_MODE_NA)
+			return dev_err_probe(&pdev->dev, -EINVAL,
+					     "unsupported phy interface mode\n");
+	}
+
 	if (!plat->suspend && plat->exit)
 		plat->suspend = stmmac_plat_suspend;
 	if (!plat->resume && plat->init)
@@ -961,7 +970,8 @@ static int __maybe_unused stmmac_pltfr_noirq_suspend(struct device *dev)
 
 	if (!priv->wolopts) {
 		/* Disable clock in case of PWM is off */
-		clk_disable_unprepare(priv->plat->clk_ptp_ref);
+		if (priv->ptp_enabled)
+			clk_disable_unprepare(priv->plat->clk_ptp_ref);
 
 		ret = pm_runtime_force_suspend(dev);
 		if (ret)
@@ -985,6 +995,9 @@ static int __maybe_unused stmmac_pltfr_noirq_resume(struct device *dev)
 		ret = pm_runtime_force_resume(dev);
 		if (ret)
 			return ret;
+
+		if (!priv->ptp_enabled)
+			return 0;
 
 		ret = clk_prepare_enable(priv->plat->clk_ptp_ref);
 		if (ret < 0) {

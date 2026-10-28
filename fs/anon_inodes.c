@@ -46,7 +46,7 @@ static struct inode *anon_inode_inode __ro_after_init;
  * Rather than mess with our internal sane inode data, just fix it
  * up here in getattr() by masking off the format bits.
  */
-int anon_inode_getattr(struct mnt_idmap *idmap, const struct path *path,
+int anon_inode_getattr(const struct mnt_idmap *idmap, const struct path *path,
 		       struct kstat *stat, u32 request_mask,
 		       unsigned int query_flags)
 {
@@ -57,7 +57,7 @@ int anon_inode_getattr(struct mnt_idmap *idmap, const struct path *path,
 	return 0;
 }
 
-int anon_inode_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+int anon_inode_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 		       struct iattr *attr)
 {
 	return -EOPNOTSUPP;
@@ -86,8 +86,6 @@ static int anon_inodefs_init_fs_context(struct fs_context *fc)
 	struct pseudo_fs_context *ctx = init_pseudo(fc, ANON_INODE_FS_MAGIC);
 	if (!ctx)
 		return -ENOMEM;
-	fc->s_iflags |= SB_I_NOEXEC;
-	fc->s_iflags |= SB_I_NODEV;
 	ctx->dops = &anon_inodefs_dentry_operations;
 	return 0;
 }

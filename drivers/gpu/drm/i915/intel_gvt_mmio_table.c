@@ -7,6 +7,7 @@
 #include <drm/intel/intel_gmd_misc_regs.h>
 
 #include <drm/intel/intel_gmd_interrupt_regs.h>
+#include <drm/intel/mchbar_regs.h>
 
 #include "display/bxt_dpio_phy_regs.h"
 #include "display/i9xx_plane_regs.h"
@@ -44,7 +45,6 @@
 #include "i915_pvinfo.h"
 #include "i915_reg.h"
 #include "intel_gvt.h"
-#include "intel_mchbar_regs.h"
 
 #define MMIO_F(reg, s) do { \
 	int ret; \
@@ -611,7 +611,7 @@ static int iterate_generic_mmio(struct intel_gvt_mmio_table_iter *iter)
 	MMIO_D(GEN6_UCGCTL1);
 	MMIO_D(GEN6_UCGCTL2);
 	MMIO_F(_MMIO(0x4f000), 0x90);
-	MMIO_D(GEN6_PCODE_DATA);
+	MMIO_D(GEN6_PCODE_DATA0);
 	MMIO_D(_MMIO(0x13812c));
 	MMIO_D(GEN7_ERR_INT);
 	MMIO_D(HSW_EDRAM_CAP);

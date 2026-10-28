@@ -518,8 +518,8 @@ static int iw_cm_map(struct iw_cm_id *cm_id, bool active)
 	cm_id->m_local_addr = cm_id->local_addr;
 	cm_id->m_remote_addr = cm_id->remote_addr;
 
-	strcpy(pm_reg_msg.dev_name, devname);
-	strcpy(pm_reg_msg.if_name, ifname);
+	strscpy(pm_reg_msg.dev_name, devname);
+	strscpy(pm_reg_msg.if_name, ifname);
 
 	if (iwpm_register_pid(&pm_reg_msg, RDMA_NL_IWCM) ||
 	    !iwpm_valid_pid())
@@ -936,7 +936,7 @@ static void cm_disconnect_handler(struct iwcm_id_private *cm_id_priv,
 /*
  * CM_ID <-- IDLE
  *
- * If in the ESTBLISHED or CLOSING states, the QP will have have been
+ * If in the ESTBLISHED or CLOSING states, the QP will have been
  * moved by the provider to the ERR state. Disassociate the CM_ID from
  * the QP,  move to IDLE, and remove the 'connected' reference.
  *

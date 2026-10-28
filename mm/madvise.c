@@ -25,13 +25,14 @@
 #include <linux/ksm.h>
 #include <linux/fs.h>
 #include <linux/file.h>
-#include <linux/blkdev.h>
+#include <linux/blk_plug.h>
 #include <linux/backing-dev.h>
 #include <linux/pagewalk.h>
 #include <linux/swap.h>
 #include <linux/leafops.h>
 #include <linux/shmem_fs.h>
 #include <linux/mmu_notifier.h>
+#include <linux/swap_ops.h>
 
 #include <asm/tlb.h>
 
@@ -177,6 +178,14 @@ static int madvise_update_vma(vm_flags_t new_flags,
 	/* vm_flags is protected by the mmap_lock held in write mode. */
 	vma_start_write(vma);
 	vma->flags = new_vma_flags;
+	/*
+	 * If the vma become good for khugepaged to scan,
+	 * register it here without waiting a page fault that
+	 * may not happen any time soon.
+	 */
+	if (vma_flags_test(&new_vma_flags, VMA_HUGEPAGE_BIT))
+		khugepaged_enter_vma(vma, vma_flags_to_legacy(new_vma_flags));
+
 	if (set_new_anon_name)
 		return replace_anon_vma_name(vma, anon_name);
 
@@ -188,7 +197,7 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 		unsigned long end, struct mm_walk *walk)
 {
 	struct vm_area_struct *vma = walk->private;
-	struct swap_iocb *splug = NULL;
+	struct swap_io_ctx ctx = {};
 	pte_t *ptep = NULL;
 	spinlock_t *ptl;
 	unsigned long addr;
@@ -212,15 +221,15 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 		pte_unmap_unlock(ptep, ptl);
 		ptep = NULL;
 
-		folio = read_swap_cache_async(entry, GFP_HIGHUSER_MOVABLE,
-					     vma, addr, &splug);
+		folio = read_swap_cache_async(&ctx, entry, GFP_HIGHUSER_MOVABLE,
+					vma, addr);
 		if (folio)
 			folio_put(folio);
 	}
 
 	if (ptep)
 		pte_unmap_unlock(ptep, ptl);
-	swap_read_unplug(splug);
+	swap_read_submit(&ctx);
 	cond_resched();
 
 	return 0;
@@ -238,7 +247,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 	XA_STATE(xas, &mapping->i_pages, linear_page_index(vma, start));
 	pgoff_t end_index = linear_page_index(vma, end) - 1;
 	struct folio *folio;
-	struct swap_iocb *splug = NULL;
+	struct swap_io_ctx ctx = {};
 
 	rcu_read_lock();
 	xas_for_each(&xas, folio, end_index) {
@@ -253,19 +262,19 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 			continue;
 
 		addr = vma->vm_start +
-			((xas.xa_index - vma->vm_pgoff) << PAGE_SHIFT);
+			((xas.xa_index - vma_start_pgoff(vma)) << PAGE_SHIFT);
 		xas_pause(&xas);
 		rcu_read_unlock();
 
-		folio = read_swap_cache_async(entry, mapping_gfp_mask(mapping),
-					     vma, addr, &splug);
+		folio = read_swap_cache_async(&ctx, entry,
+				mapping_gfp_mask(mapping), vma, addr);
 		if (folio)
 			folio_put(folio);
 
 		rcu_read_lock();
 	}
 	rcu_read_unlock();
-	swap_read_unplug(splug);
+	swap_read_submit(&ctx);
 }
 #endif		/* CONFIG_SWAP */
 
@@ -288,11 +297,12 @@ static long madvise_willneed(struct madvise_behavior *madv_behavior)
 	loff_t offset;
 
 #ifdef CONFIG_SWAP
-	if (!file) {
+	if (vma_is_cow_mapping(vma) && vma->anon_vma) {
 		walk_page_range_vma(vma, start, end, &swapin_walk_ops, vma);
 		lru_add_drain(); /* Push any new pages onto the LRU now */
-		return 0;
 	}
+	if (!file)
+		return 0;
 
 	if (shmem_mapping(file->f_mapping)) {
 		shmem_swapin_range(vma, start, end, file->f_mapping);
@@ -318,7 +328,7 @@ static long madvise_willneed(struct madvise_behavior *madv_behavior)
 	mark_mmap_lock_dropped(madv_behavior);
 	get_file(file);
 	offset = (loff_t)(start - vma->vm_start)
-			+ ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
+			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT);
 	mmap_read_unlock(mm);
 	vfs_fadvise(file, offset, end - start, POSIX_FADV_WILLNEED);
 	fput(file);
@@ -336,8 +346,7 @@ static inline bool can_do_file_pageout(struct vm_area_struct *vma)
 	 * otherwise we'd be including shared non-exclusive mappings, which
 	 * opens a side channel.
 	 */
-	return inode_owner_or_capable(&nop_mnt_idmap,
-				      file_inode(vma->vm_file)) ||
+	return file_owner_or_capable(vma->vm_file) ||
 	       file_permission(vma->vm_file, MAY_WRITE) == 0;
 }
 
@@ -385,16 +394,18 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 			return 0;
 
 		orig_pmd = *pmd;
-		if (is_huge_zero_pmd(orig_pmd))
-			goto huge_unlock;
-
 		if (unlikely(!pmd_present(orig_pmd))) {
-			VM_BUG_ON(thp_migration_supported() &&
-					!pmd_is_migration_entry(orig_pmd));
+			VM_WARN_ON_ONCE(!pmd_is_migration_entry(orig_pmd) &&
+					!pmd_is_device_private_entry(orig_pmd));
 			goto huge_unlock;
 		}
 
-		folio = pmd_folio(orig_pmd);
+		folio = vm_normal_folio_pmd(vma, addr, orig_pmd);
+		if (!folio)
+			goto huge_unlock;
+
+		if (folio_is_zone_device(folio))
+			goto huge_unlock;
 
 		/* Do not interfere with other mappings of this folio */
 		if (folio_maybe_mapped_shared(folio))
@@ -406,9 +417,10 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 		if (next - addr != HPAGE_PMD_SIZE) {
 			int err;
 
+			if (!folio_trylock(folio))
+				goto huge_unlock;
 			folio_get(folio);
 			spin_unlock(ptl);
-			folio_lock(folio);
 			err = split_folio(folio);
 			folio_unlock(folio);
 			folio_put(folio);
@@ -418,10 +430,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 		}
 
 		if (!pageout && pmd_young(orig_pmd)) {
-			pmdp_invalidate(vma, addr, pmd);
-			orig_pmd = pmd_mkold(orig_pmd);
-
-			set_pmd_at(mm, addr, pmd, orig_pmd);
+			pmdp_test_and_clear_young(vma, addr, pmd);
 			tlb_remove_pmd_tlb_entry(tlb, pmd, addr);
 		}
 
@@ -442,6 +451,7 @@ huge_unlock:
 		spin_unlock(ptl);
 		if (pageout)
 			reclaim_pages(&folio_list);
+		cond_resched();
 		return 0;
 	}
 
@@ -451,7 +461,7 @@ regular_folio:
 restart:
 	start_pte = pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
 	if (!start_pte)
-		return 0;
+		goto out;
 	flush_tlb_batched_pending(mm);
 	lazy_mmu_mode_enable();
 	for (; addr < end; pte += nr, addr += nr * PAGE_SIZE) {
@@ -555,6 +565,7 @@ restart:
 			folio_deactivate(folio);
 	}
 
+out:
 	if (start_pte) {
 		lazy_mmu_mode_disable();
 		pte_unmap_unlock(start_pte, ptl);
@@ -695,10 +706,10 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 				nr = swap_pte_batch(pte, max_nr, ptent);
 				nr_swap -= nr;
 				swap_put_entries_direct(entry, nr);
-				clear_not_present_full_ptes(mm, addr, pte, nr, tlb->fullmm);
+				clear_nonpresent_ptes(mm, addr, pte, nr);
 			} else if (softleaf_is_hwpoison(entry) ||
 				   softleaf_is_poison_marker(entry)) {
-				pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+				pte_clear(mm, addr, pte);
 			}
 			continue;
 		}
@@ -869,7 +880,7 @@ bool madvise_dontneed_free_valid_vma(struct madvise_behavior *madv_behavior)
 	int behavior = madv_behavior->behavior;
 	struct madvise_behavior_range *range = &madv_behavior->range;
 
-	if (!is_vm_hugetlb_page(vma)) {
+	if (!vma_is_hugetlb(vma)) {
 		unsigned int forbidden = VM_PFNMAP;
 
 		if (behavior != MADV_DONTNEED_LOCKED)
@@ -1023,7 +1034,7 @@ static long madvise_remove(struct madvise_behavior *madv_behavior)
 		return -EACCES;
 
 	offset = (loff_t)(start - vma->vm_start)
-			+ ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
+			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT);
 
 	/*
 	 * Filesystem's fallocate may need to take i_rwsem.  We need to
@@ -1044,19 +1055,25 @@ static long madvise_remove(struct madvise_behavior *madv_behavior)
 	return error;
 }
 
-static bool is_valid_guard_vma(struct vm_area_struct *vma, bool allow_locked)
+static bool is_valid_guard_vma(const struct vm_area_struct *vma,
+			       bool allow_locked)
 {
-	vm_flags_t disallowed = VM_SPECIAL | VM_HUGETLB;
-
 	/*
-	 * A user could lock after setting a guard range but that's fine, as
+	 * A user could lock after setting a guard range but that's fine as
 	 * they'd not be able to fault in. The issue arises when we try to zap
 	 * existing locked VMAs. We don't want to do that.
 	 */
-	if (!allow_locked)
-		disallowed |= VM_LOCKED;
+	if (!allow_locked && vma_test(vma, VMA_LOCKED_BIT))
+		return false;
+	/*
+	 * Guard regions require a VMA whose page tables are managed solely by
+	 * core mm, so the VMA must be mm-backed (excluding hugetlb, in which
+	 * guard markers cannot be installed).
+	 */
+	if (!vma_is_mm_backed(vma) || vma_is_hugetlb(vma))
+		return false;
 
-	return !(vma->vm_flags & disallowed);
+	return true;
 }
 
 static bool is_guard_pte_marker(pte_t ptent)
@@ -1139,13 +1156,13 @@ static long madvise_guard_install(struct madvise_behavior *madv_behavior)
 
 	/*
 	 * If anonymous and we are establishing page tables the VMA ought to
-	 * have an anon_vma associated with it.
+	 * have an anon rmap associated with it.
 	 *
 	 * We will hold an mmap read lock if this is necessary, this is checked
 	 * as part of the VMA lock logic.
 	 */
 	if (vma_is_anonymous(vma)) {
-		VM_WARN_ON_ONCE(!vma->anon_vma &&
+		VM_WARN_ON_ONCE(!vma_has_anon_rmap(vma) &&
 				madv_behavior->lock_mode != MADVISE_MMAP_READ_LOCK);
 
 		err = anon_vma_prepare(vma);
@@ -1234,7 +1251,7 @@ static int guard_remove_pte_entry(pte_t *pte, unsigned long addr,
 
 	if (is_guard_pte_marker(ptent)) {
 		/* Simply clear the PTE marker. */
-		pte_clear_not_present_full(walk->mm, addr, pte, false);
+		pte_clear(walk->mm, addr, pte);
 		update_mmu_cache(walk->vma, addr, pte);
 	}
 
@@ -1285,7 +1302,7 @@ static bool is_discard(int behavior)
  * We are restricted from madvise()'ing mseal()'d VMAs only in very particular
  * circumstances - discarding of data from read-only anonymous SEALED mappings.
  *
- * This is because users cannot trivally discard data from these VMAs, and may
+ * This is because users cannot trivially discard data from these VMAs, and may
  * only do so via an appropriate madvise() call.
  */
 static bool can_madvise_modify(struct madvise_behavior *madv_behavior)
@@ -1383,7 +1400,7 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 		new_flags |= VM_DONTCOPY;
 		break;
 	case MADV_DOFORK:
-		if (new_flags & VM_SPECIAL)
+		if (!vma_is_mm_backed(vma) || vma_is_hugetlb(vma))
 			return -EINVAL;
 		new_flags &= ~VM_DONTCOPY;
 		break;
@@ -1402,8 +1419,11 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 		new_flags |= VM_DONTDUMP;
 		break;
 	case MADV_DODUMP:
-		if ((!is_vm_hugetlb_page(vma) && (new_flags & VM_SPECIAL)) ||
-		    (new_flags & VM_DROPPABLE))
+		/* Only mm-backed memory can be meaningfully dumped. */
+		if (!vma_is_mm_backed(vma))
+			return -EINVAL;
+		/* Core mm may discard droppable memory at any time. */
+		if (new_flags & VM_DROPPABLE)
 			return -EINVAL;
 		new_flags &= ~VM_DONTDUMP;
 		break;
@@ -1604,11 +1624,11 @@ static bool is_vma_lock_sufficient(struct vm_area_struct *vma,
 	 * anon_vma_prepare() explicitly requires an mmap lock for
 	 * serialisation, so we cannot use a VMA lock in this case.
 	 *
-	 * Note we might race with anon_vma being set, however this makes this
-	 * check overly paranoid which is safe.
+	 * Note we might race with the anon rmap being assigned, however this
+	 * makes this check overly paranoid which is safe.
 	 */
 	if (vma_is_anonymous(vma) &&
-	    prepares_anon_vma(madv_behavior->behavior) && !vma->anon_vma)
+	    prepares_anon_vma(madv_behavior->behavior) && !vma_has_anon_rmap(vma))
 		return false;
 
 	return true;
@@ -1834,50 +1854,29 @@ static void madvise_finish_tlb(struct madvise_behavior *madv_behavior)
 		tlb_finish_mmu(madv_behavior->tlb);
 }
 
-static bool is_valid_madvise(unsigned long start, size_t len_in, int behavior)
+/**
+ * check_input_range() - Check if the requested range is valid.
+ * @start:	Start address of madvise-requested address range.
+ * @len_in:	Length of madvise-requested address range.
+ *
+ * Returns: 0 if the input range is valid, otherwise an error code.
+ */
+static int check_input_range(unsigned long start, size_t len_in)
 {
 	size_t len;
 
-	if (!madvise_behavior_valid(behavior))
-		return false;
-
 	if (!PAGE_ALIGNED(start))
-		return false;
+		return -EINVAL;
 	len = PAGE_ALIGN(len_in);
 
 	/* Check to see whether len was rounded up from small -ve to zero */
 	if (len_in && !len)
-		return false;
+		return -EINVAL;
 
 	if (start + len < start)
-		return false;
+		return -EINVAL;
 
-	return true;
-}
-
-/*
- * madvise_should_skip() - Return if the request is invalid or nothing.
- * @start:	Start address of madvise-requested address range.
- * @len_in:	Length of madvise-requested address range.
- * @behavior:	Requested madvise behavior.
- * @err:	Pointer to store an error code from the check.
- *
- * If the specified behaviour is invalid or nothing would occur, we skip the
- * operation.  This function returns true in the cases, otherwise false.  In
- * the former case we store an error on @err.
- */
-static bool madvise_should_skip(unsigned long start, size_t len_in,
-		int behavior, int *err)
-{
-	if (!is_valid_madvise(start, len_in, behavior)) {
-		*err = -EINVAL;
-		return true;
-	}
-	if (start + PAGE_ALIGN(len_in) == start) {
-		*err = 0;
-		return true;
-	}
-	return false;
+	return 0;
 }
 
 static bool is_madvise_populate(struct madvise_behavior *madv_behavior)
@@ -2013,8 +2012,13 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 		.tlb = &tlb,
 	};
 
-	if (madvise_should_skip(start, len_in, behavior, &error))
+	if (!madvise_behavior_valid(behavior))
+		return -EINVAL;
+
+	error = check_input_range(start, len_in);
+	if (error || !len_in)
 		return error;
+
 	error = madvise_lock(&madv_behavior);
 	if (error)
 		return error;
@@ -2056,7 +2060,8 @@ static ssize_t vector_madvise(struct mm_struct *mm, struct iov_iter *iter,
 		size_t len_in = iter_iov_len(iter);
 		int error;
 
-		if (madvise_should_skip(start, len_in, behavior, &error))
+		error = check_input_range(start, len_in);
+		if (error || !len_in)
 			ret = error;
 		else
 			ret = madvise_do_behavior(start, len_in, &madv_behavior);
@@ -2129,6 +2134,11 @@ SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,
 	if (IS_ERR(mm)) {
 		ret = PTR_ERR(mm);
 		goto release_task;
+	}
+
+	if (!madvise_behavior_valid(behavior)) {
+		ret = -EINVAL;
+		goto release_mm;
 	}
 
 	/*

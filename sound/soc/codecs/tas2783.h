@@ -35,9 +35,11 @@
 #define TAS2783_AMP_LEVEL_MASK	GENMASK(5, 1)
 
 #define PRAM_ADDR_START		TASDEV_REG_SDW(0x8c, 0x01, 0x8)
-#define PRAM_ADDR_END		TASDEV_REG_SDW(0x8c, 0xff, 0x7f)
+#define PRAM_ADDR_END		TASDEV_REG_SDW(0x8c, 0xff, 0x80)
 #define YRAM_ADDR_START		TASDEV_REG_SDW(0x00, 0x02, 0x8)
 #define YRAM_ADDR_END		TASDEV_REG_SDW(0x00, 0x37, 0x7f)
+
+#define TAS2783_FW_VERSION	TASDEV_REG_SDW(0x00, 0x20, 0x3c)
 
 /* Calibration data */
 #define TAS2783_CAL_R0		TASDEV_REG_SDW(0, 0x16, 0x4C)
@@ -99,13 +101,5 @@
 #define TAS2783_CALIB_CRC_SZ	4
 #define TAS2783_CALIB_DATA_SZ	((TAS2783_CALIB_HDR_SZ) + TAS2783_CALIB_CRC_SZ + \
 				((TAS2783_CALIB_PARAMS) * 4 * (TAS2783_CALIB_MAX_SPK_COUNT)))
-
-#if IS_ENABLED(CONFIG_SND_SOC_TAS2783_UTIL)
-int32_t tas25xx_register_misc(struct sdw_slave *peripheral);
-int32_t tas25xx_deregister_misc(void);
-#else
-static void tas25xx_register_misc(struct sdw_slave *peripheral) {}
-static void tas25xx_deregister_misc(void) {}
-#endif
 
 #endif /*__TAS2783_H__ */

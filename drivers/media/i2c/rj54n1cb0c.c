@@ -541,6 +541,7 @@ static int rj54n1_sensor_scale(struct v4l2_subdev *sd, s32 *in_w, s32 *in_h,
 			       s32 *out_w, s32 *out_h);
 
 static int rj54n1_set_selection(struct v4l2_subdev *sd,
+				const struct v4l2_subdev_client_info *ci,
 				struct v4l2_subdev_state *sd_state,
 				struct v4l2_subdev_selection *sel)
 {
@@ -578,6 +579,7 @@ static int rj54n1_set_selection(struct v4l2_subdev *sd,
 }
 
 static int rj54n1_get_selection(struct v4l2_subdev *sd,
+				const struct v4l2_subdev_client_info *ci,
 				struct v4l2_subdev_state *sd_state,
 				struct v4l2_subdev_selection *sel)
 {
@@ -973,6 +975,7 @@ static int rj54n1_reg_init(struct i2c_client *client)
 }
 
 static int rj54n1_set_fmt(struct v4l2_subdev *sd,
+		const struct v4l2_subdev_client_info *ci,
 		struct v4l2_subdev_state *sd_state,
 		struct v4l2_subdev_format *format)
 {
@@ -1413,7 +1416,7 @@ static void rj54n1_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id rj54n1_id[] = {
-	{ "rj54n1cb0c" },
+	{ .name = "rj54n1cb0c" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, rj54n1_id);

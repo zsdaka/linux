@@ -163,7 +163,8 @@ static int bnge_adjust_rings(struct bnge_dev *bd, u16 *rx,
 	u16 tx_chunks = bnge_num_tx_to_cp(bd, *tx);
 
 	if (tx_chunks != *tx) {
-		u16 tx_saved = tx_chunks, rc;
+		u16 tx_saved = tx_chunks;
+		int rc;
 
 		rc = bnge_fix_rings_count(rx, &tx_chunks, max_nq, sh);
 		if (rc)
@@ -381,7 +382,7 @@ int bnge_alloc_irqs(struct bnge_dev *bd)
 	irqs_demand = pci_alloc_irq_vectors(bd->pdev, min, irqs_demand,
 					    PCI_IRQ_MSIX);
 	aux_msix = bnge_aux_get_msix(bd);
-	if (irqs_demand < 0 || irqs_demand < aux_msix) {
+	if (irqs_demand < 0 || irqs_demand < aux_msix + min) {
 		rc = -ENODEV;
 		goto err_free_irqs;
 	}

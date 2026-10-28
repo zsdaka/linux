@@ -186,23 +186,6 @@
 		regulator-always-on;
 	};
 
-	rsnd_ak4613: sound {
-		compatible = "simple-audio-card";
-
-		simple-audio-card,name = "rsnd-ak4613";
-		simple-audio-card,format = "left_j";
-		simple-audio-card,bitclock-master = <&sndcpu>;
-		simple-audio-card,frame-master = <&sndcpu>;
-
-		sndcodec: simple-audio-card,codec {
-			sound-dai = <&ak4613>;
-		};
-
-		sndcpu: simple-audio-card,cpu {
-			sound-dai = <&rcar_sound>;
-		};
-	};
-
 	vbus0_usb2: regulator-vbus0-usb2 {
 		compatible = "regulator-fixed";
 
@@ -258,6 +241,23 @@
 		gpios = <&gpio3 15 GPIO_ACTIVE_HIGH>;
 		gpios-states = <1>;
 		states = <3300000 1>, <1800000 0>;
+	};
+
+	rsnd_ak4613: sound {
+		compatible = "simple-audio-card";
+
+		simple-audio-card,name = "rsnd-ak4613";
+		simple-audio-card,format = "left_j";
+		simple-audio-card,bitclock-master = <&sndcpu>;
+		simple-audio-card,frame-master = <&sndcpu>;
+
+		sndcodec: simple-audio-card,codec {
+			sound-dai = <&ak4613>;
+		};
+
+		sndcpu: simple-audio-card,cpu {
+			sound-dai = <&rcar_sound>;
+		};
 	};
 
 	vga {
@@ -322,6 +322,8 @@
 		reg = <0>;
 		interrupts-extended = <&gpio2 21 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&gpio1 20 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <10000>;
+		reset-deassert-us = <300>;
 		/*
 		 * TX clock internal delay mode is required for reliable
 		 * 1Gbps communication using the KSZ9031RNX phy present on
@@ -512,7 +514,7 @@
 		asahi-kasei,out6-single-end;
 	};
 
-	cs2000: clk-multiplier@4f {
+	cs2000: clock-controller@4f {
 		#clock-cells = <0>;
 		compatible = "cirrus,cs2000-cp";
 		reg = <0x4f>;
@@ -672,7 +674,7 @@
 		power-source = <3300>;
 	};
 
-	sdhi0_pins_uhs: sd0_uhs {
+	sdhi0_pins_uhs: sd0-uhs {
 		groups = "sdhi0_data4", "sdhi0_ctrl";
 		function = "sdhi0";
 		power-source = <1800>;
@@ -684,7 +686,7 @@
 		power-source = <3300>;
 	};
 
-	sdhi1_pins_uhs: sd1_uhs {
+	sdhi1_pins_uhs: sd1-uhs {
 		groups = "sdhi1_data4", "sdhi1_ctrl";
 		function = "sdhi1";
 		power-source = <1800>;
@@ -696,7 +698,7 @@
 		power-source = <1800>;
 	};
 
-	sound_clk_pins: sound_clk {
+	sound_clk_pins: sound-clk {
 		groups = "audio_clk_a", "audio_clk_b_a", "audio_clk_c_a",
 			 "audio_clkout_a", "audio_clkout1_a";
 		function = "audio_clk";

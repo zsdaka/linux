@@ -42,6 +42,8 @@
 #include <linux/mutex.h>
 #include <linux/completion.h>
 #include <linux/cdev.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-resv.h>
 
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_umem.h>
@@ -135,6 +137,13 @@ struct ib_uverbs_completion_event_file {
 
 struct ib_uverbs_dmabuf_file {
 	struct ib_uobject uobj;
+	/*
+	 * Serializes users of dmabuf with the dma_buf's release, which sets it
+	 * to NULL. The uobject can outlive the dma_buf while it waits to be
+	 * destroyed. The map and unmap callbacks use attachment->dmabuf
+	 * instead of taking this lock.
+	 */
+	struct mutex dmabuf_release_lock;
 	struct dma_buf *dmabuf;
 	struct list_head dmabufs_elm;
 	struct rdma_user_mmap_entry *mmap_entry;
@@ -203,7 +212,6 @@ void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue);
 void ib_uverbs_init_async_event_file(struct ib_uverbs_async_event_file *ev_file);
 void ib_uverbs_free_event_queue(struct ib_uverbs_event_queue *event_queue);
 void ib_uverbs_flow_resources_free(struct ib_uflow_resources *uflow_res);
-int uverbs_async_event_release(struct inode *inode, struct file *filp);
 
 int ib_alloc_ucontext(struct uverbs_attr_bundle *attrs);
 int ib_init_ucontext(struct uverbs_attr_bundle *attrs);
@@ -262,6 +270,21 @@ struct bundle_priv {
 	struct uverbs_attr_bundle_hdr bundle;
 	u64 internal_buffer[32];
 };
+
+static inline int uverbs_set_output(const struct uverbs_attr_bundle *bundle,
+				    const struct uverbs_attr *attr)
+{
+	struct bundle_priv *pbundle =
+		container_of(&bundle->hdr, struct bundle_priv, bundle);
+	u16 flags;
+
+	flags = pbundle->uattrs[attr->ptr_attr.uattr_idx].flags |
+		UVERBS_ATTR_F_VALID_OUTPUT;
+	if (put_user(flags,
+		     &pbundle->user_attrs[attr->ptr_attr.uattr_idx].flags))
+		return -EFAULT;
+	return 0;
+}
 
 long ib_uverbs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 
@@ -344,5 +367,42 @@ static inline void ib_uverbs_dmabuf_done(struct kref *kref)
 
 	complete(&priv->comp);
 }
+
+/*
+ * Revoke the dmabuf and wait for all of its DMA mappings to be gone. Must be
+ * called with the mmap entry's dmabufs_lock held, after the dmabuf has been
+ * removed from the entry's dmabufs list, so it runs once per dmabuf. Lock
+ * order is dmabufs_lock, dmabuf_release_lock, then the dma_resv lock.
+ */
+static inline void ib_uverbs_dmabuf_revoke(struct ib_uverbs_dmabuf_file *priv)
+{
+	mutex_lock(&priv->dmabuf_release_lock);
+	if (priv->dmabuf) {
+		dma_resv_lock(priv->dmabuf->resv, NULL);
+		priv->revoked = true;
+		dma_buf_invalidate_mappings(priv->dmabuf);
+		dma_resv_wait_timeout(priv->dmabuf->resv,
+				      DMA_RESV_USAGE_BOOKKEEP, false,
+				      MAX_SCHEDULE_TIMEOUT);
+		dma_resv_unlock(priv->dmabuf->resv);
+	} else {
+		/* A released dma_buf has no attachments left to invalidate */
+		priv->revoked = true;
+	}
+	mutex_unlock(&priv->dmabuf_release_lock);
+
+	kref_put(&priv->kref, ib_uverbs_dmabuf_done);
+	/* Wait till all DMA unmaps are completed */
+	wait_for_completion(&priv->comp);
+}
+
+int __uverbs_cleanup_ufile(struct ib_uverbs_file *ufile,
+			   enum rdma_remove_reason reason);
+
+static inline void ib_uverbs_comp_dev(struct ib_uverbs_device *dev)
+{
+	complete(&dev->comp);
+}
+
 
 #endif /* UVERBS_H */

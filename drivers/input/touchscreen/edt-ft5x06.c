@@ -331,6 +331,8 @@ static irqreturn_t edt_ft5x06_ts_isr(int irq, void *dev_id)
 			swap(x, y);
 
 		id = (buf[2] >> 4) & 0x0f;
+		if (id >= tsdata->max_support_points)
+			continue;
 
 		input_mt_slot(tsdata->input, id);
 		if (input_mt_report_slot_state(tsdata->input, MT_TOOL_FINGER,
@@ -1290,7 +1292,6 @@ static int edt_ft5x06_ts_probe(struct i2c_client *client)
 
 	input->name = tsdata->name;
 	input->id.bustype = BUS_I2C;
-	input->dev.parent = &client->dev;
 
 	input_set_abs_params(input, ABS_MT_POSITION_X,
 			     0, tsdata->num_x * 64 - 1, 0, 0);

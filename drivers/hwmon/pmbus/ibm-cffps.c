@@ -166,7 +166,7 @@ static ssize_t ibm_cffps_debugfs_read(struct file *file, char __user *buf,
 				if (rc < 0)
 					goto unlock;
 
-				snprintf(&data[i * 2], 3, "%02X", rc);
+				snprintf(&data[i * 2], 3, "%02X", (u8)rc);
 			}
 
 			rc = i * 2;
@@ -177,7 +177,7 @@ static ssize_t ibm_cffps_debugfs_read(struct file *file, char __user *buf,
 				if (rc < 0)
 					goto unlock;
 
-				snprintf(&data[i * 4], 5, "%04X", rc);
+				snprintf(&data[i * 4], 5, "%04X", (u16)rc);
 			}
 
 			rc = i * 4;
@@ -472,10 +472,10 @@ static struct pmbus_platform_data ibm_cffps_pdata = {
 };
 
 static const struct i2c_device_id ibm_cffps_id[] = {
-	{ "ibm_cffps1", cffps1 },
-	{ "ibm_cffps2", cffps2 },
-	{ "ibm_cffps", cffps_unknown },
-	{}
+	{ .name = "ibm_cffps1", .driver_data = cffps1 },
+	{ .name = "ibm_cffps2", .driver_data = cffps2 },
+	{ .name = "ibm_cffps", .driver_data = cffps_unknown },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, ibm_cffps_id);
 

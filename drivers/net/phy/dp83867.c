@@ -8,6 +8,7 @@
 #include <linux/kernel.h>
 #include <linux/mii.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/phy.h>
 #include <linux/delay.h>
@@ -103,6 +104,10 @@
 #define DP83867_PHYCR_RX_FIFO_DEPTH_MASK	GENMASK(13, 12)
 #define DP83867_PHYCR_SGMII_EN			BIT(11)
 #define DP83867_PHYCR_FORCE_LINK_GOOD		BIT(10)
+#define DP83867_PHYCR_MDIX_MASK			GENMASK(6, 5)
+#define DP83867_PHYCR_MDIX_MDI			(0x0 << 5)
+#define DP83867_PHYCR_MDIX_MDIX			(0x1 << 5)
+#define DP83867_PHYCR_MDIX_AUTO			(0x3 << 5)
 
 /* RGMIIDCTL bits */
 #define DP83867_RGMII_TX_CLK_DELAY_MAX		0xf
@@ -123,6 +128,10 @@
 #define DP83867_PHYSTS_100			BIT(14)
 #define DP83867_PHYSTS_DUPLEX			BIT(13)
 #define DP83867_PHYSTS_LINK			BIT(10)
+#define DP83867_PHYSTS_MDIX_CD			BIT(9)
+#define DP83867_PHYSTS_MDIX_AB			BIT(8)
+#define DP83867_PHYSTS_MDIX_MASK		(DP83867_PHYSTS_MDIX_AB | \
+						DP83867_PHYSTS_MDIX_CD)
 
 /* CFG2 bits */
 #define DP83867_DOWNSHIFT_EN		(BIT(8) | BIT(9))
@@ -188,6 +197,16 @@ struct dp83867_private {
 	bool set_clk_output;
 	u32 clk_output_sel;
 	bool sgmii_ref_clk_en;
+
+	/* Shadow of the LED registers, replayed after a soft reset. led_lock
+	 * serializes the shadow and its replay against the LED callbacks,
+	 * because dp83867_config_init() does the replay off phydev->lock.
+	 */
+	struct mutex led_lock;
+	u16 ledcr1;
+	u16 ledcr1_mask;
+	u16 ledcr2;
+	u16 ledcr2_mask;
 };
 
 static int dp83867_ack_interrupt(struct phy_device *phydev)
@@ -390,6 +409,22 @@ static int dp83867_read_status(struct phy_device *phydev)
 		phydev->speed = SPEED_100;
 	else
 		phydev->speed = SPEED_10;
+
+	if (!(status & DP83867_PHYSTS_LINK)) {
+		phydev->mdix = ETH_TP_MDI_INVALID;
+	} else {
+		switch (status & DP83867_PHYSTS_MDIX_MASK) {
+		case 0:
+			phydev->mdix = ETH_TP_MDI;
+			break;
+		case DP83867_PHYSTS_MDIX_MASK:
+			phydev->mdix = ETH_TP_MDI_X;
+			break;
+		default:
+			phydev->mdix = ETH_TP_MDI_INVALID;
+			break;
+		}
+	}
 
 	return 0;
 }
@@ -698,6 +733,7 @@ static int dp83867_resume(struct phy_device *phydev)
 static int dp83867_probe(struct phy_device *phydev)
 {
 	struct dp83867_private *dp83867;
+	int ret;
 
 	dp83867 = devm_kzalloc(&phydev->mdio.dev, sizeof(*dp83867),
 			       GFP_KERNEL);
@@ -706,13 +742,66 @@ static int dp83867_probe(struct phy_device *phydev)
 
 	phydev->priv = dp83867;
 
+	ret = devm_mutex_init(&phydev->mdio.dev, &dp83867->led_lock);
+	if (ret)
+		return ret;
+
 	return dp83867_of_init(phydev);
+}
+
+/* Update an LED register and mirror the change into the shadow, so that
+ * dp83867_config_init() can replay it after a soft reset. Caller must hold
+ * dp83867->led_lock.
+ */
+static int __dp83867_led_modify(struct phy_device *phydev, u32 reg,
+				u16 mask, u16 val)
+{
+	struct dp83867_private *dp83867 = phydev->priv;
+	int ret;
+
+	ret = phy_modify(phydev, reg, mask, val);
+	if (ret)
+		return ret;
+
+	if (reg == DP83867_LEDCR1) {
+		dp83867->ledcr1 = (dp83867->ledcr1 & ~mask) | (val & mask);
+		dp83867->ledcr1_mask |= mask;
+	} else if (reg == DP83867_LEDCR2) {
+		dp83867->ledcr2 = (dp83867->ledcr2 & ~mask) | (val & mask);
+		dp83867->ledcr2_mask |= mask;
+	} else {
+		WARN_ON_ONCE(1);
+	}
+
+	return 0;
+}
+
+/* Restore the LED registers the driver has programmed, cleared by the soft
+ * reset in dp83867_phy_reset().
+ */
+static int dp83867_led_restore(struct phy_device *phydev)
+{
+	struct dp83867_private *dp83867 = phydev->priv;
+	int ret = 0;
+
+	mutex_lock(&dp83867->led_lock);
+	if (dp83867->ledcr1_mask)
+		ret = phy_modify(phydev, DP83867_LEDCR1,
+				 dp83867->ledcr1_mask, dp83867->ledcr1);
+	if (!ret && dp83867->ledcr2_mask)
+		ret = phy_modify(phydev, DP83867_LEDCR2,
+				 dp83867->ledcr2_mask, dp83867->ledcr2);
+	mutex_unlock(&dp83867->led_lock);
+
+	return ret;
 }
 
 static int dp83867_config_init(struct phy_device *phydev)
 {
 	struct dp83867_private *dp83867 = phydev->priv;
 	int ret, val, bs;
+
+	phydev->mdix_ctrl = ETH_TP_MDI_AUTO;
 
 	/* Force speed optimization for the PHY even if it strapped */
 	ret = phy_modify(phydev, DP83867_CFG2, DP83867_DOWNSHIFT_EN,
@@ -870,7 +959,44 @@ static int dp83867_config_init(struct phy_device *phydev)
 			       mask, val);
 	}
 
+	ret = dp83867_led_restore(phydev);
+	if (ret)
+		phydev_warn(phydev, "failed to restore LED config: %d\n", ret);
+
 	return 0;
+}
+
+static int dp83867_config_mdix(struct phy_device *phydev, u8 ctrl)
+{
+	int val;
+
+	switch (ctrl) {
+	case ETH_TP_MDI:
+		val = DP83867_PHYCR_MDIX_MDI;
+		break;
+	case ETH_TP_MDI_X:
+		val = DP83867_PHYCR_MDIX_MDIX;
+		break;
+	case ETH_TP_MDI_AUTO:
+		val = DP83867_PHYCR_MDIX_AUTO;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return phy_modify(phydev, MII_DP83867_PHYCTRL,
+			  DP83867_PHYCR_MDIX_MASK, val);
+}
+
+static int dp83867_config_aneg(struct phy_device *phydev)
+{
+	int ret;
+
+	ret = dp83867_config_mdix(phydev, phydev->mdix_ctrl);
+	if (ret)
+		return ret;
+
+	return genphy_config_aneg(phydev);
 }
 
 static int dp83867_phy_reset(struct phy_device *phydev)
@@ -945,7 +1071,9 @@ static int
 dp83867_led_brightness_set(struct phy_device *phydev,
 			   u8 index, enum led_brightness brightness)
 {
-	u32 val;
+	struct dp83867_private *dp83867 = phydev->priv;
+	u16 val;
+	int ret;
 
 	if (index >= DP83867_LED_COUNT)
 		return -EINVAL;
@@ -956,10 +1084,13 @@ dp83867_led_brightness_set(struct phy_device *phydev,
 	if (brightness)
 		val |= DP83867_LED_DRV_VAL(index);
 
-	return phy_modify(phydev, DP83867_LEDCR2,
-			  DP83867_LED_DRV_VAL(index) |
-			  DP83867_LED_DRV_EN(index),
-			  val);
+	mutex_lock(&dp83867->led_lock);
+	ret = __dp83867_led_modify(phydev, DP83867_LEDCR2,
+				   DP83867_LED_DRV_VAL(index) |
+				   DP83867_LED_DRV_EN(index), val);
+	mutex_unlock(&dp83867->led_lock);
+
+	return ret;
 }
 
 static int dp83867_led_mode(u8 index, unsigned long rules)
@@ -1010,18 +1141,24 @@ static int dp83867_led_hw_is_supported(struct phy_device *phydev, u8 index,
 static int dp83867_led_hw_control_set(struct phy_device *phydev, u8 index,
 				      unsigned long rules)
 {
+	struct dp83867_private *dp83867 = phydev->priv;
 	int mode, ret;
 
 	mode = dp83867_led_mode(index, rules);
 	if (mode < 0)
 		return mode;
 
-	ret = phy_modify(phydev, DP83867_LEDCR1, DP83867_LED_FN_MASK(index),
-			 DP83867_LED_FN(index, mode));
-	if (ret)
-		return ret;
+	mutex_lock(&dp83867->led_lock);
+	ret = __dp83867_led_modify(phydev, DP83867_LEDCR1,
+				   DP83867_LED_FN_MASK(index),
+				   DP83867_LED_FN(index, mode));
+	if (!ret)
+		ret = __dp83867_led_modify(phydev, DP83867_LEDCR2,
+					   DP83867_LED_DRV_EN(index) |
+					   DP83867_LED_DRV_VAL(index), 0);
+	mutex_unlock(&dp83867->led_lock);
 
-	return phy_modify(phydev, DP83867_LEDCR2, DP83867_LED_DRV_EN(index), 0);
+	return ret;
 }
 
 static int dp83867_led_hw_control_get(struct phy_device *phydev, u8 index,
@@ -1082,21 +1219,31 @@ static int dp83867_led_hw_control_get(struct phy_device *phydev, u8 index,
 static int dp83867_led_polarity_set(struct phy_device *phydev, int index,
 				    unsigned long modes)
 {
+	struct dp83867_private *dp83867 = phydev->priv;
 	/* Default active high */
 	u16 polarity = DP83867_LED_POLARITY(index);
 	u32 mode;
+	int ret;
 
 	for_each_set_bit(mode, &modes, __PHY_LED_MODES_NUM) {
 		switch (mode) {
 		case PHY_LED_ACTIVE_LOW:
 			polarity = 0;
 			break;
+		case PHY_LED_ACTIVE_HIGH:
+			polarity = DP83867_LED_POLARITY(index);
+			break;
 		default:
 			return -EINVAL;
 		}
 	}
-	return phy_modify(phydev, DP83867_LEDCR2,
-			  DP83867_LED_POLARITY(index), polarity);
+
+	mutex_lock(&dp83867->led_lock);
+	ret = __dp83867_led_modify(phydev, DP83867_LEDCR2,
+				   DP83867_LED_POLARITY(index), polarity);
+	mutex_unlock(&dp83867->led_lock);
+
+	return ret;
 }
 
 static unsigned int dp83867_inband_caps(struct phy_device *phydev,
@@ -1127,6 +1274,7 @@ static struct phy_driver dp83867_driver[] = {
 
 		.probe          = dp83867_probe,
 		.config_init	= dp83867_config_init,
+		.config_aneg	= dp83867_config_aneg,
 		.soft_reset	= dp83867_phy_reset,
 
 		.read_status	= dp83867_read_status,

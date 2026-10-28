@@ -16,6 +16,9 @@
 
 #include "hisi_acc_vfio_pci.h"
 
+VFIO_PCI_CORE_DEFINE_CALLBACKS(hisi_acc_vf, struct hisi_acc_vf_core_device,
+			       core_device)
+
 /* Return 0 on VM acc device ready, -ETIMEDOUT hardware timeout */
 static int qm_wait_dev_not_ready(struct hisi_qm *qm)
 {
@@ -81,48 +84,15 @@ static int qm_get_vft(struct hisi_qm *qm, u32 *base)
 	u32 qp_num;
 	int ret;
 
-	ret = hisi_qm_mb(qm, QM_MB_CMD_SQC_VFT_V2, 0, 0, 1);
+	ret = hisi_qm_mb_read(qm, &sqc_vft, QM_MB_CMD_SQC_VFT_V2, 0);
 	if (ret)
 		return ret;
 
-	sqc_vft = readl(qm->io_base + QM_MB_CMD_DATA_ADDR_L) |
-		  ((u64)readl(qm->io_base + QM_MB_CMD_DATA_ADDR_H) <<
-		  QM_XQC_ADDR_OFFSET);
 	*base = QM_SQC_VFT_BASE_MASK_V2 & (sqc_vft >> QM_SQC_VFT_BASE_SHIFT_V2);
 	qp_num = (QM_SQC_VFT_NUM_MASK_V2 &
 		  (sqc_vft >> QM_SQC_VFT_NUM_SHIFT_V2)) + 1;
 
 	return qp_num;
-}
-
-static int qm_get_sqc(struct hisi_qm *qm, u64 *addr)
-{
-	int ret;
-
-	ret = hisi_qm_mb(qm, QM_MB_CMD_SQC_BT, 0, 0, 1);
-	if (ret)
-		return ret;
-
-	*addr = readl(qm->io_base + QM_MB_CMD_DATA_ADDR_L) |
-		  ((u64)readl(qm->io_base + QM_MB_CMD_DATA_ADDR_H) <<
-		  QM_XQC_ADDR_OFFSET);
-
-	return 0;
-}
-
-static int qm_get_cqc(struct hisi_qm *qm, u64 *addr)
-{
-	int ret;
-
-	ret = hisi_qm_mb(qm, QM_MB_CMD_CQC_BT, 0, 0, 1);
-	if (ret)
-		return ret;
-
-	*addr = readl(qm->io_base + QM_MB_CMD_DATA_ADDR_L) |
-		  ((u64)readl(qm->io_base + QM_MB_CMD_DATA_ADDR_H) <<
-		  QM_XQC_ADDR_OFFSET);
-
-	return 0;
 }
 
 static void qm_xqc_reg_offsets(struct hisi_qm *qm,
@@ -575,13 +545,13 @@ static int vf_qm_read_data(struct hisi_qm *vf_qm, struct acc_vf_data *vf_data)
 	vf_data->aeqe_dma |= vf_data->qm_aeqc_dw[QM_XQC_ADDR_LOW];
 
 	/* Through SQC_BT/CQC_BT to get sqc and cqc address */
-	ret = qm_get_sqc(vf_qm, &vf_data->sqc_dma);
+	ret = hisi_qm_mb_read(vf_qm, &vf_data->sqc_dma, QM_MB_CMD_SQC_BT, 0);
 	if (ret) {
 		dev_err(dev, "failed to read SQC addr!\n");
 		return ret;
 	}
 
-	ret = qm_get_cqc(vf_qm, &vf_data->cqc_dma);
+	ret = hisi_qm_mb_read(vf_qm, &vf_data->cqc_dma, QM_MB_CMD_CQC_BT, 0);
 	if (ret) {
 		dev_err(dev, "failed to read CQC addr!\n");
 		return ret;
@@ -621,10 +591,7 @@ static int vf_qm_state_save(struct hisi_acc_vf_core_device *hisi_acc_vdev,
 
 static struct hisi_acc_vf_core_device *hisi_acc_drvdata(struct pci_dev *pdev)
 {
-	struct vfio_pci_core_device *core_device = dev_get_drvdata(&pdev->dev);
-
-	return container_of(core_device, struct hisi_acc_vf_core_device,
-			    core_device);
+	return pci_get_drvdata(pdev);
 }
 
 /* Check the PF's RAS state and Function INT state */
@@ -1187,14 +1154,16 @@ static void hisi_acc_vf_pci_reset_prepare(struct pci_dev *pdev)
 {
 	struct hisi_acc_vf_core_device *hisi_acc_vdev = hisi_acc_drvdata(pdev);
 	struct hisi_qm *qm = hisi_acc_vdev->pf_qm;
-	struct device *dev = &qm->pdev->dev;
 	u32 delay = 0;
+
+	if (!hisi_acc_vdev->core_device.vdev.mig_ops)
+		return;
 
 	/* All reset requests need to be queued for processing */
 	while (test_and_set_bit(QM_RESETTING, &qm->misc_ctl)) {
 		msleep(1);
 		if (++delay > QM_RESET_WAIT_TIMEOUT) {
-			dev_err(dev, "reset prepare failed\n");
+			dev_err(&qm->pdev->dev, "reset prepare failed\n");
 			return;
 		}
 	}
@@ -1207,11 +1176,13 @@ static void hisi_acc_vf_pci_aer_reset_done(struct pci_dev *pdev)
 	struct hisi_acc_vf_core_device *hisi_acc_vdev = hisi_acc_drvdata(pdev);
 	struct hisi_qm *qm = hisi_acc_vdev->pf_qm;
 
-	if (hisi_acc_vdev->set_reset_flag)
-		clear_bit(QM_RESETTING, &qm->misc_ctl);
-
 	if (!hisi_acc_vdev->core_device.vdev.mig_ops)
 		return;
+
+	if (hisi_acc_vdev->set_reset_flag) {
+		clear_bit(QM_RESETTING, &qm->misc_ctl);
+		hisi_acc_vdev->set_reset_flag = false;
+	}
 
 	mutex_lock(&hisi_acc_vdev->state_mutex);
 	hisi_acc_vf_reset(hisi_acc_vdev);
@@ -1224,13 +1195,6 @@ static int hisi_acc_vf_qm_init(struct hisi_acc_vf_core_device *hisi_acc_vdev)
 	struct hisi_qm *vf_qm = &hisi_acc_vdev->vf_qm;
 	struct hisi_qm *pf_qm = hisi_acc_vdev->pf_qm;
 	struct pci_dev *vf_dev = vdev->pdev;
-	u32 val;
-
-	val = readl(pf_qm->io_base + QM_MIG_REGION_SEL);
-	if (pf_qm->ver > QM_HW_V3 && (val & QM_MIG_REGION_EN))
-		hisi_acc_vdev->drv_mode = HW_ACC_MIG_PF_CTRL;
-	else
-		hisi_acc_vdev->drv_mode = HW_ACC_MIG_VF_CTRL;
 
 	if (hisi_acc_vdev->drv_mode == HW_ACC_MIG_PF_CTRL) {
 		/*
@@ -1449,9 +1413,8 @@ static int hisi_acc_vf_debug_check(struct seq_file *seq, struct vfio_device *vde
 static int hisi_acc_vf_debug_cmd(struct seq_file *seq, void *data)
 {
 	struct device *vf_dev = seq->private;
-	struct vfio_pci_core_device *core_device = dev_get_drvdata(vf_dev);
-	struct vfio_device *vdev = &core_device->vdev;
-	struct hisi_acc_vf_core_device *hisi_acc_vdev = hisi_acc_get_vf_dev(vdev);
+	struct hisi_acc_vf_core_device *hisi_acc_vdev = dev_get_drvdata(vf_dev);
+	struct vfio_device *vdev = &hisi_acc_vdev->core_device.vdev;
 	struct hisi_qm *vf_qm = &hisi_acc_vdev->vf_qm;
 	u64 value;
 	int ret;
@@ -1478,9 +1441,8 @@ static int hisi_acc_vf_debug_cmd(struct seq_file *seq, void *data)
 static int hisi_acc_vf_dev_read(struct seq_file *seq, void *data)
 {
 	struct device *vf_dev = seq->private;
-	struct vfio_pci_core_device *core_device = dev_get_drvdata(vf_dev);
-	struct vfio_device *vdev = &core_device->vdev;
-	struct hisi_acc_vf_core_device *hisi_acc_vdev = hisi_acc_get_vf_dev(vdev);
+	struct hisi_acc_vf_core_device *hisi_acc_vdev = dev_get_drvdata(vf_dev);
+	struct vfio_device *vdev = &hisi_acc_vdev->core_device.vdev;
 	size_t vf_data_sz = offsetofend(struct acc_vf_data, padding);
 	struct acc_vf_data *vf_data;
 	int ret;
@@ -1525,9 +1487,7 @@ mutex_release:
 static int hisi_acc_vf_migf_read(struct seq_file *seq, void *data)
 {
 	struct device *vf_dev = seq->private;
-	struct vfio_pci_core_device *core_device = dev_get_drvdata(vf_dev);
-	struct vfio_device *vdev = &core_device->vdev;
-	struct hisi_acc_vf_core_device *hisi_acc_vdev = hisi_acc_get_vf_dev(vdev);
+	struct hisi_acc_vf_core_device *hisi_acc_vdev = dev_get_drvdata(vf_dev);
 	size_t vf_data_sz = offsetofend(struct acc_vf_data, padding);
 	struct hisi_acc_vf_migration_file *debug_migf = hisi_acc_vdev->debug_migf;
 
@@ -1698,21 +1658,34 @@ static void hisi_acc_vf_debugfs_exit(struct hisi_acc_vf_core_device *hisi_acc_vd
 	hisi_acc_vdev->debug_migf = NULL;
 }
 
+static enum hw_drv_mode hisi_acc_vf_get_drv_mode(struct hisi_qm *pf_qm)
+{
+	u32 val;
+
+	val = readl(pf_qm->io_base + QM_MIG_REGION_SEL);
+	if (pf_qm->ver > QM_HW_V3 && (val & QM_MIG_REGION_EN))
+		return HW_ACC_MIG_PF_CTRL;
+
+	return HW_ACC_MIG_VF_CTRL;
+}
+
 static int hisi_acc_vfio_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct hisi_acc_vf_core_device *hisi_acc_vdev;
 	const struct vfio_device_ops *ops = &hisi_acc_vfio_pci_ops;
+	enum hw_drv_mode drv_mode = HW_ACC_MIG_VF_CTRL;
+	resource_size_t func_len;
 	struct hisi_qm *pf_qm;
-	int vf_id;
 	int ret;
 
 	pf_qm = hisi_acc_get_pf_qm(pdev);
 	if (pf_qm && pf_qm->ver >= QM_HW_V3) {
-		vf_id = pci_iov_vf_id(pdev);
-		if (vf_id >= 0)
-			ops = &hisi_acc_vfio_pci_migrn_ops;
+		func_len = pci_resource_len(pdev, VFIO_PCI_BAR2_REGION_INDEX) >> 1;
+		drv_mode = hisi_acc_vf_get_drv_mode(pf_qm);
+		if (drv_mode == HW_ACC_MIG_VF_CTRL && func_len < PAGE_SIZE)
+			pci_warn(pdev, "migration not supported on 64KB pages with QM_HW_V3\n");
 		else
-			pci_warn(pdev, "migration support failed, continue with generic interface\n");
+			ops = &hisi_acc_vfio_pci_migrn_ops;
 	}
 
 	hisi_acc_vdev = vfio_alloc_device(hisi_acc_vf_core_device,
@@ -1720,7 +1693,9 @@ static int hisi_acc_vfio_pci_probe(struct pci_dev *pdev, const struct pci_device
 	if (IS_ERR(hisi_acc_vdev))
 		return PTR_ERR(hisi_acc_vdev);
 
-	dev_set_drvdata(&pdev->dev, &hisi_acc_vdev->core_device);
+	hisi_acc_vdev->drv_mode = drv_mode;
+
+	dev_set_drvdata(&pdev->dev, hisi_acc_vdev);
 	ret = vfio_pci_core_register_device(&hisi_acc_vdev->core_device);
 	if (ret)
 		goto out_put_vdev;
@@ -1754,7 +1729,7 @@ MODULE_DEVICE_TABLE(pci, hisi_acc_vfio_pci_table);
 static const struct pci_error_handlers hisi_acc_vf_err_handlers = {
 	.reset_prepare = hisi_acc_vf_pci_reset_prepare,
 	.reset_done = hisi_acc_vf_pci_aer_reset_done,
-	.error_detected = vfio_pci_core_aer_err_detected,
+	.error_detected = hisi_acc_vf_aer_err_detected,
 };
 
 static struct pci_driver hisi_acc_vfio_pci_driver = {
@@ -1762,6 +1737,7 @@ static struct pci_driver hisi_acc_vfio_pci_driver = {
 	.id_table = hisi_acc_vfio_pci_table,
 	.probe = hisi_acc_vfio_pci_probe,
 	.remove = hisi_acc_vfio_pci_remove,
+	.driver = { .pm = pm_ptr(&hisi_acc_vf_pm_ops) },
 	.err_handler = &hisi_acc_vf_err_handlers,
 	.driver_managed_dma = true,
 };

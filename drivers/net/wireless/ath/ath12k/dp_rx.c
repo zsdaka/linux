@@ -17,6 +17,11 @@
 #include "dp_mon.h"
 #include "debugfs_htt_stats.h"
 
+#define ATH12K_2GHZ_MIN_CHAN_NUM 1
+#define ATH12K_2GHZ_MAX_CHAN_NUM 14
+#define ATH12K_5GHZ_MIN_CHAN_NUM 36
+#define ATH12K_5GHZ_MAX_CHAN_NUM 177
+
 static int ath12k_dp_rx_tid_delete_handler(struct ath12k_base *ab,
 					   struct ath12k_dp_rx_tid_rxq *rx_tid);
 
@@ -325,16 +330,20 @@ static int ath12k_dp_rx_pdev_srng_alloc(struct ath12k *ar)
 {
 	struct ath12k_pdev_dp *dp = &ar->dp;
 	struct ath12k_base *ab = ar->ab;
+	u32 monitor_dst_ring_size;
+	u32 mac_id = dp->mac_id;
 	int i;
 	int ret;
-	u32 mac_id = dp->mac_id;
+
+	monitor_dst_ring_size =
+		ath12k_dp_rxdma_monitor_dst_ring_size(&ab->profile_param->dp_params);
 
 	for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
 		ret = ath12k_dp_srng_setup(ar->ab,
 					   &dp->rxdma_mon_dst_ring[i],
 					   HAL_RXDMA_MONITOR_DST,
 					   0, mac_id + i,
-					   DP_RXDMA_MONITOR_DST_RING_SIZE(ab));
+					   monitor_dst_ring_size);
 		if (ret) {
 			ath12k_warn(ar->ab,
 				    "failed to setup HAL_RXDMA_MONITOR_DST\n");
@@ -1095,7 +1104,8 @@ static void ath12k_get_dot11_hdr_from_rx_desc(struct ath12k_pdev_dp *dp_pdev,
 static void ath12k_dp_rx_h_undecap_eth(struct ath12k_pdev_dp *dp_pdev,
 				       struct sk_buff *msdu,
 				       enum hal_encrypt_type enctype,
-				       struct hal_rx_desc_data *rx_info)
+				       struct hal_rx_desc_data *rx_info,
+				       enum ath12k_dp_rx_decap_type decap_type)
 {
 	struct ieee80211_hdr *hdr;
 	struct ethhdr *eth;
@@ -1103,12 +1113,24 @@ static void ath12k_dp_rx_h_undecap_eth(struct ath12k_pdev_dp *dp_pdev,
 	u8 sa[ETH_ALEN];
 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
 	struct ath12k_dp_rx_rfc1042_hdr rfc = {0xaa, 0xaa, 0x03, {0x00, 0x00, 0x00}};
+	struct ath12k_dp_rx_rfc1042_hdr *llc;
 
 	eth = (struct ethhdr *)msdu->data;
 	ether_addr_copy(da, eth->h_dest);
 	ether_addr_copy(sa, eth->h_source);
-	rfc.snap_type = eth->h_proto;
-	skb_pull(msdu, sizeof(*eth));
+	if (decap_type == DP_RX_DECAP_TYPE_8023) {
+		/*
+		 * For 802.3 frames, eth->h_proto carries a length field, not
+		 * an EtherType. The actual EtherType is in the LLC/SNAP header
+		 * that follows the Ethernet header.
+		 */
+		llc = (struct ath12k_dp_rx_rfc1042_hdr *)(msdu->data + sizeof(*eth));
+		rfc.snap_type = llc->snap_type;
+		skb_pull(msdu, sizeof(*eth) + sizeof(*llc));
+	} else {
+		rfc.snap_type = eth->h_proto;
+		skb_pull(msdu, sizeof(*eth));
+	}
 	memcpy(skb_push(msdu, sizeof(rfc)), &rfc,
 	       sizeof(rfc));
 	ath12k_get_dot11_hdr_from_rx_desc(dp_pdev, msdu, rxcb, enctype, rx_info);
@@ -1124,11 +1146,13 @@ static void ath12k_dp_rx_h_undecap_eth(struct ath12k_pdev_dp *dp_pdev,
 void ath12k_dp_rx_h_undecap(struct ath12k_pdev_dp *dp_pdev, struct sk_buff *msdu,
 			    enum hal_encrypt_type enctype,
 			    bool decrypted,
-			    struct hal_rx_desc_data *rx_info)
+			    struct hal_rx_desc_data *rx_info,
+			    struct ath12k_dp_peer *peer)
 {
+	enum ath12k_dp_rx_decap_type decap_type = rx_info->decap_type;
 	struct ethhdr *ehdr;
 
-	switch (rx_info->decap_type) {
+	switch (decap_type) {
 	case DP_RX_DECAP_TYPE_NATIVE_WIFI:
 		ath12k_dp_rx_h_undecap_nwifi(dp_pdev, msdu, enctype, rx_info);
 		break;
@@ -1142,44 +1166,43 @@ void ath12k_dp_rx_h_undecap(struct ath12k_pdev_dp *dp_pdev, struct sk_buff *msdu
 		/* mac80211 allows fast path only for authorized STA */
 		if (ehdr->h_proto == cpu_to_be16(ETH_P_PAE)) {
 			ATH12K_SKB_RXCB(msdu)->is_eapol = true;
-			ath12k_dp_rx_h_undecap_eth(dp_pdev, msdu, enctype, rx_info);
+			ath12k_dp_rx_h_undecap_eth(dp_pdev, msdu, enctype, rx_info,
+						   decap_type);
+			break;
+		}
+
+		if (peer && !peer->use_4addr &&
+		    rx_info->is_from_ds && rx_info->is_to_ds) {
+			ath12k_dp_rx_h_undecap_eth(dp_pdev, msdu, enctype, rx_info,
+						   decap_type);
 			break;
 		}
 
 		/* PN for mcast packets will be validated in mac80211;
 		 * remove eth header and add 802.11 header.
 		 */
-		if (ATH12K_SKB_RXCB(msdu)->is_mcbc && decrypted)
-			ath12k_dp_rx_h_undecap_eth(dp_pdev, msdu, enctype, rx_info);
+		if (ATH12K_SKB_RXCB(msdu)->is_mcbc && decrypted) {
+			ath12k_dp_rx_h_undecap_eth(dp_pdev, msdu, enctype, rx_info,
+						   decap_type);
+			break;
+		}
+
+		rx_info->rx_status->flag |= RX_FLAG_8023;
 		break;
 	case DP_RX_DECAP_TYPE_8023:
-		/* TODO: Handle undecap for these formats */
-		break;
+		/*
+		 * Note that ethernet decap format indicates that the decapped
+		 * packet is either Ethernet 2 (DIX)  or 802.3 (uses SNAP/LLC).
+		 */
+		if (ATH12K_SKB_RXCB(msdu)->is_mcbc && decrypted) {
+			ath12k_dp_rx_h_undecap_eth(dp_pdev, msdu, enctype, rx_info,
+						   decap_type);
+			break;
+		}
+		rx_info->rx_status->flag |= RX_FLAG_8023;
 	}
 }
 EXPORT_SYMBOL(ath12k_dp_rx_h_undecap);
-
-struct ath12k_dp_link_peer *
-ath12k_dp_rx_h_find_link_peer(struct ath12k_pdev_dp *dp_pdev, struct sk_buff *msdu,
-			      struct hal_rx_desc_data *rx_info)
-{
-	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
-	struct ath12k_dp_link_peer *peer = NULL;
-	struct ath12k_dp *dp = dp_pdev->dp;
-
-	lockdep_assert_held(&dp->dp_lock);
-
-	if (rxcb->peer_id)
-		peer = ath12k_dp_link_peer_find_by_peerid(dp_pdev, rxcb->peer_id);
-
-	if (peer)
-		return peer;
-
-	if (rx_info->addr2_present)
-		peer = ath12k_dp_link_peer_find_by_addr(dp, rx_info->addr2);
-
-	return peer;
-}
 
 static void ath12k_dp_rx_h_rate(struct ath12k_pdev_dp *dp_pdev,
 				struct hal_rx_desc_data *rx_info)
@@ -1289,9 +1312,11 @@ void ath12k_dp_rx_h_ppdu(struct ath12k_pdev_dp *dp_pdev,
 	    center_freq <= ATH12K_MAX_6GHZ_FREQ) {
 		rx_status->band = NL80211_BAND_6GHZ;
 		rx_status->freq = center_freq;
-	} else if (channel_num >= 1 && channel_num <= 14) {
+	} else if (channel_num >= ATH12K_2GHZ_MIN_CHAN_NUM &&
+		   channel_num <= ATH12K_2GHZ_MAX_CHAN_NUM) {
 		rx_status->band = NL80211_BAND_2GHZ;
-	} else if (channel_num >= 36 && channel_num <= 173) {
+	} else if (channel_num >= ATH12K_5GHZ_MIN_CHAN_NUM &&
+		   channel_num <= ATH12K_5GHZ_MAX_CHAN_NUM) {
 		rx_status->band = NL80211_BAND_5GHZ;
 	}
 
@@ -1333,20 +1358,28 @@ void ath12k_dp_rx_deliver_msdu(struct ath12k_pdev_dp *dp_pdev, struct napi_struc
 	struct ath12k_dp *dp = dp_pdev->dp;
 	struct ieee80211_rx_status *rx_status;
 	struct ieee80211_sta *pubsta;
+	struct ieee80211_link_sta *link_pubsta = NULL;
 	struct ath12k_dp_peer *peer;
 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
 	struct ieee80211_rx_status *status = rx_info->rx_status;
-	u8 decap = rx_info->decap_type;
 	bool is_mcbc = rxcb->is_mcbc;
-	bool is_eapol = rxcb->is_eapol;
 
 	peer = ath12k_dp_peer_find_by_peerid(dp_pdev, rxcb->peer_id);
 
 	pubsta = peer ? peer->sta : NULL;
 
-	if (pubsta && pubsta->valid_links) {
-		status->link_valid = 1;
-		status->link_id = peer->hw_links[rxcb->hw_link_id];
+	if (pubsta) {
+		if (pubsta->valid_links) {
+			int link_id =
+				ath12k_hw_get_rx_link_id(dp->hw_params, peer,
+							 rxcb, status);
+
+			if (link_id >= 0)
+				link_pubsta =
+					rcu_dereference(pubsta->link[link_id]);
+		} else {
+			link_pubsta = &pubsta->deflink;
+		}
 	}
 
 	ath12k_dbg(dp->ab, ATH12K_DBG_DATA,
@@ -1383,16 +1416,8 @@ void ath12k_dp_rx_deliver_msdu(struct ath12k_pdev_dp *dp_pdev, struct napi_struc
 
 	/* TODO: trace rx packet */
 
-	/* PN for multicast packets are not validate in HW,
-	 * so skip 802.3 rx path
-	 * Also, fast_rx expects the STA to be authorized, hence
-	 * eapol packets are sent in slow path.
-	 */
-	if (decap == DP_RX_DECAP_TYPE_ETHERNET2_DIX && !is_eapol &&
-	    !(is_mcbc && rx_status->flag & RX_FLAG_DECRYPTED))
-		rx_status->flag |= RX_FLAG_8023;
-
-	ieee80211_rx_napi(ath12k_pdev_dp_to_hw(dp_pdev), pubsta, msdu, napi);
+	ieee80211_rx_napi(ath12k_pdev_dp_to_hw(dp_pdev), link_pubsta, msdu,
+			  napi);
 }
 EXPORT_SYMBOL(ath12k_dp_rx_deliver_msdu);
 
@@ -1662,6 +1687,8 @@ int ath12k_dp_rx_htt_setup(struct ath12k_base *ab)
 
 int ath12k_dp_rx_alloc(struct ath12k_base *ab)
 {
+	const struct ath12k_dp_profile_params *dp_params = &ab->profile_param->dp_params;
+	u32 monitor_buf_ring_size = ath12k_dp_rxdma_monitor_buf_ring_size(dp_params);
 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
 	struct dp_srng *srng;
 	int i, ret;
@@ -1672,7 +1699,7 @@ int ath12k_dp_rx_alloc(struct ath12k_base *ab)
 	ret = ath12k_dp_srng_setup(ab,
 				   &dp->rx_refill_buf_ring.refill_buf_ring,
 				   HAL_RXDMA_BUF, 0, 0,
-				   DP_RXDMA_BUF_RING_SIZE);
+				   ath12k_dp_rxdma_buf_ring_size(dp_params));
 	if (ret) {
 		ath12k_warn(ab, "failed to setup rx_refill_buf_ring\n");
 		return ret;
@@ -1706,7 +1733,7 @@ int ath12k_dp_rx_alloc(struct ath12k_base *ab)
 		ret = ath12k_dp_srng_setup(ab,
 					   &dp->rxdma_mon_buf_ring.refill_buf_ring,
 					   HAL_RXDMA_MONITOR_BUF, 0, 0,
-					   DP_RXDMA_MONITOR_BUF_RING_SIZE(ab));
+					   monitor_buf_ring_size);
 		if (ret) {
 			ath12k_warn(ab, "failed to setup HAL_RXDMA_MONITOR_BUF\n");
 			return ret;

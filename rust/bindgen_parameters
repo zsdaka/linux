@@ -14,12 +14,21 @@
 --opaque-type alt_instr
 --opaque-type x86_msi_data
 --opaque-type x86_msi_addr_lo
+# s390-only: same packed/align issue as above (E0588).
+--opaque-type lowcore
+--opaque-type tod_clock
+--opaque-type tpi_info
+--opaque-type uv_cb.*
+--opaque-type uv_secret.*
+--opaque-type zpci_fib
 
 # If SMP is disabled, `arch_spinlock_t` is defined as a ZST which triggers a Rust
 # warning. We don't need to peek into it anyway.
 --opaque-type spinlock
 
 # enums that appear in indirect function calls should specify a cfi type
+--newtype-enum fwctl_rpc_scope
+--with-attribute-custom-enum=fwctl_rpc_scope='#[cfi_encoding="15fwctl_rpc_scope"]'
 --newtype-enum lru_status
 --with-attribute-custom-enum=lru_status='#[cfi_encoding="10lru_status"]'
 
@@ -43,7 +52,7 @@
 --blocklist-item VM_MAYREAD
 --blocklist-item VM_MAYWRITE
 --blocklist-item VM_MAYEXEC
---blocklist-item VM_MAYEXEC
+--blocklist-item VM_MAYSHARE
 --blocklist-item VM_PFNMAP
 --blocklist-item VM_IO
 --blocklist-item VM_DONTCOPY

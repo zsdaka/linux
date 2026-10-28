@@ -347,7 +347,9 @@ static void ufs_qcom_disable_lane_clks(struct ufs_qcom_host *host)
 	if (!host->is_lane_clks_enabled)
 		return;
 
-	clk_bulk_disable_unprepare(host->num_clks, host->clks);
+	clk_disable_unprepare(host->rx_lane1_sync_clk);
+	clk_disable_unprepare(host->rx_lane0_sync_clk);
+	clk_disable_unprepare(host->tx_lane0_sync_clk);
 
 	host->is_lane_clks_enabled = false;
 }
@@ -356,28 +358,57 @@ static int ufs_qcom_enable_lane_clks(struct ufs_qcom_host *host)
 {
 	int err;
 
-	err = clk_bulk_prepare_enable(host->num_clks, host->clks);
+	if (host->is_lane_clks_enabled)
+		return 0;
+
+	err = clk_prepare_enable(host->tx_lane0_sync_clk);
 	if (err)
-		return err;
+		goto out;
+
+	err = clk_prepare_enable(host->rx_lane0_sync_clk);
+	if (err)
+		goto out_disable_tx_lane0;
+
+	err = clk_prepare_enable(host->rx_lane1_sync_clk);
+	if (err)
+		goto out_disable_rx_lane0;
 
 	host->is_lane_clks_enabled = true;
 
 	return 0;
+
+out_disable_rx_lane0:
+	clk_disable_unprepare(host->rx_lane0_sync_clk);
+out_disable_tx_lane0:
+	clk_disable_unprepare(host->tx_lane0_sync_clk);
+out:
+	return err;
 }
 
 static int ufs_qcom_init_lane_clks(struct ufs_qcom_host *host)
 {
-	int err;
 	struct device *dev = host->hba->dev;
 
 	if (has_acpi_companion(dev))
 		return 0;
 
-	err = devm_clk_bulk_get_all(dev, &host->clks);
-	if (err <= 0)
-		return err;
+	host->tx_lane0_sync_clk = devm_clk_get(dev, "tx_lane0_sync_clk");
+	if (IS_ERR(host->tx_lane0_sync_clk))
+		return dev_err_probe(dev, PTR_ERR(host->tx_lane0_sync_clk),
+				     "failed to get tx_lane0_sync_clk\n");
 
-	host->num_clks = err;
+	host->rx_lane0_sync_clk = devm_clk_get(dev, "rx_lane0_sync_clk");
+	if (IS_ERR(host->rx_lane0_sync_clk))
+		return dev_err_probe(dev, PTR_ERR(host->rx_lane0_sync_clk),
+				     "failed to get rx_lane0_sync_clk\n");
+
+	/* In case of single lane per direction, don't read lane1 clocks */
+	if (host->hba->lanes_per_direction > 1) {
+		host->rx_lane1_sync_clk = devm_clk_get(dev, "rx_lane1_sync_clk");
+		if (IS_ERR(host->rx_lane1_sync_clk))
+			return dev_err_probe(dev, PTR_ERR(host->rx_lane1_sync_clk),
+					     "failed to get rx_lane1_sync_clk\n");
+	}
 
 	return 0;
 }
@@ -705,9 +736,17 @@ cfg_timers:
 	return 0;
 }
 
+static void ufs_qcom_link_startup_post_change(struct ufs_hba *hba)
+{
+	if (ufshcd_is_auto_hibern8_supported(hba))
+		ufshcd_rmwl(hba, UFS_HW_CLK_CTRL_EN, UFS_HW_CLK_CTRL_EN,
+			    UFS_AH8_CFG);
+}
+
 static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
 					enum ufs_notify_change_status status)
 {
+	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
 	int err = 0;
 
 	switch (status) {
@@ -730,6 +769,17 @@ static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
 		 */
 		err = ufshcd_disable_host_tx_lcc(hba);
 
+		/*
+		 * Restore HS/LS link startup mode set by bootloader
+		 * after UFS reset clears REG_UFS_DEBUG_SPARE_CFG.
+		 */
+		if (host->hw_ver.major > 0x6 ||
+		    (host->hw_ver.major == 0x6 && host->hw_ver.minor >= 0x2))
+			ufshcd_writel(hba, host->boot_spare_cfg,
+				      REG_UFS_DEBUG_SPARE_CFG);
+		break;
+	case POST_CHANGE:
+		ufs_qcom_link_startup_post_change(hba);
 		break;
 	default:
 		break;
@@ -1305,6 +1355,9 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 	if (host->hw_ver.major > 0x3)
 		hba->quirks |= UFSHCD_QUIRK_REINIT_AFTER_MAX_GEAR_SWITCH;
 
+	if (host->hw_ver.major == 0x7 && host->hw_ver.minor == 0x1)
+		hba->quirks |= UFSHCD_QUIRK_EXTENDED_TX_EQTR_ADAPT_LENGTH_L0L1L2L3;
+
 	if (drvdata && drvdata->quirks)
 		hba->quirks |= drvdata->quirks;
 }
@@ -1312,7 +1365,7 @@ static void ufs_qcom_advertise_quirks(struct ufs_hba *hba)
 static void ufs_qcom_set_phy_gear(struct ufs_qcom_host *host)
 {
 	struct ufs_host_params *host_params = &host->host_params;
-	u32 val, dev_major;
+	u32 dev_major;
 
 	/*
 	 * Default to powering up the PHY to the max gear possible, which is
@@ -1331,8 +1384,8 @@ static void ufs_qcom_set_phy_gear(struct ufs_qcom_host *host)
 		 */
 		host->phy_gear = UFS_HS_G2;
 	} else if (host->hw_ver.major >= 0x5) {
-		val = ufshcd_readl(host->hba, REG_UFS_DEBUG_SPARE_CFG);
-		dev_major = FIELD_GET(UFS_DEV_VER_MAJOR_MASK, val);
+		host->boot_spare_cfg = ufshcd_readl(host->hba, REG_UFS_DEBUG_SPARE_CFG);
+		dev_major = FIELD_GET(UFS_DEV_VER_MAJOR_MASK, host->boot_spare_cfg);
 
 		/*
 		 * Since the UFS device version is populated, let's remove the
@@ -2269,7 +2322,7 @@ static void ufs_qcom_config_scaling_param(struct ufs_hba *hba,
 	p->polling_ms = 60;
 	p->timer = DEVFREQ_TIMER_DELAYED;
 	d->upthreshold = 70;
-	d->downdifferential = 5;
+	d->downdifferential = 65;
 
 	hba->clk_scaling.suspend_on_no_request = true;
 }
@@ -2418,8 +2471,6 @@ static int ufs_qcom_config_esi(struct ufs_hba *hba)
 		ret = devm_request_irq(hba->dev, qi[idx].irq, ufs_qcom_mcq_esi_handler,
 				       IRQF_SHARED, "qcom-mcq-esi", qi + idx);
 		if (ret) {
-			dev_err(hba->dev, "%s: Failed to request IRQ for %d, err = %d\n",
-				__func__, qi[idx].irq, ret);
 			/* Free previously allocated IRQs */
 			for (int j = 0; j < idx; j++)
 				devm_free_irq(hba->dev, qi[j].irq, qi + j);
@@ -2750,7 +2801,7 @@ static int ufs_qcom_get_rx_fom(struct ufs_hba *hba,
 			       struct tx_eqtr_iter *d_iter)
 {
 	struct ufshcd_tx_eq_params *params __free(kfree) =
-		kzalloc(sizeof(*params), GFP_KERNEL);
+		kzalloc_obj(*params);
 	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
 	struct ufs_pa_layer_attr old_pwr_info;
 	u32 fom[PA_MAXDATALANES] = { 0 };
@@ -2781,7 +2832,7 @@ static int ufs_qcom_get_rx_fom(struct ufs_hba *hba,
 	if (ret) {
 		dev_err(hba->dev, "%s: Failed to apply TX EQ settings for HS-G%u: %d\n",
 			__func__, gear, ret);
-		return ret;
+		goto link_recover_and_restore;
 	}
 
 	/* Force PMC to target HS Gear to use new TX Equalization settings. */
@@ -2789,16 +2840,15 @@ static int ufs_qcom_get_rx_fom(struct ufs_hba *hba,
 	if (ret) {
 		dev_err(hba->dev, "%s: Failed to change power mode to HS-G%u, Rate-%s: %d\n",
 			__func__, gear, ufs_hs_rate_to_str(rate), ret);
-		return ret;
+		goto link_recover_and_restore;
 	}
 
 	ret = ufs_qcom_host_sw_rx_fom(hba, pwr_mode->lane_rx, fom);
-	if (ret) {
+	if (ret)
 		dev_err(hba->dev, "Failed to get SW FOM of TX (PreShoot: %u, DeEmphasis: %u): %d\n",
 			d_iter->preshoot, d_iter->deemphasis, ret);
-		return ret;
-	}
 
+link_recover_and_restore:
 	/* Restore Device's TX Equalization settings. */
 	ret = ufshcd_apply_tx_eq_settings(hba, &hba->tx_eq_params[gear - 1], gear);
 	if (ret) {
@@ -2938,6 +2988,11 @@ static const struct ufs_hba_variant_ops ufs_hba_qcom_sa8255p_vops = {
 	.resume                 = ufs_qcom_fw_managed_resume,
 	.dbg_register_dump      = ufs_qcom_dump_dbg_regs,
 	.device_reset           = ufs_qcom_fw_managed_device_reset,
+	.mcq_config_resource	= ufs_qcom_mcq_config_resource,
+	.get_hba_mac		= ufs_qcom_get_hba_mac,
+	.op_runtime_config	= ufs_qcom_op_runtime_config,
+	.get_outstanding_cqs	= ufs_qcom_get_outstanding_cqs,
+	.config_esi		= ufs_qcom_config_esi,
 };
 
 /**

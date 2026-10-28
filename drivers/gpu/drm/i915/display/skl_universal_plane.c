@@ -7,7 +7,9 @@
 #include <drm/drm_blend.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_fourcc.h>
+#include <drm/drm_panic_helper.h>
 #include <drm/drm_print.h>
+#include <drm/intel/step.h>
 
 #include "intel_bo.h"
 #include "intel_color.h"
@@ -25,7 +27,6 @@
 #include "intel_plane.h"
 #include "intel_psr.h"
 #include "intel_psr_regs.h"
-#include "intel_step.h"
 #include "skl_scaler.h"
 #include "skl_universal_plane.h"
 #include "skl_universal_plane_regs.h"
@@ -266,7 +267,7 @@ bool icl_is_hdr_plane(struct intel_display *display, enum plane_id plane_id)
 static int icl_plane_min_cdclk(const struct intel_crtc_state *crtc_state,
 			       const struct intel_plane_state *plane_state)
 {
-	unsigned int pixel_rate = intel_plane_pixel_rate(crtc_state, plane_state);
+	unsigned int pixel_rate = intel_plane_pixel_rate_cdclk(crtc_state, plane_state);
 
 	/* two pixels per clock */
 	return DIV_ROUND_UP(pixel_rate, 2);
@@ -290,7 +291,7 @@ glk_plane_ratio(const struct intel_plane_state *plane_state,
 static int glk_plane_min_cdclk(const struct intel_crtc_state *crtc_state,
 			       const struct intel_plane_state *plane_state)
 {
-	unsigned int pixel_rate = intel_plane_pixel_rate(crtc_state, plane_state);
+	unsigned int pixel_rate = intel_plane_pixel_rate_cdclk(crtc_state, plane_state);
 	unsigned int num, den;
 
 	glk_plane_ratio(plane_state, &num, &den);
@@ -317,7 +318,7 @@ skl_plane_ratio(const struct intel_plane_state *plane_state,
 static int skl_plane_min_cdclk(const struct intel_crtc_state *crtc_state,
 			       const struct intel_plane_state *plane_state)
 {
-	unsigned int pixel_rate = intel_plane_pixel_rate(crtc_state, plane_state);
+	unsigned int pixel_rate = intel_plane_pixel_rate_cdclk(crtc_state, plane_state);
 	unsigned int num, den;
 
 	skl_plane_ratio(plane_state, &num, &den);
@@ -885,7 +886,8 @@ static void icl_plane_disable_sel_fetch_arm(struct intel_dsb *dsb,
 	struct intel_display *display = to_intel_display(plane);
 	enum pipe pipe = plane->pipe;
 
-	if (!crtc_state->enable_psr2_sel_fetch)
+	if (!crtc_state->enable_psr2_sel_fetch &&
+	    !crtc_state->clear_psr2_sel_fetch)
 		return;
 
 	intel_de_write_dsb(display, dsb, SEL_FETCH_PLANE_CTL(pipe, plane->id), 0);
@@ -1240,36 +1242,46 @@ static u32 glk_plane_color_ctl_crtc(const struct intel_crtc_state *crtc_state)
 	return plane_color_ctl;
 }
 
-static u32 glk_plane_color_ctl(const struct intel_plane_state *plane_state)
+static u32 glk_plane_color_ctl_input_csc(const struct intel_plane_state *plane_state)
 {
 	struct intel_display *display = to_intel_display(plane_state);
 	const struct drm_framebuffer *fb = plane_state->hw.fb;
 	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
+	bool color_pipeline = !!plane_state->uapi.color_pipeline;
+	bool needs_csc = color_pipeline ? plane_state->hw.csc_ff_enable : fb->format->is_yuv;
+	u32 ctl = 0;
+
+	if (!needs_csc)
+		return 0;
+
+	if (!icl_is_hdr_plane(display, plane->id)) {
+		switch (plane_state->hw.color_encoding) {
+		case DRM_COLOR_YCBCR_BT709:
+			ctl |= PLANE_COLOR_CSC_MODE_YUV709_TO_RGB709;
+			break;
+		case DRM_COLOR_YCBCR_BT2020:
+			ctl |= PLANE_COLOR_CSC_MODE_YUV2020_TO_RGB2020;
+			break;
+		default:
+			ctl |= PLANE_COLOR_CSC_MODE_YUV601_TO_RGB601;
+		}
+	} else {
+		ctl |= PLANE_COLOR_INPUT_CSC_ENABLE;
+	}
+
+	if (plane_state->hw.color_range == DRM_COLOR_YCBCR_FULL_RANGE)
+		ctl |= PLANE_COLOR_YUV_RANGE_CORRECTION_DISABLE;
+
+	return ctl;
+}
+
+static u32 glk_plane_color_ctl(const struct intel_plane_state *plane_state)
+{
 	u32 plane_color_ctl = 0;
 
 	plane_color_ctl |= PLANE_COLOR_PLANE_GAMMA_DISABLE;
 	plane_color_ctl |= glk_plane_color_ctl_alpha(plane_state);
-
-	if (fb->format->is_yuv && !icl_is_hdr_plane(display, plane->id)) {
-		switch (plane_state->hw.color_encoding) {
-		case DRM_COLOR_YCBCR_BT709:
-			plane_color_ctl |= PLANE_COLOR_CSC_MODE_YUV709_TO_RGB709;
-			break;
-		case DRM_COLOR_YCBCR_BT2020:
-			plane_color_ctl |=
-				PLANE_COLOR_CSC_MODE_YUV2020_TO_RGB2020;
-			break;
-		default:
-			plane_color_ctl |=
-				PLANE_COLOR_CSC_MODE_YUV601_TO_RGB601;
-		}
-		if (plane_state->hw.color_range == DRM_COLOR_YCBCR_FULL_RANGE)
-			plane_color_ctl |= PLANE_COLOR_YUV_RANGE_CORRECTION_DISABLE;
-	} else if (fb->format->is_yuv) {
-		plane_color_ctl |= PLANE_COLOR_INPUT_CSC_ENABLE;
-		if (plane_state->hw.color_range == DRM_COLOR_YCBCR_FULL_RANGE)
-			plane_color_ctl |= PLANE_COLOR_YUV_RANGE_CORRECTION_DISABLE;
-	}
+	plane_color_ctl |= glk_plane_color_ctl_input_csc(plane_state);
 
 	if (plane_state->force_black)
 		plane_color_ctl |= PLANE_COLOR_PLANE_CSC_ENABLE;
@@ -1532,7 +1544,7 @@ static void icl_plane_update_sel_fetch_noarm(struct intel_dsb *dsb,
 	if (!color_plane)
 		y = plane_state->view.color_plane[color_plane].y + clip->y1;
 	else
-		y = plane_state->view.color_plane[color_plane].y + clip->y1 / 2;
+		y = plane_state->view.color_plane[color_plane].y + DIV_ROUND_UP(clip->y1, 2);
 
 	val = y << 16 | x;
 
@@ -1611,7 +1623,8 @@ icl_plane_update_noarm(struct intel_dsb *dsb,
 	intel_de_write_dsb(display, dsb, PLANE_COLOR_CTL(pipe, plane_id),
 			   plane_color_ctl);
 
-	if (fb->format->is_yuv && icl_is_hdr_plane(display, plane_id))
+	if (icl_is_hdr_plane(display, plane_id) &&
+	    (fb->format->is_yuv || plane_state->hw.csc_ff_enable))
 		icl_program_input_csc(dsb, plane, plane_state);
 
 	skl_write_plane_wm(dsb, plane, crtc_state);
@@ -1634,10 +1647,8 @@ static void icl_plane_update_sel_fetch_arm(struct intel_dsb *dsb,
 	struct intel_display *display = to_intel_display(plane);
 	enum pipe pipe = plane->pipe;
 
-	if (!crtc_state->enable_psr2_sel_fetch)
-		return;
-
-	if (drm_rect_height(&plane_state->psr2_sel_fetch_area) > 0)
+	if (crtc_state->enable_psr2_sel_fetch &&
+	    drm_rect_height(&plane_state->psr2_sel_fetch_area) > 0)
 		intel_de_write_dsb(display, dsb, SEL_FETCH_PLANE_CTL(pipe, plane->id),
 				   SEL_FETCH_PLANE_CTL_ENABLE);
 	else
@@ -1932,10 +1943,10 @@ static int intel_plane_min_height(struct intel_plane *plane,
 	return 1;
 }
 
-static int intel_plane_max_width(struct intel_plane *plane,
-				 const struct drm_framebuffer *fb,
-				 int color_plane,
-				 unsigned int rotation)
+int intel_plane_max_width(struct intel_plane *plane,
+			  const struct drm_framebuffer *fb,
+			  int color_plane,
+			  unsigned int rotation)
 {
 	if (plane->max_width)
 		return plane->max_width(fb, color_plane, rotation);
@@ -1943,10 +1954,10 @@ static int intel_plane_max_width(struct intel_plane *plane,
 		return INT_MAX;
 }
 
-static int intel_plane_max_height(struct intel_plane *plane,
-				  const struct drm_framebuffer *fb,
-				  int color_plane,
-				  unsigned int rotation)
+int intel_plane_max_height(struct intel_plane *plane,
+			   const struct drm_framebuffer *fb,
+			   int color_plane,
+			   unsigned int rotation)
 {
 	if (plane->max_height)
 		return plane->max_height(fb, color_plane, rotation);
@@ -2139,10 +2150,22 @@ static int skl_check_nv12_aux_surface(struct intel_plane_state *plane_state)
 	int min_height = intel_plane_min_height(plane, fb, uv_plane, rotation);
 	int max_width = intel_plane_max_width(plane, fb, uv_plane, rotation);
 	int max_height = intel_plane_max_height(plane, fb, uv_plane, rotation);
-	int x = plane_state->uapi.src.x1 >> 17;
-	int y = plane_state->uapi.src.y1 >> 17;
-	int w = drm_rect_width(&plane_state->uapi.src) >> 17;
-	int h = drm_rect_height(&plane_state->uapi.src) >> 17;
+
+	/*
+	 * UV (chroma) start/size = ceiling(half of the *integer* Y plane
+	 * start/size), i.e. the value the luma surface programs (src >> 16),
+	 * not the raw U16.16. A bigjoiner seam mapped through the scaler can
+	 * give a fractional luma src; ceiling that directly would round the
+	 * chroma one column too far and read past the chroma surface.
+	 */
+	int luma_x = plane_state->uapi.src.x1 >> 16;
+	int luma_y = plane_state->uapi.src.y1 >> 16;
+	int luma_w = drm_rect_width(&plane_state->uapi.src) >> 16;
+	int luma_h = drm_rect_height(&plane_state->uapi.src) >> 16;
+	int x = DIV_ROUND_UP(luma_x, 2);
+	int y = DIV_ROUND_UP(luma_y, 2);
+	int w = DIV_ROUND_UP(luma_x + luma_w, 2) - x;
+	int h = DIV_ROUND_UP(luma_y + luma_h, 2) - y;
 	u32 offset;
 
 	/* FIXME not quite sure how/if these apply to the chroma plane */
@@ -2695,6 +2718,7 @@ static const struct drm_plane_funcs skl_plane_funcs = {
 	.atomic_destroy_state = intel_plane_destroy_state,
 	.format_mod_supported = skl_plane_format_mod_supported,
 	.format_mod_supported_async = intel_plane_format_mod_supported_async,
+	DRM_PANIC_PLANE_FUNCS,
 };
 
 static const struct drm_plane_funcs icl_plane_funcs = {
@@ -2705,6 +2729,7 @@ static const struct drm_plane_funcs icl_plane_funcs = {
 	.atomic_destroy_state = intel_plane_destroy_state,
 	.format_mod_supported = icl_plane_format_mod_supported,
 	.format_mod_supported_async = intel_plane_format_mod_supported_async,
+	DRM_PANIC_PLANE_FUNCS,
 };
 
 static const struct drm_plane_funcs tgl_plane_funcs = {
@@ -2715,6 +2740,7 @@ static const struct drm_plane_funcs tgl_plane_funcs = {
 	.atomic_destroy_state = intel_plane_destroy_state,
 	.format_mod_supported = tgl_plane_format_mod_supported,
 	.format_mod_supported_async = intel_plane_format_mod_supported_async,
+	DRM_PANIC_PLANE_FUNCS,
 };
 
 static void
@@ -3148,12 +3174,6 @@ skl_get_initial_plane_config(struct intel_crtc *crtc,
 
 	fb->format = drm_get_format_info(display->drm, fourcc, fb->modifier);
 
-	if (!display->params.enable_dpt &&
-	    intel_fb_modifier_uses_dpt(display, fb->modifier)) {
-		drm_dbg_kms(display->drm, "DPT disabled, skipping initial FB\n");
-		goto error;
-	}
-
 	/*
 	 * DRM_MODE_ROTATE_ is counter clockwise to stay compatible with Xrandr
 	 * while i915 HW rotation is clockwise, that's why this swapping.
@@ -3206,7 +3226,7 @@ skl_get_initial_plane_config(struct intel_crtc *crtc,
 		    fb->width, fb->height, fb->format->cpp[0] * 8,
 		    base, fb->pitches[0], plane_config->size);
 
-	plane_config->fb = intel_fb;
+	plane_config->fb = &intel_fb->base;
 	return;
 
 error:

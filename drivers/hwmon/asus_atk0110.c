@@ -141,8 +141,8 @@ typedef ssize_t (*sysfs_show_func)(struct device *dev,
 			struct device_attribute *attr, char *buf);
 
 static const struct acpi_device_id atk_ids[] = {
-	{ATK_HID, 0},
-	{"", 0},
+	{ .id = ATK_HID },
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, atk_ids);
 
@@ -1035,6 +1035,9 @@ static int atk_ec_present(struct atk_data *data)
 		union acpi_object *id;
 
 		if (obj->type != ACPI_TYPE_PACKAGE)
+			continue;
+
+		if (!obj->package.count)
 			continue;
 
 		id = &obj->package.elements[0];

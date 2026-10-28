@@ -235,7 +235,6 @@ static int mpr_touchkey_probe(struct i2c_client *client)
 
 	input_dev->name = "Freescale MPR121 Touchkey";
 	input_dev->id.bustype = BUS_I2C;
-	input_dev->dev.parent = dev;
 	if (device_property_read_bool(dev, "autorepeat"))
 		__set_bit(EV_REP, input_dev->evbit);
 	input_set_capability(input_dev, EV_MSC, MSC_SCAN);
@@ -322,7 +321,7 @@ static int mpr_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(mpr121_touchkey_pm_ops, mpr_suspend, mpr_resume);
 
 static const struct i2c_device_id mpr121_id[] = {
-	{ "mpr121_touchkey" },
+	{ .name = "mpr121_touchkey" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, mpr121_id);

@@ -762,6 +762,17 @@ static int wm8988_set_bias_level(struct snd_soc_component *component,
 #define WM8988_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE |\
 	SNDRV_PCM_FMTBIT_S24_LE)
 
+static const u64 wm8988_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_RIGHT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_IF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_IF;
+
 static const struct snd_soc_dai_ops wm8988_ops = {
 	.startup = wm8988_pcm_startup,
 	.hw_params = wm8988_pcm_hw_params,
@@ -769,6 +780,8 @@ static const struct snd_soc_dai_ops wm8988_ops = {
 	.set_sysclk = wm8988_set_dai_sysclk,
 	.mute_stream = wm8988_mute,
 	.no_capture_mute = 1,
+	.auto_selectable_formats = &wm8988_selectable_formats,
+	.num_auto_selectable_formats = 1,
 };
 
 static struct snd_soc_dai_driver wm8988_dai = {
@@ -897,7 +910,7 @@ static int wm8988_i2c_probe(struct i2c_client *i2c)
 }
 
 static const struct i2c_device_id wm8988_i2c_id[] = {
-	{ "wm8988" },
+	{ .name = "wm8988" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, wm8988_i2c_id);

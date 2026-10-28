@@ -17,12 +17,13 @@
 
 #include "f2fs.h"
 #include "node.h"
+#include "segment.h"
 #include <trace/events/f2fs.h>
 
-bool sanity_check_extent_cache(struct inode *inode, struct folio *ifolio)
+bool sanity_check_extent_cache(struct inode *inode, struct f2fs_cached_block *ientry)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	struct f2fs_extent *i_ext = &F2FS_INODE(ifolio)->i_ext;
+	struct f2fs_extent *i_ext = &F2FS_INODE(ientry)->i_ext;
 	struct extent_info ei;
 	int devi;
 
@@ -60,6 +61,14 @@ bool sanity_check_extent_cache(struct inode *inode, struct folio *ifolio)
 			    "%s: device alias inode (ino=%llx)'s extent info "
 			    "[%u, %u, %u] maps to zoned block device",
 			    __func__, inode->i_ino, ei.blk, ei.fofs, ei.len);
+			return false;
+		}
+
+		if ((GET_SEGOFF_FROM_SEG0(sbi, ei.blk) % BLKS_PER_SEC(sbi)) ||
+		    (ei.len % BLKS_PER_SEC(sbi))) {
+			f2fs_warn(sbi, "%s: device alias inode (ino=%llx)'s extent info [%u, %u, %u] is not aligned to section size %u",
+				  __func__, inode->i_ino, ei.blk, ei.fofs, ei.len,
+				  BLKS_PER_SEC(sbi));
 			return false;
 		}
 		return true;
@@ -119,10 +128,9 @@ static bool __may_extent_tree(struct inode *inode, enum extent_type type)
 	if (!__init_may_extent_tree(inode, type))
 		return false;
 
-	if (is_inode_flag_set(inode, FI_NO_EXTENT))
-		return false;
-
 	if (type == EX_READ) {
+		if (is_inode_flag_set(inode, FI_NO_EXTENT))
+			return false;
 		if (is_inode_flag_set(inode, FI_COMPRESSED_FILE) &&
 				 !f2fs_sb_has_readonly(F2FS_I_SB(inode)))
 			return false;
@@ -408,11 +416,11 @@ static void __drop_largest_extent(struct extent_tree *et,
 	}
 }
 
-void f2fs_init_read_extent_tree(struct inode *inode, struct folio *ifolio)
+void f2fs_init_read_extent_tree(struct inode *inode, struct f2fs_cached_block *ientry)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct extent_tree_info *eti = &sbi->extent_tree[EX_READ];
-	struct f2fs_extent *i_ext = &F2FS_INODE(ifolio)->i_ext;
+	struct f2fs_extent *i_ext = &F2FS_INODE(ientry)->i_ext;
 	struct extent_tree *et;
 	struct extent_node *en;
 	struct extent_info ei = {0};
@@ -420,9 +428,9 @@ void f2fs_init_read_extent_tree(struct inode *inode, struct folio *ifolio)
 	if (!__may_extent_tree(inode, EX_READ)) {
 		/* drop largest read extent */
 		if (i_ext->len) {
-			f2fs_folio_wait_writeback(ifolio, NODE, true, true);
+			f2fs_cache_wait_writeback(ientry);
 			i_ext->len = 0;
-			folio_mark_dirty(ifolio);
+			f2fs_mark_cache_dirty(ientry);
 		}
 		set_inode_flag(inode, FI_NO_EXTENT);
 		return;
@@ -645,13 +653,9 @@ static unsigned int __destroy_extent_node(struct inode *inode,
 
 	while (atomic_read(&et->node_cnt)) {
 		write_lock(&et->lock);
-		if (!is_inode_flag_set(inode, FI_NO_EXTENT))
-			set_inode_flag(inode, FI_NO_EXTENT);
 		node_cnt += __free_extent_tree(sbi, et, nr_shrink);
 		write_unlock(&et->lock);
 	}
-
-	f2fs_bug_on(sbi, atomic_read(&et->node_cnt));
 
 	return node_cnt;
 }
@@ -691,12 +695,12 @@ static void __update_extent_tree_range(struct inode *inode,
 
 	write_lock(&et->lock);
 
-	if (is_inode_flag_set(inode, FI_NO_EXTENT)) {
-		write_unlock(&et->lock);
-		return;
-	}
-
 	if (type == EX_READ) {
+		if (is_inode_flag_set(inode, FI_NO_EXTENT)) {
+			write_unlock(&et->lock);
+			return;
+		}
+
 		prev = et->largest;
 		dei.len = 0;
 
@@ -900,11 +904,12 @@ static int __get_new_block_age(struct inode *inode, struct extent_info *ei,
 	struct extent_info tei = *ei;	/* only fofs and len are valid */
 
 	/*
-	 * When I/O is not aligned to a PAGE_SIZE, update will happen to the last
-	 * file block even in seq write. So don't record age for newly last file
-	 * block here.
+	 * When I/O is not aligned to the filesystem block size, update will
+	 * happen to the last file block even in seq write. Do not record the age
+	 * of the new last file block here.
 	 */
-	if ((f_size >> PAGE_SHIFT) == ei->fofs && f_size & (PAGE_SIZE - 1) &&
+	if ((f_size >> sbi->log_blocksize) == ei->fofs &&
+	    f_size & F2FS_BLKSIZE_MASK(sbi) &&
 			blkaddr == NEW_ADDR)
 		return -EINVAL;
 
@@ -952,8 +957,8 @@ static void __update_extent_cache(struct dnode_of_data *dn, enum extent_type typ
 	if (!__may_extent_tree(dn->inode, type))
 		return;
 
-	ei.fofs = f2fs_start_bidx_of_node(ofs_of_node(dn->node_folio), dn->inode) +
-								dn->ofs_in_node;
+	ei.fofs = f2fs_start_bidx_of_node(ofs_of_node(F2FS_I_SB(dn->inode),
+				dn->node_entry), dn->inode) + dn->ofs_in_node;
 	ei.len = 1;
 
 	if (type == EX_READ) {

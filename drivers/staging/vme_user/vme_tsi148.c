@@ -26,6 +26,7 @@
 #include <linux/io.h>
 #include <linux/uaccess.h>
 #include <linux/byteorder/generic.h>
+#include <linux/string_choices.h>
 
 #include "vme.h"
 #include "vme_bridge.h"
@@ -2458,7 +2459,7 @@ static int tsi148_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			 geoid);
 
 	dev_info(&pdev->dev, "VME Write and flush and error check is %s\n",
-		 err_chk ? "enabled" : "disabled");
+		 str_enabled_disabled(err_chk));
 
 	retval = tsi148_crcsr_init(tsi148_bridge, pdev);
 	if (retval) {
@@ -2534,6 +2535,7 @@ static void tsi148_remove(struct pci_dev *pdev)
 {
 	struct list_head *pos = NULL;
 	struct list_head *tmplist;
+	struct vme_lm_resource *lm;
 	struct vme_master_resource *master_image;
 	struct vme_slave_resource *slave_image;
 	struct vme_dma_resource *dma_ctrlr;
@@ -2589,6 +2591,13 @@ static void tsi148_remove(struct pci_dev *pdev)
 	vme_unregister_bridge(tsi148_bridge);
 
 	tsi148_crcsr_exit(tsi148_bridge, pdev);
+
+	/* resources are stored in link list */
+	list_for_each_safe(pos, tmplist, &tsi148_bridge->lm_resources) {
+		lm = list_entry(pos, struct vme_lm_resource, list);
+		list_del(pos);
+		kfree(lm);
+	}
 
 	/* resources are stored in link list */
 	list_for_each_safe(pos, tmplist, &tsi148_bridge->dma_resources) {

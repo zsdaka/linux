@@ -532,7 +532,7 @@ static void dwxgmac2_set_filter(struct mac_device_info *hw,
 	dwxgmac2_set_mchash(ioaddr, mc_filter, mcbitslog2);
 
 	/* Handle multiple unicast addresses */
-	if (netdev_uc_count(dev) > hw->unicast_filter_entries) {
+	if (netdev_uc_count(dev) + 1 > hw->unicast_filter_entries) {
 		value |= XGMAC_FILTER_PR;
 	} else {
 		struct netdev_hw_addr *ha;
@@ -1370,56 +1370,44 @@ static int dwxgmac2_config_l4_filter(struct mac_device_info *hw, u32 filter_no,
 		value &= ~XGMAC_L4PEN0;
 	}
 
-	value &= ~(XGMAC_L4SPM0 | XGMAC_L4SPIM0);
-	value &= ~(XGMAC_L4DPM0 | XGMAC_L4DPIM0);
 	if (sa) {
 		value |= XGMAC_L4SPM0;
 		if (inv)
 			value |= XGMAC_L4SPIM0;
+		else
+			value &= ~XGMAC_L4SPIM0;
 	} else {
 		value |= XGMAC_L4DPM0;
 		if (inv)
 			value |= XGMAC_L4DPIM0;
+		else
+			value &= ~XGMAC_L4DPIM0;
 	}
 
 	ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L3L4_CTRL, value);
 	if (ret)
 		return ret;
 
+	ret = dwxgmac2_filter_read(hw, filter_no, XGMAC_L4_ADDR, &value);
+	if (ret)
+		return ret;
+
 	if (sa) {
-		value = FIELD_PREP(XGMAC_L4SP0, match);
-
-		ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L4_ADDR, value);
-		if (ret)
-			return ret;
+		value &= ~XGMAC_L4SP0;
+		value |= FIELD_PREP(XGMAC_L4SP0, match);
 	} else {
-		value = FIELD_PREP(XGMAC_L4DP0, match);
-
-		ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L4_ADDR, value);
-		if (ret)
-			return ret;
+		value &= ~XGMAC_L4DP0;
+		value |= FIELD_PREP(XGMAC_L4DP0, match);
 	}
+
+	ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L4_ADDR, value);
+	if (ret)
+		return ret;
 
 	if (!en)
 		return dwxgmac2_filter_write(hw, filter_no, XGMAC_L3L4_CTRL, 0);
 
 	return 0;
-}
-
-static void dwxgmac2_set_arp_offload(struct mac_device_info *hw, bool en,
-				     u32 addr)
-{
-	void __iomem *ioaddr = hw->pcsr;
-	u32 value;
-
-	writel(addr, ioaddr + XGMAC_ARP_ADDR);
-
-	value = readl(ioaddr + XGMAC_RX_CONFIG);
-	if (en)
-		value |= XGMAC_CONFIG_ARPEN;
-	else
-		value &= ~XGMAC_CONFIG_ARPEN;
-	writel(value, ioaddr + XGMAC_RX_CONFIG);
 }
 
 const struct stmmac_ops dwxgmac210_ops = {
@@ -1460,7 +1448,6 @@ const struct stmmac_ops dwxgmac210_ops = {
 	.sarc_configure = dwxgmac2_sarc_configure,
 	.config_l3_filter = dwxgmac2_config_l3_filter,
 	.config_l4_filter = dwxgmac2_config_l4_filter,
-	.set_arp_offload = dwxgmac2_set_arp_offload,
 	.fpe_map_preemption_class = dwxgmac3_fpe_map_preemption_class,
 };
 
@@ -1515,7 +1502,6 @@ const struct stmmac_ops dwxlgmac2_ops = {
 	.sarc_configure = dwxgmac2_sarc_configure,
 	.config_l3_filter = dwxgmac2_config_l3_filter,
 	.config_l4_filter = dwxgmac2_config_l4_filter,
-	.set_arp_offload = dwxgmac2_set_arp_offload,
 	.fpe_map_preemption_class = dwxgmac3_fpe_map_preemption_class,
 };
 

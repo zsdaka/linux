@@ -38,8 +38,10 @@
 #include <linux/slab.h>
 #include <linux/sunrpc/svc_xprt.h>
 #include <net/net_namespace.h>
+#include "auth.h"
 #include "idmap.h"
 #include "nfsd.h"
+#include "nfserr.h"
 #include "netns.h"
 #include "vfs.h"
 
@@ -126,7 +128,7 @@ idtoname_hash(struct ent *ent)
 static int
 idtoname_upcall(struct cache_detail *cd, struct cache_head *h)
 {
-	return sunrpc_cache_pipe_upcall_timeout(cd, h);
+	return sunrpc_cache_upcall_warn(cd, h);
 }
 
 static void
@@ -252,8 +254,10 @@ idtoname_parse(struct cache_detail *cd, char *buf, int buflen)
 	/* Name */
 	error = -EINVAL;
 	len = qword_get(&buf, buf1, PAGE_SIZE);
-	if (len < 0 || len >= IDMAP_NAMESZ)
+	if (len < 0 || len >= IDMAP_NAMESZ) {
+		cache_put(&res->h, cd);
 		goto out;
+	}
 	if (len == 0)
 		set_bit(CACHE_NEGATIVE, &ent.h.flags);
 	else
@@ -306,7 +310,7 @@ nametoid_hash(struct ent *ent)
 static int
 nametoid_upcall(struct cache_detail *cd, struct cache_head *h)
 {
-	return sunrpc_cache_pipe_upcall_timeout(cd, h);
+	return sunrpc_cache_upcall_warn(cd, h);
 }
 
 static void

@@ -119,6 +119,8 @@
 		reg = <0>;
 		interrupts-extended = <&gpio1 17 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&gpio1 16 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <10000>;
+		reset-deassert-us = <300>;
 	};
 };
 
@@ -213,7 +215,7 @@
 		function = "i2c0";
 	};
 
-	mmc_pins: mmc_3_3v {
+	mmc_pins: mmc-3-3v {
 		groups = "mmc_data8", "mmc_ctrl";
 		function = "mmc";
 		power-source = <3300>;

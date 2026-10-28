@@ -4,6 +4,7 @@
 #include <generated/utsrelease.h>
 #include <linux/crash_dump.h>
 #include <linux/net/intel/libie/pctype.h>
+#include <linux/net/intel/libie/rx.h>
 #include <linux/if_bridge.h>
 #include <linux/if_macvlan.h>
 #include <linux/module.h>
@@ -63,40 +64,43 @@ static bool i40e_is_total_port_shutdown_enabled(struct i40e_pf *pf);
  *   Class, Class Mask, private data (not used) }
  */
 static const struct pci_device_id i40e_pci_tbl[] = {
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_SFP_XL710), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_QEMU), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_KX_B), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_KX_C), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_QSFP_A), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_QSFP_B), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_QSFP_C), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_1G_BASE_T_BC), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_BASE_T), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_BASE_T4), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_BASE_T_BC), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_SFP), 0},
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_SFP_XL710) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_QEMU) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_KX_B) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_KX_C) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_QSFP_A) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_QSFP_B) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_QSFP_C) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_1G_BASE_T_BC) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_BASE_T) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_BASE_T4) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_BASE_T_BC) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_SFP) },
 	/*
 	 * This ID conflicts with ipw2200, but the devices can be differentiated
 	 * because i40e devices use PCI_CLASS_NETWORK_ETHERNET and ipw2200
 	 * devices use PCI_CLASS_NETWORK_OTHER.
 	 */
-	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, I40E_DEV_ID_10G_B),
-		PCI_CLASS_NETWORK_ETHERNET << 8, 0xffff00, 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_KX_X722), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_QSFP_X722), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_SFP_X722), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_1G_BASE_T_X722), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_BASE_T_X722), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_SFP_I_X722), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_SFP_X722_A), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_20G_KR2), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_20G_KR2_A), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_X710_N3000), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_XXV710_N3000), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_25G_B), 0},
-	{PCI_VDEVICE(INTEL, I40E_DEV_ID_25G_SFP28), 0},
+	{
+		PCI_DEVICE(PCI_VENDOR_ID_INTEL, I40E_DEV_ID_10G_B),
+		.class = PCI_CLASS_NETWORK_ETHERNET << 8,
+		.class_mask = 0xffff00,
+	},
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_KX_X722) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_QSFP_X722) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_SFP_X722) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_1G_BASE_T_X722) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_10G_BASE_T_X722) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_SFP_I_X722) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_SFP_X722_A) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_20G_KR2) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_20G_KR2_A) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_X710_N3000) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_XXV710_N3000) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_25G_B) },
+	{ PCI_VDEVICE(INTEL, I40E_DEV_ID_25G_SFP28) },
 	/* required last entry */
-	{0, }
+	{ }
 };
 MODULE_DEVICE_TABLE(pci, i40e_pci_tbl);
 
@@ -2408,10 +2412,12 @@ void i40e_aqc_add_filters(struct i40e_vsi *vsi, const char *vsi_name,
 
 	if (fcnt != num_add) {
 		if (vsi->type == I40E_VSI_MAIN) {
-			set_bit(__I40E_VSI_OVERFLOW_PROMISC, vsi->state);
-			dev_warn(&vsi->back->pdev->dev,
-				 "Error %s adding RX filters on %s, promiscuous mode forced on\n",
-				 libie_aq_str(aq_status), vsi_name);
+			if (!test_and_set_bit(__I40E_VSI_OVERFLOW_PROMISC,
+					      vsi->state)) {
+				dev_warn(&vsi->back->pdev->dev,
+					 "Error %s adding RX filters on %s, promiscuous mode forced on\n",
+					 libie_aq_str(aq_status), vsi_name);
+			}
 		} else if (vsi->type == I40E_VSI_SRIOV ||
 			   vsi->type == I40E_VSI_VMDQ1 ||
 			   vsi->type == I40E_VSI_VMDQ2) {
@@ -2461,10 +2467,11 @@ i40e_aqc_broadcast_filter(struct i40e_vsi *vsi, const char *vsi_name,
 	}
 
 	if (aq_ret) {
-		set_bit(__I40E_VSI_OVERFLOW_PROMISC, vsi->state);
-		dev_warn(&vsi->back->pdev->dev,
-			 "Error %s, forcing overflow promiscuous on %s\n",
-			 libie_aq_str(hw->aq.asq_last_status), vsi_name);
+		if (!test_and_set_bit(__I40E_VSI_OVERFLOW_PROMISC, vsi->state)) {
+			dev_warn(&vsi->back->pdev->dev,
+				 "Error %s, forcing overflow promiscuous on %s\n",
+				 libie_aq_str(hw->aq.asq_last_status), vsi_name);
+		}
 	}
 
 	return aq_ret;
@@ -3619,7 +3626,7 @@ static int i40e_configure_rx_ring(struct i40e_ring *ring)
 	}
 
 skip:
-	xdp_init_buff(&ring->xdp, xdp_frame_sz, &ring->xdp_rxq);
+	xdp_init_buff(&ring->xdp_ctx.xdp, xdp_frame_sz, &ring->xdp_rxq);
 
 	rx_ctx.dbuff = DIV_ROUND_UP(ring->rx_buf_len,
 				    BIT_ULL(I40E_RXQ_CTX_DBUFF_SHIFT));
@@ -4861,16 +4868,10 @@ static void i40e_control_rx_q(struct i40e_pf *pf, int pf_q, bool enable)
  **/
 int i40e_control_wait_rx_q(struct i40e_pf *pf, int pf_q, bool enable)
 {
-	int ret = 0;
-
 	i40e_control_rx_q(pf, pf_q, enable);
 
 	/* wait for the change to finish */
-	ret = i40e_pf_rxq_wait(pf, pf_q, enable);
-	if (ret)
-		return ret;
-
-	return ret;
+	return i40e_pf_rxq_wait(pf, pf_q, enable);
 }
 
 /**
@@ -13585,6 +13586,53 @@ static int i40e_xdp(struct net_device *dev,
 	}
 }
 
+static int i40e_xdp_rx_hash(const struct xdp_md *_ctx, u32 *hash,
+			    enum xdp_rss_hash_type *rss_type)
+{
+	const struct i40e_xdp_buff *ctx = (const void *)_ctx;
+	const union i40e_rx_desc *desc = ctx->desc;
+	struct libeth_rx_pt rx_ptype;
+	u8 raw_rx_ptype;
+	u64 status;
+
+	status = le64_to_cpu(desc->wb.qword1.status_error_len);
+	raw_rx_ptype = FIELD_GET(I40E_RXD_QW1_PTYPE_MASK, status);
+	rx_ptype = libie_rx_pt_parse(raw_rx_ptype);
+
+	if (!libeth_rx_pt_has_hash(ctx->xdp.rxq->dev, rx_ptype) ||
+	    FIELD_GET(I40E_RX_DESC_STATUS_FLTSTAT_MASK, status) !=
+		    I40E_RX_DESC_FLTSTAT_RSS_HASH)
+		return -ENODATA;
+
+	*hash = le32_to_cpu(desc->wb.qword0.hi_dword.rss);
+	*rss_type = rx_ptype.hash_type;
+
+	return 0;
+}
+
+static int i40e_xdp_rx_vlan_tag(const struct xdp_md *_ctx, __be16 *vlan_proto,
+				u16 *vlan_tci)
+{
+	const struct i40e_xdp_buff *ctx = (const void *)_ctx;
+	const union i40e_rx_desc *desc = ctx->desc;
+	u64 status;
+
+	status = le64_to_cpu(desc->wb.qword1.status_error_len);
+
+	if (!(status & BIT(I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)))
+		return -ENODATA;
+
+	*vlan_proto = cpu_to_be16(ETH_P_8021Q);
+	*vlan_tci = le16_to_cpu(desc->wb.qword0.lo_dword.l2tag1);
+
+	return 0;
+}
+
+static const struct xdp_metadata_ops i40e_xdp_metadata_ops = {
+	.xmo_rx_hash		= i40e_xdp_rx_hash,
+	.xmo_rx_vlan_tag	= i40e_xdp_rx_vlan_tag,
+};
+
 static const struct net_device_ops i40e_netdev_ops = {
 	.ndo_open		= i40e_open,
 	.ndo_stop		= i40e_close,
@@ -13787,6 +13835,7 @@ static int i40e_config_netdev(struct i40e_vsi *vsi)
 	i40e_vsi_config_netdev_tc(vsi, vsi->tc_config.enabled_tc);
 
 	netdev->netdev_ops = &i40e_netdev_ops;
+	netdev->xdp_metadata_ops = &i40e_xdp_metadata_ops;
 	netdev->watchdog_timeo = 5 * HZ;
 	i40e_set_ethtool_ops(netdev);
 

@@ -382,12 +382,16 @@ static irqreturn_t cqspi_irq_handler(int this_irq, void *dev)
 	/* Clear interrupt */
 	writel(irq_status, cqspi->iobase + CQSPI_REG_IRQSTATUS);
 
-	if (cqspi->use_dma_read && ddata && ddata->get_dma_status)
-		irq_status = ddata->get_dma_status(cqspi);
-	else if (cqspi->slow_sram)
+	if (cqspi->use_dma_read && ddata && ddata->get_dma_status) {
+		if (ddata->get_dma_status(cqspi)) {
+			complete(&cqspi->transfer_complete);
+			return IRQ_HANDLED;
+		}
+	} else if (cqspi->slow_sram) {
 		irq_status &= CQSPI_IRQ_MASK_RD_SLOW_SRAM | CQSPI_IRQ_MASK_WR;
-	else
+	} else {
 		irq_status &= CQSPI_IRQ_MASK_RD | CQSPI_IRQ_MASK_WR;
+	}
 
 	if (irq_status)
 		complete(&cqspi->transfer_complete);
@@ -1052,8 +1056,7 @@ static int cqspi_write_setup(struct cqspi_flash_pdata *f_pdata,
 	 * care of polling the status register.
 	 */
 	if (cqspi->wr_completion) {
-		reg = readl(reg_base + CQSPI_REG_WR_COMPLETION_CTRL);
-		reg |= CQSPI_REG_WR_DISABLE_AUTO_POLL;
+		reg = CQSPI_REG_WR_DISABLE_AUTO_POLL;
 		writel(reg, reg_base + CQSPI_REG_WR_COMPLETION_CTRL);
 		/*
 		 * DAC mode require auto polling as flash needs to be polled
@@ -1378,7 +1381,7 @@ static int cqspi_direct_read_execute(struct cqspi_flash_pdata *f_pdata,
 		return 0;
 	}
 
-	ddev = cqspi->rx_chan->device->dev;
+	ddev = dmaengine_get_dma_device(cqspi->rx_chan);
 	dma_dst = dma_map_single(ddev, buf, len, DMA_FROM_DEVICE);
 	if (dma_mapping_error(ddev, dma_dst)) {
 		dev_err(dev, "dma mapping failed\n");
@@ -1394,7 +1397,7 @@ static int cqspi_direct_read_execute(struct cqspi_flash_pdata *f_pdata,
 
 	tx->callback = cqspi_rx_dma_callback;
 	tx->callback_param = cqspi;
-	cookie = tx->tx_submit(tx);
+	cookie = dmaengine_submit(tx);
 	reinit_completion(&cqspi->rx_dma_complete);
 
 	ret = dma_submit_error(cookie);
@@ -1478,7 +1481,6 @@ static int cqspi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 	int ret;
 	struct cqspi_st *cqspi = spi_controller_get_devdata(mem->spi->controller);
 	struct device *dev = &cqspi->pdev->dev;
-	const struct cqspi_driver_platdata *ddata = of_device_get_match_data(dev);
 
 	if (refcount_read(&cqspi->inflight_ops) == 0)
 		return -ENODEV;
@@ -1494,18 +1496,15 @@ static int cqspi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
 		return -EBUSY;
 	}
 
-	if (!(ddata && (ddata->quirks & CQSPI_DISABLE_RUNTIME_PM))) {
-		ret = pm_runtime_resume_and_get(dev);
-		if (ret) {
-			dev_err(&mem->spi->dev, "resume failed with %d\n", ret);
-			goto dec_inflight_refcount;
-		}
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret) {
+		dev_err(&mem->spi->dev, "resume failed with %d\n", ret);
+		goto dec_inflight_refcount;
 	}
 
 	ret = cqspi_mem_process(mem, op);
 
-	if (!(ddata && (ddata->quirks & CQSPI_DISABLE_RUNTIME_PM)))
-		pm_runtime_put_autosuspend(dev);
+	pm_runtime_put_autosuspend(dev);
 
 	if (ret)
 		dev_err(&mem->spi->dev, "operation failed with %d\n", ret);
@@ -1742,6 +1741,12 @@ static const struct spi_controller_mem_caps cqspi_mem_caps = {
 	.per_op_freq = true,
 };
 
+static const struct spi_controller_mem_caps cqspi_am654_mem_caps = {
+	.dtr = true,
+	.per_op_freq = true,
+	.no_cs_assertion = true,
+};
+
 static int cqspi_setup_flash(struct cqspi_st *cqspi)
 {
 	struct platform_device *pdev = cqspi->pdev;
@@ -1799,6 +1804,8 @@ static int cqspi_probe(struct platform_device *pdev)
 	host->mode_bits = SPI_RX_QUAD | SPI_RX_DUAL;
 	host->mem_ops = &cqspi_mem_ops;
 	host->mem_caps = &cqspi_mem_caps;
+	if (of_device_is_compatible(pdev->dev.of_node, "ti,am654-ospi"))
+		host->mem_caps = &cqspi_am654_mem_caps;
 
 	cqspi = spi_controller_get_devdata(host);
 	if (of_device_is_compatible(pdev->dev.of_node, "starfive,jh7110-qspi"))
@@ -1957,13 +1964,11 @@ static int cqspi_probe(struct platform_device *pdev)
 	cqspi->current_cs = -1;
 	cqspi->sclk = 0;
 
-	if (!(ddata && (ddata->quirks & CQSPI_DISABLE_RUNTIME_PM))) {
-		pm_runtime_set_autosuspend_delay(dev, CQSPI_AUTOSUSPEND_TIMEOUT);
-		pm_runtime_use_autosuspend(dev);
-		pm_runtime_get_noresume(dev);
-		pm_runtime_set_active(dev);
-		pm_runtime_enable(dev);
-	}
+	pm_runtime_set_autosuspend_delay(dev, CQSPI_AUTOSUSPEND_TIMEOUT);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_get_noresume(dev);
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
 
 	host->num_chipselect = cqspi->num_chipselect;
 
@@ -1993,12 +1998,11 @@ release_dma_chan:
 	if (cqspi->rx_chan)
 		dma_release_channel(cqspi->rx_chan);
 disable_rpm:
-	if (!(ddata && (ddata->quirks & CQSPI_DISABLE_RUNTIME_PM))) {
-		pm_runtime_disable(dev);
-		pm_runtime_set_suspended(dev);
-		pm_runtime_put_noidle(dev);
-		pm_runtime_dont_use_autosuspend(dev);
-	}
+	pm_runtime_disable(dev);
+	pm_runtime_set_suspended(dev);
+	pm_runtime_put_noidle(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+
 	cqspi_controller_enable(cqspi, 0);
 disable_clks:
 	clk_bulk_disable_unprepare(CLK_QSPI_NUM, cqspi->clks);
@@ -2008,12 +2012,9 @@ disable_clks:
 
 static void cqspi_remove(struct platform_device *pdev)
 {
-	const struct cqspi_driver_platdata *ddata;
 	struct cqspi_st *cqspi = platform_get_drvdata(pdev);
-	struct device *dev = &pdev->dev;
+	const struct cqspi_driver_platdata *ddata = cqspi->ddata;
 	int ret = 0;
-
-	ddata = of_device_get_match_data(dev);
 
 	spi_unregister_controller(cqspi->host);
 
@@ -2033,12 +2034,10 @@ static void cqspi_remove(struct platform_device *pdev)
 		clk_bulk_disable_unprepare(CLK_QSPI_NUM, cqspi->clks);
 	}
 
-	if (!(ddata && (ddata->quirks & CQSPI_DISABLE_RUNTIME_PM))) {
-		pm_runtime_disable(&pdev->dev);
-		pm_runtime_set_suspended(&pdev->dev);
-		pm_runtime_put_noidle(&pdev->dev);
-		pm_runtime_dont_use_autosuspend(&pdev->dev);
-	}
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_set_suspended(&pdev->dev);
+	pm_runtime_put_noidle(&pdev->dev);
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
 }
 
 static int cqspi_runtime_suspend(struct device *dev)

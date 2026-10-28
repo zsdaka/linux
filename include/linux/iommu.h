@@ -345,12 +345,6 @@ struct iommu_pages_list {
 /**
  * struct iommu_iotlb_gather - Range information for a pending IOTLB flush
  *
- * @start: IOVA representing the start of the range to be flushed
- * @end: IOVA representing the end of the range to be flushed (inclusive)
- * @pgsize: The interval at which to perform the flush
- * @freelist: Removed pages to free after sync
- * @queued: Indicates that the flush will be queued
- *
  * This structure is intended to be updated by multiple calls to the
  * ->unmap() function in struct iommu_ops before eventually being passed
  * into ->iotlb_sync(). Drivers can add pages to @freelist to be freed after
@@ -359,10 +353,44 @@ struct iommu_pages_list {
  * later instead of ->iotlb_sync(), so drivers may optimise accordingly.
  */
 struct iommu_iotlb_gather {
+	/** @start: IOVA representing the start of the range to be flushed */
 	unsigned long		start;
+	/**
+	 * @end: IOVA representing the end of the range to be
+	 *       flushed (inclusive)
+	 */
 	unsigned long		end;
-	size_t			pgsize;
+
+	union {
+		/**
+		 * @pgsize: The interval at which to perform the flush, only
+		 *          used by arm-smmu-v3
+		 */
+		size_t pgsize;
+		struct {
+			/**
+			 * @pt.leaf_levels_bitmap: Bitmap of generic_pt
+			 * levels where leaf entries were unmapped. Bit 0
+			 * means the leaf only level. If 0 no leafs
+			 * were unmapped.
+			 */
+			u8 leaf_levels_bitmap;
+			/**
+			 * @pt.table_levels_bitmap: Bitmap of generic_pt levels
+			 * of table entries that were removed. Bit 0 is never
+			 * set, bit 1 means a table of all leafs was removed.
+			 * When freelist is empty this must be 0.
+			 */
+			u8 table_levels_bitmap;
+		} pt;
+	};
+
+	/**
+	 * @freelist: Removed pages to free after sync, only used by
+	 *            iommupt
+	 */
 	struct iommu_pages_list	freelist;
+	/** @queued: True if the gather will be completed with a flush all */
 	bool			queued;
 };
 
@@ -547,6 +575,7 @@ iommu_copy_struct_from_full_user_array(void *kdst, size_t kdst_entry_size,
 				   user_array->entry_num *
 					   user_array->entry_len))
 			return -EFAULT;
+		return 0;
 	}
 
 	/* Copy item by item */
@@ -744,8 +773,10 @@ struct iommu_ops {
  *                         passes in the cache invalidation requests, in form
  *                         of a driver data structure. The driver must update
  *                         array->entry_num to report the number of handled
- *                         invalidation requests. The driver data structure
- *                         must be defined in include/uapi/linux/iommufd.h
+ *                         invalidation requests. A driver may handle fewer than
+ *                         the requested, in which case the core re-invokes the
+ *                         op for the remainder. The driver data structure must
+ *                         be defined in include/uapi/linux/iommufd.h
  * @iova_to_phys: translate iova to physical address
  * @enforce_cache_coherency: Prevent any kind of DMA from bypassing IOMMU_CACHE,
  *                           including no-snoop TLPs on PCIe or other platform
@@ -869,7 +900,6 @@ int  iommu_device_sysfs_add(struct iommu_device *iommu,
 void iommu_device_sysfs_remove(struct iommu_device *iommu);
 int  iommu_device_link(struct iommu_device   *iommu, struct device *link);
 void iommu_device_unlink(struct iommu_device *iommu, struct device *link);
-int iommu_deferred_attach(struct device *dev, struct iommu_domain *domain);
 
 static inline struct iommu_device *dev_to_iommu_device(struct device *dev)
 {
@@ -914,7 +944,6 @@ extern void iommu_detach_device(struct iommu_domain *domain,
 				struct device *dev);
 extern struct iommu_domain *iommu_get_domain_for_dev(struct device *dev);
 struct iommu_domain *iommu_driver_get_domain_for_dev(struct device *dev);
-extern struct iommu_domain *iommu_get_dma_domain(struct device *dev);
 extern int iommu_map(struct iommu_domain *domain, unsigned long iova,
 		     phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
 int iommu_map_nosync(struct iommu_domain *domain, unsigned long iova,
@@ -1675,6 +1704,7 @@ void iopf_free_group(struct iopf_group *group);
 int iommu_report_device_fault(struct device *dev, struct iopf_fault *evt);
 void iopf_group_response(struct iopf_group *group,
 			 enum iommu_page_response_code status);
+void iopf_group_dequeue(struct iopf_group *group);
 #else
 static inline int
 iopf_queue_add_device(struct iopf_queue *queue, struct device *dev)
@@ -1718,6 +1748,10 @@ iommu_report_device_fault(struct device *dev, struct iopf_fault *evt)
 
 static inline void iopf_group_response(struct iopf_group *group,
 				       enum iommu_page_response_code status)
+{
+}
+
+static inline void iopf_group_dequeue(struct iopf_group *group)
 {
 }
 #endif /* CONFIG_IOMMU_IOPF */

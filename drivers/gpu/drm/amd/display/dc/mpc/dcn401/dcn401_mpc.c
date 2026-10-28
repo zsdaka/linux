@@ -286,7 +286,8 @@ void mpc_program_gamut_remap(
 	unsigned int mpcc_id,
 	const uint16_t *regval,
 	enum mpcc_gamut_remap_id gamut_remap_block_id,
-	enum mpcc_gamut_remap_mode_select mode_select)
+	enum mpcc_gamut_remap_mode_select mode_select,
+	enum cm_gamut_coef_format coef_format)
 {
 	struct color_matrices_reg gamut_regs;
 	struct dcn401_mpc *mpc401 = TO_DCN401_MPC(mpc);
@@ -323,8 +324,11 @@ void mpc_program_gamut_remap(
 			regval,
 			&gamut_regs);
 
-		//select coefficient set to use, set A (MODE_1) or set B (MODE_2)
-		REG_SET(MPCC_GAMUT_REMAP_MODE[mpcc_id], 0, MPCC_GAMUT_REMAP_MODE, mode_select);
+		//select coefficient set to use, set A (MODE_1) or set B (MODE_2) + format
+		REG_SET(MPCC_GAMUT_REMAP_MODE[mpcc_id], 0,
+			MPCC_GAMUT_REMAP_MODE, mode_select);
+		REG_SET(MPCC_GAMUT_REMAP_COEF_FORMAT[mpcc_id], 0,
+			MPCC_GAMUT_REMAP_COEF_FORMAT, coef_format);
 		break;
 
 	case MPCC_MCM_FIRST_GAMUT_REMAP:
@@ -357,9 +361,11 @@ void mpc_program_gamut_remap(
 			regval,
 			&gamut_regs);
 
-		//select coefficient set to use, set A (MODE_1) or set B (MODE_2)
+		//select coefficient set to use, set A (MODE_1) or set B (MODE_2) + format
 		REG_SET(MPCC_MCM_FIRST_GAMUT_REMAP_MODE[mpcc_id], 0,
 			MPCC_MCM_FIRST_GAMUT_REMAP_MODE, mode_select);
+		REG_SET(MPCC_MCM_FIRST_GAMUT_REMAP_COEF_FORMAT[mpcc_id], 0,
+			MPCC_MCM_FIRST_GAMUT_REMAP_COEF_FORMAT, coef_format);
 		break;
 
 	case MPCC_MCM_SECOND_GAMUT_REMAP:
@@ -392,9 +398,11 @@ void mpc_program_gamut_remap(
 			regval,
 			&gamut_regs);
 
-		//select coefficient set to use, set A (MODE_1) or set B (MODE_2)
+		//select coefficient set to use, set A (MODE_1) or set B (MODE_2) + format
 		REG_SET(MPCC_MCM_SECOND_GAMUT_REMAP_MODE[mpcc_id], 0,
 			MPCC_MCM_SECOND_GAMUT_REMAP_MODE, mode_select);
+		REG_SET(MPCC_MCM_SECOND_GAMUT_REMAP_COEF_FORMAT[mpcc_id], 0,
+			MPCC_MCM_SECOND_GAMUT_REMAP_COEF_FORMAT, coef_format);
 		break;
 
 	default:
@@ -410,19 +418,28 @@ void mpc401_set_gamut_remap(
 	struct dcn401_mpc *mpc401 = TO_DCN401_MPC(mpc);
 	unsigned int i = 0;
 	uint32_t mode_select = 0;
+	uint16_t hw_matrix[12];
+	enum cm_gamut_coef_format coef_format = CM_GAMUT_REMAP_COEF_FORMAT_S2_13;
+	struct fixed31_32 abs_max_coef = {0};
 
 	if (adjust->gamut_adjust_type != GRAPHICS_GAMUT_ADJUST_TYPE_SW) {
 		/* Bypass / Disable if type is bypass or hw */
-		mpc_program_gamut_remap(mpc, mpcc_id, NULL,
-			adjust->mpcc_gamut_remap_block_id, MPCC_GAMUT_REMAP_MODE_SELECT_0);
+		mpc_program_gamut_remap(mpc, mpcc_id, NULL, adjust->mpcc_gamut_remap_block_id,
+			MPCC_GAMUT_REMAP_MODE_SELECT_0, coef_format);
 	} else {
-		struct fixed31_32 arr_matrix[12];
-		uint16_t arr_reg_val[12];
+		// take largest absolute value of coefficient in temperature matrix
+		// if S2D13 cannot fit value, use S3D12
+		for (i = 0; i < 12; i++) {
+			if (dc_fixpt_le(abs_max_coef, dc_fixpt_abs(adjust->temperature_matrix[i])))
+				abs_max_coef = dc_fixpt_abs(adjust->temperature_matrix[i]);
+		}
 
-		for (i = 0; i < 12; i++)
-			arr_matrix[i] = adjust->temperature_matrix[i];
+		if (dc_fixpt_le(abs_max_coef, dc_fixpt_from_fraction(S2D13_MAX, DIVIDER)))
+			coef_format = CM_GAMUT_REMAP_COEF_FORMAT_S2_13;
+		else
+			coef_format = CM_GAMUT_REMAP_COEF_FORMAT_S3_12;
 
-		convert_float_matrix(arr_reg_val, arr_matrix, 12);
+		convert_float_matrix(hw_matrix, adjust->temperature_matrix, coef_format, 12);
 
 		switch (adjust->mpcc_gamut_remap_block_id) {
 		case MPCC_OGAM_GAMUT_REMAP:
@@ -447,8 +464,8 @@ void mpc401_set_gamut_remap(
 		else
 			mode_select = MPCC_GAMUT_REMAP_MODE_SELECT_2;
 
-		mpc_program_gamut_remap(mpc, mpcc_id, arr_reg_val,
-			adjust->mpcc_gamut_remap_block_id, mode_select);
+		mpc_program_gamut_remap(mpc, mpcc_id, hw_matrix,
+			adjust->mpcc_gamut_remap_block_id, mode_select, coef_format);
 	}
 }
 
@@ -456,7 +473,8 @@ void mpc_read_gamut_remap(struct mpc *mpc,
 	int mpcc_id,
 	uint16_t *regval,
 	enum mpcc_gamut_remap_id gamut_remap_block_id,
-	uint32_t *mode_select)
+	uint32_t *mode_select,
+	enum cm_gamut_coef_format *coef_format)
 {
 	struct color_matrices_reg gamut_regs = {0};
 	struct dcn401_mpc *mpc401 = TO_DCN401_MPC(mpc);
@@ -464,7 +482,10 @@ void mpc_read_gamut_remap(struct mpc *mpc,
 	switch (gamut_remap_block_id) {
 	case MPCC_OGAM_GAMUT_REMAP:
 		//current coefficient set in use
-		REG_GET(MPCC_GAMUT_REMAP_MODE[mpcc_id], MPCC_GAMUT_REMAP_MODE_CURRENT, mode_select);
+		REG_GET(MPCC_GAMUT_REMAP_MODE[mpcc_id],
+			MPCC_GAMUT_REMAP_MODE_CURRENT, mode_select);
+		REG_GET(MPCC_GAMUT_REMAP_COEF_FORMAT[mpcc_id],
+			MPCC_GAMUT_REMAP_COEF_FORMAT, coef_format);
 
 		gamut_regs.shifts.csc_c11 = mpc401->mpc_shift->MPCC_GAMUT_REMAP_C11_A;
 		gamut_regs.masks.csc_c11 = mpc401->mpc_mask->MPCC_GAMUT_REMAP_C11_A;
@@ -487,7 +508,9 @@ void mpc_read_gamut_remap(struct mpc *mpc,
 
 	case MPCC_MCM_FIRST_GAMUT_REMAP:
 		REG_GET(MPCC_MCM_FIRST_GAMUT_REMAP_MODE[mpcc_id],
-				MPCC_MCM_FIRST_GAMUT_REMAP_MODE_CURRENT, mode_select);
+			MPCC_MCM_FIRST_GAMUT_REMAP_MODE_CURRENT, mode_select);
+		REG_GET(MPCC_MCM_FIRST_GAMUT_REMAP_COEF_FORMAT[mpcc_id],
+			MPCC_MCM_FIRST_GAMUT_REMAP_COEF_FORMAT, coef_format);
 
 		gamut_regs.shifts.csc_c11 = mpc401->mpc_shift->MPCC_MCM_FIRST_GAMUT_REMAP_C11_A;
 		gamut_regs.masks.csc_c11 = mpc401->mpc_mask->MPCC_MCM_FIRST_GAMUT_REMAP_C11_A;
@@ -510,7 +533,9 @@ void mpc_read_gamut_remap(struct mpc *mpc,
 
 	case MPCC_MCM_SECOND_GAMUT_REMAP:
 		REG_GET(MPCC_MCM_SECOND_GAMUT_REMAP_MODE[mpcc_id],
-				MPCC_MCM_SECOND_GAMUT_REMAP_MODE_CURRENT, mode_select);
+			MPCC_MCM_SECOND_GAMUT_REMAP_MODE_CURRENT, mode_select);
+		REG_GET(MPCC_MCM_SECOND_GAMUT_REMAP_COEF_FORMAT[mpcc_id],
+			MPCC_MCM_SECOND_GAMUT_REMAP_COEF_FORMAT, coef_format);
 
 		gamut_regs.shifts.csc_c11 = mpc401->mpc_shift->MPCC_MCM_SECOND_GAMUT_REMAP_C11_A;
 		gamut_regs.masks.csc_c11 = mpc401->mpc_mask->MPCC_MCM_SECOND_GAMUT_REMAP_C11_A;
@@ -549,8 +574,10 @@ void mpc401_get_gamut_remap(struct mpc *mpc,
 {
 	uint16_t arr_reg_val[12] = {0};
 	uint32_t mode_select = MPCC_GAMUT_REMAP_MODE_SELECT_0;
+	enum cm_gamut_coef_format coef_format = CM_GAMUT_REMAP_COEF_FORMAT_S2_13;
 
-	mpc_read_gamut_remap(mpc, mpcc_id, arr_reg_val, adjust->mpcc_gamut_remap_block_id, &mode_select);
+	mpc_read_gamut_remap(mpc, mpcc_id, arr_reg_val,
+			adjust->mpcc_gamut_remap_block_id, &mode_select, &coef_format);
 
 	if (mode_select == MPCC_GAMUT_REMAP_MODE_SELECT_0) {
 		adjust->gamut_adjust_type = GRAPHICS_GAMUT_ADJUST_TYPE_BYPASS;
@@ -558,8 +585,8 @@ void mpc401_get_gamut_remap(struct mpc *mpc,
 	}
 
 	adjust->gamut_adjust_type = GRAPHICS_GAMUT_ADJUST_TYPE_SW;
-	convert_hw_matrix(adjust->temperature_matrix,
-		arr_reg_val, ARRAY_SIZE(arr_reg_val));
+	convert_hw_matrix(adjust->temperature_matrix, arr_reg_val,
+			coef_format, ARRAY_SIZE(arr_reg_val));
 }
 
 void mpc401_get_lut_mode(struct mpc *mpc,
@@ -600,8 +627,24 @@ void mpc401_get_lut_mode(struct mpc *mpc,
 	}
 }
 
+static void mpc401_read_mpcc_state(
+		struct mpc *mpc,
+		int mpcc_inst,
+		struct mpcc_state *s)
+{
+	struct dcn401_mpc *mpc401 = TO_DCN401_MPC(mpc);
+
+	mpc1_read_mpcc_state(mpc, mpcc_inst, s);
+
+	REG_GET_2(MPCC_MCM_3DLUT_MODE[mpcc_inst],
+			MPCC_MCM_3DLUT_MODE_CURRENT, &s->lut3d_mode,
+			MPCC_MCM_3DLUT_SIZE, &s->lut3d_size);
+	REG_GET(MPCC_MCM_SHAPER_CONTROL[mpcc_inst],
+			MPCC_MCM_SHAPER_MODE_CURRENT, &s->shaper_lut_mode);
+}
+
 static const struct mpc_funcs dcn401_mpc_funcs = {
-	.read_mpcc_state = mpc1_read_mpcc_state,
+	.read_mpcc_state = mpc401_read_mpcc_state,
 	.insert_plane = mpc1_insert_plane,
 	.remove_mpcc = mpc1_remove_mpcc,
 	.mpc_init = mpc32_mpc_init,
@@ -653,6 +696,7 @@ void dcn401_mpc_construct(struct dcn401_mpc *mpc401,
 	int i;
 
 	mpc401->base.ctx = ctx;
+	mpc401->base.inst = 0;
 
 	mpc401->base.funcs = &dcn401_mpc_funcs;
 

@@ -302,6 +302,17 @@
 				 <&clks IMX6QDL_CLK_PCIE_REF_125M>;
 			clock-names = "pcie", "pcie_bus", "pcie_phy";
 			status = "disabled";
+
+			pcie_port0: pcie@0 {
+				compatible = "pciclass,0604";
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				bus-range = <0x01 0xff>;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+			};
 		};
 
 		aips1: bus@2000000 { /* AIPS1 */
@@ -913,11 +924,11 @@
 						#power-domain-cells = <0>;
 						power-supply = <&reg_pu>;
 						clocks = <&clks IMX6QDL_CLK_GPU3D_CORE>,
-						         <&clks IMX6QDL_CLK_GPU3D_SHADER>,
-						         <&clks IMX6QDL_CLK_GPU2D_CORE>,
-						         <&clks IMX6QDL_CLK_GPU2D_AXI>,
-						         <&clks IMX6QDL_CLK_OPENVG_AXI>,
-						         <&clks IMX6QDL_CLK_VPU_AXI>;
+							 <&clks IMX6QDL_CLK_GPU3D_SHADER>,
+							 <&clks IMX6QDL_CLK_GPU2D_CORE>,
+							 <&clks IMX6QDL_CLK_GPU2D_AXI>,
+							 <&clks IMX6QDL_CLK_OPENVG_AXI>,
+							 <&clks IMX6QDL_CLK_VPU_AXI>;
 					};
 				};
 			};

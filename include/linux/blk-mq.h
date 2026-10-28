@@ -428,7 +428,7 @@ struct blk_mq_hw_ctx {
 	struct blk_mq_tags	*sched_tags;
 
 	/** @numa_node: NUMA node the storage adapter has been connected to. */
-	unsigned int		numa_node;
+	int			numa_node;
 	/** @queue_num: Index of this hardware queue. */
 	unsigned int		queue_num;
 
@@ -525,8 +525,6 @@ enum hctx_type {
  *		   request_queue.tag_set_list.
  * @srcu:	   Use as lock when type of the request queue is blocking
  *		   (BLK_MQ_F_BLOCKING).
- * @tags_srcu:	   SRCU used to defer freeing of tags page_list to prevent
- *		   use-after-free when iterating tags.
  * @update_nr_hwq_lock:
  * 		   Synchronize updating nr_hw_queues with add/del disk &
  * 		   switching elevator.
@@ -551,7 +549,6 @@ struct blk_mq_tag_set {
 	struct mutex		tag_list_lock;
 	struct list_head	tag_list;
 	struct srcu_struct	*srcu;
-	struct srcu_struct	tags_srcu;
 
 	struct rw_semaphore	update_nr_hwq_lock;
 };
@@ -653,7 +650,7 @@ struct blk_mq_ops {
 	 * flush request.
 	 */
 	int (*init_request)(struct blk_mq_tag_set *set, struct request *,
-			    unsigned int, unsigned int);
+			    unsigned int, int);
 	/**
 	 * @exit_request: Ditto for exit/teardown.
 	 */
@@ -1017,6 +1014,13 @@ static inline void *blk_mq_rq_to_pdu(struct request *rq)
 	return rq + 1;
 }
 
+static inline bool blk_mq_rq_is_dmabuf(struct request *rq)
+{
+	if (!IS_ENABLED(CONFIG_DMA_SHARED_BUFFER))
+		return false;
+	return rq->bio && op_is_dmabuf(rq->bio->bi_opf);
+}
+
 static inline struct blk_mq_hw_ctx *queue_hctx(struct request_queue *q, int id)
 {
 	struct blk_mq_hw_ctx *hctx;
@@ -1104,6 +1108,7 @@ struct req_iterator {
 /*
  * blk_rq_pos()			: the current sector
  * blk_rq_bytes()		: bytes left in the entire request
+ * blk_rq_has_data()		: whether the request carries data
  * blk_rq_cur_bytes()		: bytes left in the current segment
  * blk_rq_sectors()		: sectors left in the entire request
  * blk_rq_cur_sectors()		: sectors left in the current segment
@@ -1117,6 +1122,14 @@ static inline sector_t blk_rq_pos(const struct request *rq)
 static inline unsigned int blk_rq_bytes(const struct request *rq)
 {
 	return rq->__data_len;
+}
+
+static inline bool blk_rq_has_data(const struct request *rq)
+{
+	return blk_rq_bytes(rq) &&
+	       req_op(rq) != REQ_OP_DISCARD &&
+	       req_op(rq) != REQ_OP_SECURE_ERASE &&
+	       req_op(rq) != REQ_OP_WRITE_ZEROES;
 }
 
 static inline int blk_rq_cur_bytes(const struct request *rq)
@@ -1243,4 +1256,44 @@ static inline int blk_rq_map_sg(struct request *rq, struct scatterlist *sglist)
 }
 void blk_dump_rq_flags(struct request *, char *);
 
+/**
+ * blk_rq_passthrough_stats - check if this request should account stats
+ * @rq: request to check
+ * @q: the queue accumulating the stats
+ *
+ * Note, @q does not necessarily need to be the request_queue that provides
+ * @rq.
+ *
+ * Return: true if stats should be accounted.
+ */
+static inline bool blk_rq_passthrough_stats(struct request *rq,
+					    struct request_queue *q)
+{
+	struct bio *bio = rq->bio;
+
+	if (!blk_queue_passthrough_stat(q))
+		return false;
+
+	/* Requests without a bio do not transfer data. */
+	if (!bio)
+		return false;
+
+	/*
+	 * Stats are accumulated in the bdev, so must have one attached to a
+	 * bio to track stats. Most drivers do not set the bdev for passthrough
+	 * requests, but nvme is one that will set it.
+	 */
+	if (!bio->bi_bdev)
+		return false;
+
+	/*
+	 * We don't know what a passthrough command does, but we know the
+	 * payload size and data direction. Ensuring the size is aligned to the
+	 * block size filters out most commands with payloads that don't
+	 * represent sector access.
+	 */
+	if (blk_rq_bytes(rq) & (bdev_logical_block_size(bio->bi_bdev) - 1))
+		return false;
+	return true;
+}
 #endif /* BLK_MQ_H */

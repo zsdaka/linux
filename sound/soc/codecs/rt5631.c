@@ -1626,11 +1626,21 @@ static int rt5631_probe(struct snd_soc_component *component)
 			SNDRV_PCM_FMTBIT_S24_LE | \
 			SNDRV_PCM_FMTBIT_S8)
 
+static const u64 rt5631_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF;
+
 static const struct snd_soc_dai_ops rt5631_ops = {
 	.hw_params = rt5631_hifi_pcm_params,
 	.set_fmt = rt5631_hifi_codec_set_dai_fmt,
 	.set_sysclk = rt5631_hifi_codec_set_dai_sysclk,
 	.set_pll = rt5631_codec_set_dai_pll,
+	.auto_selectable_formats = &rt5631_selectable_formats,
+	.num_auto_selectable_formats = 1,
 };
 
 static struct snd_soc_dai_driver rt5631_dai[] = {
@@ -1671,8 +1681,8 @@ static const struct snd_soc_component_driver soc_component_dev_rt5631 = {
 };
 
 static const struct i2c_device_id rt5631_i2c_id[] = {
-	{ "rt5631" },
-	{ "alc5631" },
+	{ .name = "rt5631" },
+	{ .name = "alc5631" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, rt5631_i2c_id);
@@ -1722,16 +1732,12 @@ static int rt5631_i2c_probe(struct i2c_client *i2c)
 	return ret;
 }
 
-static void rt5631_i2c_remove(struct i2c_client *client)
-{}
-
 static struct i2c_driver rt5631_i2c_driver = {
 	.driver = {
 		.name = "rt5631",
 		.of_match_table = of_match_ptr(rt5631_i2c_dt_ids),
 	},
-	.probe    = rt5631_i2c_probe,
-	.remove   = rt5631_i2c_remove,
+	.probe = rt5631_i2c_probe,
 	.id_table = rt5631_i2c_id,
 };
 

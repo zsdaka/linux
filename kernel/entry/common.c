@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 
-#include <linux/irq-entry-common.h>
-#include <linux/resume_user_mode.h>
+#include <linux/futex.h>
 #include <linux/highmem.h>
+#include <linux/irq-entry-common.h>
 #include <linux/jump_label.h>
 #include <linux/kmsan.h>
 #include <linux/livepatch.h>
+#include <linux/resume_user_mode.h>
 #include <linux/tick.h>
 
 /* Workaround to allow gradual conversion of architecture code */
@@ -60,8 +61,10 @@ static __always_inline unsigned long __exit_to_user_mode_loop(struct pt_regs *re
 		if (ti_work & _TIF_PATCH_PENDING)
 			klp_update_patch_state(current);
 
-		if (ti_work & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+		if (ti_work & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL)) {
+			futex_fixup_robust_unlock(regs);
 			arch_do_signal_or_restart(regs);
+		}
 
 		if (ti_work & _TIF_NOTIFY_RESUME)
 			resume_user_mode_work(regs);
@@ -120,7 +123,7 @@ noinstr irqentry_state_t irqentry_enter(struct pt_regs *regs)
 /**
  * arch_irqentry_exit_need_resched - Architecture specific need resched function
  *
- * Invoked from raw_irqentry_exit_cond_resched() to check if resched is needed.
+ * Invoked from irqentry_exit_cond_resched() to check if resched is needed.
  * Defaults return true.
  *
  * The main purpose is to permit arch to avoid preemption of a task from an IRQ.
@@ -131,7 +134,7 @@ static inline bool arch_irqentry_exit_need_resched(void);
 static inline bool arch_irqentry_exit_need_resched(void) { return true; }
 #endif
 
-void raw_irqentry_exit_cond_resched(void)
+void irqentry_exit_cond_resched(void)
 {
 	if (!preempt_count()) {
 		/* Sanity check RCU and thread stack */
@@ -142,19 +145,6 @@ void raw_irqentry_exit_cond_resched(void)
 			preempt_schedule_irq();
 	}
 }
-#ifdef CONFIG_PREEMPT_DYNAMIC
-#if defined(CONFIG_HAVE_PREEMPT_DYNAMIC_CALL)
-DEFINE_STATIC_CALL(irqentry_exit_cond_resched, raw_irqentry_exit_cond_resched);
-#elif defined(CONFIG_HAVE_PREEMPT_DYNAMIC_KEY)
-DEFINE_STATIC_KEY_TRUE(sk_dynamic_irqentry_exit_cond_resched);
-void dynamic_irqentry_exit_cond_resched(void)
-{
-	if (!static_branch_unlikely(&sk_dynamic_irqentry_exit_cond_resched))
-		return;
-	raw_irqentry_exit_cond_resched();
-}
-#endif
-#endif
 
 noinstr void irqentry_exit(struct pt_regs *regs, irqentry_state_t state)
 {

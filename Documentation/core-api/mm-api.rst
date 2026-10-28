@@ -52,6 +52,15 @@ Virtually Contiguous Mappings
 .. kernel-doc:: mm/vmalloc.c
    :export:
 
+Kernel Page Table Permissions
+=============================
+
+.. kernel-doc:: include/linux/set_memory.h
+   :doc: Kernel page table permissions
+
+.. kernel-doc:: include/linux/set_memory.h
+   :internal:
+
 File Mapping and Page Cache
 ===========================
 
@@ -73,6 +82,7 @@ Readahead
 Writeback
 ---------
 
+.. kernel-doc:: include/linux/writeback.h
 .. kernel-doc:: mm/page-writeback.c
    :export:
 
@@ -117,7 +127,7 @@ More Memory Management Functions
 .. #kernel-doc:: mm/hmm.c (build warnings)
 .. kernel-doc:: mm/memremap.c
 .. kernel-doc:: mm/hugetlb.c
-.. kernel-doc:: mm/swap.c
+.. kernel-doc:: mm/folio.c
 .. kernel-doc:: mm/memcontrol.c
 .. #kernel-doc:: mm/memory-tiers.c (build warnings)
 .. kernel-doc:: mm/shmem.c

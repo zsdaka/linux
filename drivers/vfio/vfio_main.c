@@ -321,6 +321,24 @@ out_inode:
 	return ret;
 }
 
+static int vfio_device_set_noiommu_and_name(struct vfio_device *device, enum vfio_group_type type)
+{
+	if (IS_ENABLED(CONFIG_IOMMUFD_NOIOMMU) && vfio_noiommu &&
+	    !device->dev->iommu && type == VFIO_IOMMU)
+		device->noiommu = true;
+
+	/*
+	 * device->noiommu records no-IOMMU support for the standalone cdev
+	 * interface. VFIO_NOIOMMU enables both group and cdev no-IOMMU; when
+	 * cdev no-IOMMU is available, device->noiommu is set before
+	 * vfio_device_set_group(), so the cdev is named noiommu-vfio%d up
+	 * front. If IOMMUFD_NOIOMMU is unavailable, no-IOMMU devices are
+	 * limited to the group interface and do not receive a device cdev.
+	 */
+	return dev_set_name(&device->device, "%svfio%d",
+		     device->noiommu ? "noiommu-" : "", device->index);
+}
+
 static int __vfio_register_dev(struct vfio_device *device,
 			       enum vfio_group_type type)
 {
@@ -340,13 +358,19 @@ static int __vfio_register_dev(struct vfio_device *device,
 	if (!device->dev_set)
 		vfio_assign_device_set(device, device);
 
-	ret = dev_set_name(&device->device, "vfio%d", device->index);
+	ret = vfio_device_set_noiommu_and_name(device, type);
 	if (ret)
 		return ret;
 
 	ret = vfio_device_set_group(device, type);
 	if (ret)
 		return ret;
+
+	if (vfio_device_is_noiommu(device) && IS_ENABLED(CONFIG_IOMMUFD_NOIOMMU)) {
+		add_taint(TAINT_USER, LOCKDEP_STILL_OK);
+		dev_warn(device->dev,
+			 "Adding kernel taint for vfio-noiommu cdev\n");
+	}
 
 	/*
 	 * VFIO always sets IOMMU_CACHE because we offer no way for userspace to
@@ -407,6 +431,13 @@ void vfio_unregister_group_dev(struct vfio_device *device)
 	vfio_device_group_unregister(device);
 
 	/*
+	 * Remove debugfs before device_del(), which releases devres.  Some
+	 * debugfs entries are created with debugfs_create_devm_seqfile() and
+	 * therefore rely on devres-managed inode private data.
+	 */
+	vfio_device_debugfs_exit(device);
+
+	/*
 	 * Balances vfio_device_add() in register path, also prevents
 	 * new device opened by userspace in the cdev path.
 	 */
@@ -435,43 +466,20 @@ void vfio_unregister_group_dev(struct vfio_device *device)
 		}
 	}
 
-	vfio_device_debugfs_exit(device);
 	/* Balances vfio_device_set_group in register path */
 	vfio_device_remove_group(device);
 }
 EXPORT_SYMBOL_GPL(vfio_unregister_group_dev);
 
 #if IS_ENABLED(CONFIG_KVM)
-void vfio_device_get_kvm_safe(struct vfio_device *device, struct kvm *kvm)
+void vfio_device_get_kvm(struct vfio_device *device, struct file *kvm)
 {
-	void (*pfn)(struct kvm *kvm);
-	bool (*fn)(struct kvm *kvm);
-	bool ret;
-
 	lockdep_assert_held(&device->dev_set->lock);
 
 	if (!kvm)
 		return;
 
-	pfn = symbol_get(kvm_put_kvm);
-	if (WARN_ON(!pfn))
-		return;
-
-	fn = symbol_get(kvm_get_kvm_safe);
-	if (WARN_ON(!fn)) {
-		symbol_put(kvm_put_kvm);
-		return;
-	}
-
-	ret = fn(kvm);
-	symbol_put(kvm_get_kvm_safe);
-	if (!ret) {
-		symbol_put(kvm_put_kvm);
-		return;
-	}
-
-	device->put_kvm = pfn;
-	device->kvm = kvm;
+	device->kvm = get_file(kvm);
 }
 
 void vfio_device_put_kvm(struct vfio_device *device)
@@ -481,14 +489,7 @@ void vfio_device_put_kvm(struct vfio_device *device)
 	if (!device->kvm)
 		return;
 
-	if (WARN_ON(!device->put_kvm))
-		goto clear;
-
-	device->put_kvm(device->kvm);
-	device->put_kvm = NULL;
-	symbol_put(kvm_put_kvm);
-
-clear:
+	fput(device->kvm);
 	device->kvm = NULL;
 }
 #endif
@@ -572,13 +573,6 @@ int vfio_df_open(struct vfio_device_file *df)
 	int ret = 0;
 
 	lockdep_assert_held(&device->dev_set->lock);
-
-	/*
-	 * Only the group path allows the device to be opened multiple
-	 * times.  The device cdev path doesn't have a secure way for it.
-	 */
-	if (device->open_count != 0 && !df->group)
-		return -EINVAL;
 
 	device->open_count++;
 	if (device->open_count == 1) {
@@ -858,7 +852,8 @@ int vfio_mig_get_next_state(struct vfio_device *device,
 	 * logical state, as per the above comment.
 	 */
 	*next_fsm = vfio_from_fsm_table[cur_fsm][new_fsm];
-	while ((state_flags_table[*next_fsm] & device->migration_flags) !=
+	while (*next_fsm != VFIO_DEVICE_STATE_ERROR &&
+	       (state_flags_table[*next_fsm] & device->migration_flags) !=
 			state_flags_table[*next_fsm])
 		*next_fsm = vfio_from_fsm_table[*next_fsm][new_fsm];
 
@@ -1513,9 +1508,13 @@ bool vfio_file_enforced_coherent(struct file *file)
 }
 EXPORT_SYMBOL_GPL(vfio_file_enforced_coherent);
 
-static void vfio_device_file_set_kvm(struct file *file, struct kvm *kvm)
+static void vfio_device_file_set_kvm(struct file *file, struct file *kvm)
 {
 	struct vfio_device_file *df = file->private_data;
+	struct file *old;
+
+	if (kvm)
+		get_file(kvm);
 
 	/*
 	 * The kvm is first recorded in the vfio_device_file, and will
@@ -1523,28 +1522,32 @@ static void vfio_device_file_set_kvm(struct file *file, struct kvm *kvm)
 	 * iommufd successfully in the vfio device cdev path.
 	 */
 	spin_lock(&df->kvm_ref_lock);
+	old = df->kvm;
 	df->kvm = kvm;
 	spin_unlock(&df->kvm_ref_lock);
+
+	if (old)
+		fput(old);
 }
 
 /**
  * vfio_file_set_kvm - Link a kvm with VFIO drivers
- * @file: VFIO group file or VFIO device file
- * @kvm: KVM to link
+ * @vfio_file: VFIO group file or VFIO device file
+ * @kvm: KVM file to link
  *
  * When a VFIO device is first opened the KVM will be available in
  * device->kvm if one was associated with the file.
  */
-void vfio_file_set_kvm(struct file *file, struct kvm *kvm)
+void vfio_file_set_kvm(struct file *vfio_file, struct file *kvm)
 {
 	struct vfio_group *group;
 
-	group = vfio_group_from_file(file);
+	group = vfio_group_from_file(vfio_file);
 	if (group)
 		vfio_group_set_kvm(group, kvm);
 
-	if (vfio_device_from_file(file))
-		vfio_device_file_set_kvm(file, kvm);
+	if (vfio_device_from_file(vfio_file))
+		vfio_device_file_set_kvm(vfio_file, kvm);
 }
 EXPORT_SYMBOL_GPL(vfio_file_set_kvm);
 

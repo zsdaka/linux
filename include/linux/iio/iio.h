@@ -177,8 +177,31 @@ struct iio_event_spec {
 };
 
 /**
+ * define IIO_SCAN_FORMAT_SIGNED_INT - signed integer data format
+ *
+ * &iio_scan_type.format value for signed integers (two's complement).
+ */
+#define IIO_SCAN_FORMAT_SIGNED_INT	's'
+
+/**
+ * define IIO_SCAN_FORMAT_UNSIGNED_INT - unsigned integer data format
+ *
+ * &iio_scan_type.format value for unsigned integers.
+ */
+#define IIO_SCAN_FORMAT_UNSIGNED_INT	'u'
+
+/**
+ * define IIO_SCAN_FORMAT_FLOAT - floating-point data format
+ *
+ * &iio_scan_type.format value for IEEE 754 floating-point numbers.
+ */
+#define IIO_SCAN_FORMAT_FLOAT		'f'
+
+/**
  * struct iio_scan_type - specification for channel data format in buffer
- * @sign:		's' or 'u' to specify signed or unsigned
+ * @sign:		Deprecated, use @format instead.
+ * @format:		Data format, can have any of the IIO_SCAN_FORMAT_*
+ *			values.
  * @realbits:		Number of valid bits of data
  * @storagebits:	Realbits + padding
  * @shift:		Shift right by this before masking out realbits.
@@ -189,7 +212,10 @@ struct iio_event_spec {
  * @endianness:		little or big endian
  */
 struct iio_scan_type {
-	char	sign;
+	union {
+		char sign;
+		char format;
+	};
 	u8	realbits;
 	u8	storagebits;
 	u8	shift;
@@ -238,6 +264,10 @@ struct iio_scan_type {
  * @ext_info:		Array of extended info attributes for this channel.
  *			The array is NULL terminated, the last element should
  *			have its name field set to NULL.
+ * @parent:		Optional pointer to the parent channel spec for
+ *			hierarchical channel relationships. When set, a read-only
+ *			"parent" sysfs attribute is created containing the
+ *			parent channel's sysfs name prefix (e.g. "in_voltage0").
  * @extend_name:	Allows labeling of channel attributes with an
  *			informative name. Note this has no effect codes etc,
  *			unlike modifiers.
@@ -283,6 +313,7 @@ struct iio_chan_spec {
 	const struct iio_event_spec *event_spec;
 	unsigned int		num_event_specs;
 	const struct iio_chan_spec_ext_info *ext_info;
+	const struct iio_chan_spec *parent;
 	const char		*extend_name;
 	const char		*datasheet_name;
 	unsigned int		modified:1;
@@ -327,15 +358,15 @@ static inline bool iio_channel_has_available(const struct iio_chan_spec *chan,
 		(chan->info_mask_shared_by_all_available & BIT(type));
 }
 
-#define IIO_CHAN_SOFT_TIMESTAMP(_si) {					\
+#define IIO_CHAN_SOFT_TIMESTAMP(_si) (struct iio_chan_spec) {		\
 	.type = IIO_TIMESTAMP,						\
 	.channel = -1,							\
 	.scan_index = _si,						\
 	.scan_type = {							\
 		.sign = 's',						\
-		.realbits = 64,					\
+		.realbits = 64,						\
 		.storagebits = 64,					\
-		},							\
+	},								\
 }
 
 s64 iio_get_time_ns(const struct iio_dev *indio_dev);
@@ -458,6 +489,10 @@ struct iio_trigger; /* forward declaration */
  * @update_scan_mode:	function to configure device and scan buffer when
  *			channels have changed
  * @debugfs_reg_access:	function to read or write register value of device
+ * @debugfs_reg64_access: function to read or write 64-bit register value of
+ *			device. debugfs_reg_access() and debugfs_reg64_access()
+ *			are mutually exclusive, but the 64-bit variant has
+ *			precedence in case both are implemented.
  * @fwnode_xlate:	fwnode based function pointer to obtain channel specifier index.
  * @hwfifo_set_watermark: function pointer to set the current hardware
  *			fifo watermark level; see hwfifo_* entries in
@@ -546,6 +581,9 @@ struct iio_info {
 	int (*debugfs_reg_access)(struct iio_dev *indio_dev,
 				  unsigned int reg, unsigned int writeval,
 				  unsigned int *readval);
+	int (*debugfs_reg64_access)(struct iio_dev *indio_dev,
+				    unsigned int reg, u64 writeval,
+				    u64 *readval);
 	int (*fwnode_xlate)(struct iio_dev *indio_dev,
 			    const struct fwnode_reference_args *iiospec);
 	int (*hwfifo_set_watermark)(struct iio_dev *indio_dev, unsigned int val);
@@ -584,6 +622,8 @@ struct iio_buffer_setup_ops {
  *			and owner
  * @buffer:		[DRIVER] any buffer present
  * @scan_bytes:		[INTERN] num bytes captured to be fed to buffer demux
+ * @scan_timestamp_offset: [INTERN] cache of the offset (in bytes) for the
+ *			   timestamp in the scan buffer
  * @available_scan_masks: [DRIVER] optional array of allowed bitmasks. Sort the
  *			   array in order of preference, the most preferred
  *			   masks first.
@@ -610,6 +650,7 @@ struct iio_dev {
 
 	struct iio_buffer		*buffer;
 	int				scan_bytes;
+	unsigned int			__private scan_timestamp_offset;
 
 	const unsigned long		*available_scan_masks;
 	unsigned int			__private masklength;
@@ -619,7 +660,7 @@ struct iio_dev {
 	struct iio_poll_func		*pollfunc;
 	struct iio_poll_func		*pollfunc_event;
 
-	struct iio_chan_spec const	*channels;
+	struct iio_chan_spec const	*channels __counted_by_ptr(num_channels);
 	int				num_channels;
 
 	const char			*name;
@@ -760,7 +801,7 @@ DEFINE_GUARD_COND(__priv__iio_dev_mode_lock, _try_direct,
  *
  * Tries to acquire the direct mode lock with cleanup ACQUIRE() semantics and
  * automatically releases it at the end of the scope. It most be always paired
- * with IIO_DEV_ACQUIRE_ERR(), for example (notice the scope braces)::
+ * with IIO_DEV_ACQUIRE_FAILED(), for example (notice the scope braces)::
  *
  *	switch() {
  *	case IIO_CHAN_INFO_RAW: {
@@ -1052,6 +1093,15 @@ static inline const struct iio_scan_type
 static inline unsigned int iio_get_masklength(const struct iio_dev *indio_dev)
 {
 	return ACCESS_PRIVATE(indio_dev, masklength);
+}
+
+/**
+ * iio_scan_timestamp_enabled - Is the timestamp channel in the current scan
+ * @indio_dev: the IIO device to check
+ */
+static inline bool iio_scan_timestamp_enabled(const struct iio_dev *indio_dev)
+{
+	return ACCESS_PRIVATE(indio_dev, scan_timestamp);
 }
 
 int iio_active_scan_mask_index(struct iio_dev *indio_dev);

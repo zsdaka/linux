@@ -1015,7 +1015,7 @@ static void mmc_set_bus_speed(struct mmc_card *card)
 }
 
 /*
- * Select the bus width amoung 4-bit and 8-bit(SDR).
+ * Select the bus width among 4-bit and 8-bit(SDR).
  * If the bus width is changed successfully, return the selected width value.
  * Zero is returned instead of error value if the wide width is not supported.
  */
@@ -1371,7 +1371,9 @@ static void mmc_select_driver_type(struct mmc_card *card)
 
 	card->drive_strength = drive_strength;
 
-	if (drv_type)
+	if (fixed_drv_type >= 0 && drive_strength)
+		mmc_set_driver_type(card->host, drive_strength);
+	else if (drv_type)
 		mmc_set_driver_type(card->host, drv_type);
 }
 

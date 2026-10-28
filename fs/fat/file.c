@@ -17,6 +17,7 @@
 #include <linux/fsnotify.h>
 #include <linux/security.h>
 #include <linux/falloc.h>
+#include <linux/fileattr.h>
 #include "fat.h"
 
 static long fat_fallocate(struct file *file, int mode,
@@ -189,8 +190,7 @@ int fat_file_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
 	struct inode *fat_inode = MSDOS_SB(inode->i_sb)->fat_inode;
 	int err;
 
-	err = mmb_fsync_noflush(filp, &MSDOS_I(inode)->i_metadata_bhs,
-				start, end, datasync);
+	err = simple_fsync_noflush(filp, start, end, datasync);
 	if (err)
 		return err;
 
@@ -290,12 +290,10 @@ static long fat_fallocate(struct file *file, int mode,
 		nr_cluster = (mm_bytes + (sbi->cluster_size - 1)) >>
 			sbi->cluster_bits;
 
-		/* Start the allocation.We are not zeroing out the clusters */
-		while (nr_cluster-- > 0) {
-			err = fat_add_cluster(inode);
-			if (err)
-				goto error;
-		}
+		/* Allocate the clusters. We are not zeroing them out */
+		err = fat_add_clusters(inode, nr_cluster);
+		if (err)
+			goto error;
 	} else {
 		if ((offset + len) <= i_size_read(inode))
 			goto error;
@@ -331,15 +329,15 @@ static int fat_free(struct inode *inode, int skip)
 	}
 	MSDOS_I(inode)->i_attrs |= ATTR_ARCH;
 	fat_truncate_time(inode, NULL, FAT_UPDATE_CMTIME);
+	mark_inode_dirty(inode);
 	if (wait) {
-		err = fat_sync_inode(inode);
+		err = sync_inode_metadata(inode, 1);
 		if (err) {
 			MSDOS_I(inode)->i_start = i_start;
 			MSDOS_I(inode)->i_logstart = i_logstart;
 			return err;
 		}
-	} else
-		mark_inode_dirty(inode);
+	}
 
 	/* Write a new EOF, and get the remaining cluster chain for freeing. */
 	if (skip) {
@@ -363,7 +361,8 @@ static int fat_free(struct inode *inode, int skip)
 				     __func__, MSDOS_I(inode)->i_pos);
 			ret = -EIO;
 		} else if (ret > 0) {
-			err = fat_ent_write(inode, &fatent, FAT_ENT_EOF, wait);
+			err = fat_ent_write(inode, &fatent, FAT_ENT_EOF, ret,
+					    wait);
 			if (err)
 				ret = err;
 		}
@@ -398,7 +397,41 @@ void fat_truncate_blocks(struct inode *inode, loff_t offset)
 	fat_flush_inodes(inode->i_sb, inode, NULL);
 }
 
-int fat_getattr(struct mnt_idmap *idmap, const struct path *path,
+int fat_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+{
+	struct msdos_sb_info *sbi = MSDOS_SB(dentry->d_sb);
+	bool case_sensitive;
+
+	/*
+	 * FAT filesystems are case-insensitive by default. VFAT
+	 * becomes case-sensitive when mounted with 'check=strict',
+	 * which installs vfat_dentry_ops. MSDOS has no such option;
+	 * its 'nocase' mount option selects case-sensitive matching.
+	 *
+	 * VFAT long filename entries preserve case. Without VFAT, only
+	 * uppercased 8.3 short names are stored. MSDOS with 'nocase'
+	 * also preserves case.
+	 */
+	if (sbi->options.isvfat)
+		case_sensitive = sbi->options.name_check == 's';
+	else
+		case_sensitive = sbi->options.nocase;
+
+	if (!case_sensitive) {
+		fa->fsx_xflags |= FS_XFLAG_CASEFOLD;
+		fa->flags |= FS_CASEFOLD_FL;
+		if (!sbi->options.isvfat)
+			fa->fsx_xflags |= FS_XFLAG_CASENONPRESERVING;
+	}
+	if (d_inode(dentry)->i_flags & S_IMMUTABLE) {
+		fa->fsx_xflags |= FS_XFLAG_IMMUTABLE;
+		fa->flags |= FS_IMMUTABLE_FL;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(fat_fileattr_get);
+
+int fat_getattr(const struct mnt_idmap *idmap, const struct path *path,
 		struct kstat *stat, u32 request_mask, unsigned int flags)
 {
 	struct inode *inode = d_inode(path->dentry);
@@ -459,7 +492,7 @@ static int fat_sanitize_mode(const struct msdos_sb_info *sbi,
 	return 0;
 }
 
-static int fat_allow_set_time(struct mnt_idmap *idmap,
+static int fat_allow_set_time(const struct mnt_idmap *idmap,
 			      struct msdos_sb_info *sbi, struct inode *inode)
 {
 	umode_t allow_utime = sbi->options.allow_utime;
@@ -480,7 +513,7 @@ static int fat_allow_set_time(struct mnt_idmap *idmap,
 /* valid file mode bits */
 #define FAT_VALID_MODE	(S_IFREG | S_IFDIR | S_IRWXUGO)
 
-int fat_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+int fat_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 		struct iattr *attr)
 {
 	struct msdos_sb_info *sbi = MSDOS_SB(dentry->d_sb);
@@ -575,5 +608,6 @@ EXPORT_SYMBOL_GPL(fat_setattr);
 const struct inode_operations fat_file_inode_operations = {
 	.setattr	= fat_setattr,
 	.getattr	= fat_getattr,
+	.fileattr_get	= fat_fileattr_get,
 	.update_time	= fat_update_time,
 };

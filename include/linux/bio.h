@@ -80,7 +80,8 @@ static inline bool bio_no_advance_iter(const struct bio *bio)
 {
 	return bio_op(bio) == REQ_OP_DISCARD ||
 	       bio_op(bio) == REQ_OP_SECURE_ERASE ||
-	       bio_op(bio) == REQ_OP_WRITE_ZEROES;
+	       bio_op(bio) == REQ_OP_WRITE_ZEROES ||
+	       op_is_dmabuf(bio->bi_opf);
 }
 
 static inline void *bio_data(struct bio *bio)
@@ -113,11 +114,13 @@ static inline void bio_advance_iter(const struct bio *bio,
 {
 	iter->bi_sector += bytes >> 9;
 
-	if (bio_no_advance_iter(bio))
+	if (bio_no_advance_iter(bio)) {
 		iter->bi_size -= bytes;
-	else
+		iter->bi_offset += bytes;
+	} else {
 		bvec_iter_advance(bio->bi_io_vec, iter, bytes);
 		/* TODO: It is reasonable to complete bio with error here. */
+	}
 }
 
 /* @bytes should be less or equal to bvec[i->bi_idx].bv_len */
@@ -127,10 +130,12 @@ static inline void bio_advance_iter_single(const struct bio *bio,
 {
 	iter->bi_sector += bytes >> 9;
 
-	if (bio_no_advance_iter(bio))
+	if (bio_no_advance_iter(bio)) {
 		iter->bi_size -= bytes;
-	else
+		iter->bi_offset += bytes;
+	} else {
 		bvec_iter_advance_single(bio->bi_io_vec, iter, bytes);
+	}
 }
 
 void __bio_advance(struct bio *, unsigned bytes);
@@ -283,7 +288,7 @@ static inline void bio_first_folio(struct folio_iter *fi, struct bio *bio,
 		return;
 	}
 
-	fi->folio = page_folio(bvec->bv_page);
+	fi->folio = bvec_folio(bvec);
 	fi->offset = bvec->bv_offset +
 			PAGE_SIZE * folio_page_idx(fi->folio, bvec->bv_page);
 	fi->_seg_count = bvec->bv_len;
@@ -347,7 +352,6 @@ enum {
 };
 extern int bioset_init(struct bio_set *, unsigned int, unsigned int, int flags);
 extern void bioset_exit(struct bio_set *);
-extern int biovec_init_pool(mempool_t *pool, int pool_entries);
 
 struct bio *bio_alloc_bioset(struct block_device *bdev, unsigned short nr_vecs,
 			     blk_opf_t opf, gfp_t gfp, struct bio_set *bs);
@@ -369,29 +373,78 @@ static inline struct bio *bio_alloc(struct block_device *bdev,
 
 void submit_bio(struct bio *bio);
 
+/**
+ * bio_in_atomic - check if the current context is unsafe for bio completion
+ *
+ * Return: %true in atomic contexts (e.g. hard/soft IRQ, preempt-disabled);
+ * %false when a bio can be safely completed in the current context.
+ */
+static inline bool bio_in_atomic(void)
+{
+	if (IS_ENABLED(CONFIG_PREEMPTION) && rcu_preempt_depth())
+		return true;
+	if (!IS_ENABLED(CONFIG_PREEMPT_COUNT))
+		return true;
+	return !preemptible();
+}
+
+void __bio_complete_in_task(struct bio *bio);
+
+/**
+ * bio_complete_in_task - ensure a bio is completed in preemptible task context
+ * @bio: bio to complete
+ *
+ * If called from non-task context, offload the bio completion to a worker
+ * thread and return %true. Else return %false and do nothing.
+ *
+ * Uses BIO_COMPLETE_IN_TASK as a sentinel: if set, the bio was already
+ * deferred and we are running in the worker — return %false so the
+ * callback proceeds instead of re-deferring.
+ */
+static inline bool bio_complete_in_task(struct bio *bio)
+{
+	if (bio_flagged(bio, BIO_COMPLETE_IN_TASK))
+		return false;
+	if (!bio_in_atomic())
+		return false;
+	bio_set_flag(bio, BIO_COMPLETE_IN_TASK);
+	__bio_complete_in_task(bio);
+	return true;
+}
+
 extern void bio_endio(struct bio *);
+
+/**
+ * bio_endio_status - end I/O on a bio with a specific status
+ * @bio:	bio
+ * @status:	status to set
+ *
+ * Set @bio->bi_status to @status and call bio_endio().
+ **/
+static inline void bio_endio_status(struct bio *bio, blk_status_t status)
+{
+	bio->bi_status = status;
+	bio_endio(bio);
+}
 
 static inline void bio_io_error(struct bio *bio)
 {
-	bio->bi_status = BLK_STS_IOERR;
-	bio_endio(bio);
+	bio_endio_status(bio, BLK_STS_IOERR);
 }
 
 static inline void bio_wouldblock_error(struct bio *bio)
 {
-	bio_set_flag(bio, BIO_QUIET);
-	bio->bi_status = BLK_STS_AGAIN;
-	bio_endio(bio);
+	bio_endio_status(bio, BLK_STS_AGAIN);
 }
 
 /*
  * Calculate number of bvec segments that should be allocated to fit data
- * pointed by @iter. If @iter is backed by bvec it's going to be reused
- * instead of allocating a new one.
+ * pointed by @iter. If @iter is backed by a bvec or a dmabuf, the bvec array /
+ * the dma map are going to be reused, and so no extra allocation is required.
  */
 static inline int bio_iov_vecs_to_alloc(struct iov_iter *iter, int max_segs)
 {
-	if (iov_iter_is_bvec(iter))
+	if (iov_iter_is_bvec(iter) || iov_iter_is_dmabuf_map(iter))
 		return 0;
 	return iov_iter_npages(iter, max_segs);
 }
@@ -431,6 +484,7 @@ static inline void bio_init_inline(struct bio *bio, struct block_device *bdev,
 extern void bio_uninit(struct bio *);
 void bio_reset(struct bio *bio, struct block_device *bdev, blk_opf_t opf);
 void bio_reuse(struct bio *bio, blk_opf_t opf);
+void bio_prepare_reissue(struct bio *bio, struct block_device *bdev);
 void bio_chain(struct bio *, struct bio *);
 void bio_await(struct bio *bio, void *priv,
 	       void (*submit)(struct bio *bio, void *priv));
@@ -468,28 +522,23 @@ int bdev_rw_virt(struct block_device *bdev, sector_t sector, void *data,
 		size_t len, enum req_op op);
 
 int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter,
+		unsigned maxlen, unsigned mem_align_mask,
 		unsigned len_align_mask);
 
-void bio_iov_bvec_set(struct bio *bio, const struct iov_iter *iter);
+bool bio_iov_iter_set(struct bio *bio, const struct iov_iter *iter);
 void __bio_release_pages(struct bio *bio, bool mark_dirty);
 extern void bio_set_pages_dirty(struct bio *bio);
 extern void bio_check_pages_dirty(struct bio *bio);
 
-int bio_iov_iter_bounce(struct bio *bio, struct iov_iter *iter, size_t maxlen,
-		size_t minsize);
-void bio_iov_iter_unbounce(struct bio *bio, bool is_error, bool mark_dirty);
+int bio_alloc_bounce_folios(struct bio *bio, size_t total_len, size_t minsize);
+void bio_free_folios(struct bio *bio);
+int bio_iov_iter_bounce_write(struct bio *bio, struct iov_iter *iter,
+		size_t maxlen, size_t minsize);
 
-extern void bio_copy_data_iter(struct bio *dst, struct bvec_iter *dst_iter,
-			       struct bio *src, struct bvec_iter *src_iter);
 extern void bio_copy_data(struct bio *dst, struct bio *src);
 extern void bio_free_pages(struct bio *bio);
+void zero_fill_bio(struct bio *bio);
 void guard_bio_eod(struct bio *bio);
-void zero_fill_bio_iter(struct bio *bio, struct bvec_iter iter);
-
-static inline void zero_fill_bio(struct bio *bio)
-{
-	zero_fill_bio_iter(bio, bio->bi_iter);
-}
 
 static inline void bio_release_pages(struct bio *bio, bool mark_dirty)
 {
@@ -701,20 +750,6 @@ struct bio_set {
 static inline bool bioset_initialized(struct bio_set *bs)
 {
 	return bs->bio_slab != NULL;
-}
-
-/*
- * Mark a bio as polled. Note that for async polled IO, the caller must
- * expect -EWOULDBLOCK if we cannot allocate a request (or other resources).
- * We cannot block waiting for requests on polled IO, as those completions
- * must be found by the caller. This is different than IRQ driven IO, where
- * it's safe to wait for IO to complete.
- */
-static inline void bio_set_polled(struct bio *bio, struct kiocb *kiocb)
-{
-	bio->bi_opf |= REQ_POLLED;
-	if (kiocb->ki_flags & IOCB_NOWAIT)
-		bio->bi_opf |= REQ_NOWAIT;
 }
 
 static inline void bio_clear_polled(struct bio *bio)

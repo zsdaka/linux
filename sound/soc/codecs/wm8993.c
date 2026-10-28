@@ -1441,6 +1441,22 @@ static irqreturn_t wm8993_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static const u64 wm8993_selectable_formats[] = {
+	/* 1st priority */
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_RIGHT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_IF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_IF,
+	/* 2nd priority */
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF,
+};
+
 static const struct snd_soc_dai_ops wm8993_ops = {
 	.set_sysclk = wm8993_set_sysclk,
 	.set_fmt = wm8993_set_dai_fmt,
@@ -1449,6 +1465,8 @@ static const struct snd_soc_dai_ops wm8993_ops = {
 	.set_pll = wm8993_set_fll,
 	.set_tdm_slot = wm8993_set_tdm_slot,
 	.no_capture_mute = 1,
+	.auto_selectable_formats = wm8993_selectable_formats,
+	.num_auto_selectable_formats = ARRAY_SIZE(wm8993_selectable_formats),
 };
 
 #define WM8993_RATES SNDRV_PCM_RATE_8000_48000
@@ -1735,7 +1753,7 @@ static void wm8993_i2c_remove(struct i2c_client *i2c)
 }
 
 static const struct i2c_device_id wm8993_i2c_id[] = {
-	{ "wm8993" },
+	{ .name = "wm8993" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, wm8993_i2c_id);

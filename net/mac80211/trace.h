@@ -44,7 +44,9 @@
 			__field(u32, n##center_freq1)					\
 			__field(u32, n##freq1_offset)					\
 			__field(u32, n##center_freq2)					\
-			__field(u16, n##punctured)
+			__field(u16, n##punctured)					\
+			__field(u32, n##npca_pri_freq)					\
+			__field(u16, n##npca_punctured)
 #define __CHANDEF_ASSIGN(n, c)								\
 			__entry->n##control_freq = (c) && (c)->chan ?			\
 				(c)->chan->center_freq : 0;				\
@@ -54,14 +56,18 @@
 			__entry->n##center_freq1 = (c) ? (c)->center_freq1 : 0;		\
 			__entry->n##freq1_offset = (c) ? (c)->freq1_offset : 0;		\
 			__entry->n##center_freq2 = (c) ? (c)->center_freq2 : 0;		\
-			__entry->n##punctured = (c) ? (c)->punctured : 0;
+			__entry->n##punctured = (c) ? (c)->punctured : 0;		\
+			__entry->n##npca_pri_freq = (c) && (c)->npca_chan ?		\
+				(c)->npca_chan->center_freq : 0;			\
+			__entry->n##npca_punctured = (c) ? (c)->npca_punctured : 0;
 #define __CHANDEF_PR_FMT(n)								\
-	" " #n "(%d.%03d MHz,width:%d,center: %d.%03d/%d MHz, punct:0x%x)"
+	" " #n "(%d.%03d MHz,width:%d,center: %d.%03d/%d MHz, punct:0x%x, npca:%u, npca_punct:0x%x)"
 #define __CHANDEF_PR_ARG(n)								\
 			__entry->n##control_freq, __entry->n##freq_offset,		\
 			__entry->n##chan_width, __entry->n##center_freq1,		\
 			__entry->n##freq1_offset, __entry->n##center_freq2,		\
-			__entry->n##punctured
+			__entry->n##punctured, __entry->n##npca_pri_freq,		\
+			__entry->n##npca_punctured
 
 #define CHANDEF_ENTRY		__CHANDEF_ENTRY()
 #define CHANDEF_ASSIGN(c)	__CHANDEF_ASSIGN(, c)
@@ -1915,6 +1921,34 @@ TRACE_EVENT(drv_stop_ap,
 	TP_printk(
 		LOCAL_PR_FMT  VIF_PR_FMT " link id %u",
 		LOCAL_PR_ARG, VIF_PR_ARG, __entry->link_id
+	)
+);
+
+TRACE_EVENT(drv_update_beacon,
+	TP_PROTO(struct ieee80211_local *local,
+		 struct ieee80211_sub_if_data *sdata,
+		 struct ieee80211_bss_conf *link_conf,
+		 u64 changed),
+
+	TP_ARGS(local, sdata, link_conf, changed),
+
+	TP_STRUCT__entry(
+		LOCAL_ENTRY
+		VIF_ENTRY
+		__field(u32, link_id)
+		__field(u64, changed)
+	),
+
+	TP_fast_assign(
+		LOCAL_ASSIGN;
+		VIF_ASSIGN;
+		__entry->link_id = link_conf->link_id;
+		__entry->changed = changed;
+	),
+
+	TP_printk(
+		LOCAL_PR_FMT  VIF_PR_FMT " link id %u changed:%#llx",
+		LOCAL_PR_ARG, VIF_PR_ARG, __entry->link_id, __entry->changed
 	)
 );
 

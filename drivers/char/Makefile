@@ -3,7 +3,7 @@
 # Makefile for the kernel character device drivers.
 #
 
-obj-y				+= mem.o random.o
+obj-y				+= random.o
 obj-$(CONFIG_TTY_PRINTK)	+= ttyprintk.o
 obj-y				+= misc.o
 obj-$(CONFIG_TEST_MISC_MINOR)	+= misc_minor_kunit.o
@@ -16,8 +16,6 @@ obj-$(CONFIG_PRINTER)		+= lp.o
 
 obj-$(CONFIG_APM_EMULATION)	+= apm-emulation.o
 
-obj-$(CONFIG_DTLK)		+= dtlk.o
-obj-$(CONFIG_APPLICOM)		+= applicom.o
 obj-$(CONFIG_SONYPI)		+= sonypi.o
 obj-$(CONFIG_HPET)		+= hpet.o
 obj-$(CONFIG_XILINX_HWICAP)	+= xilinx_hwicap/

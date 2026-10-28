@@ -848,6 +848,7 @@ start:
 			name = p;
 			p += len;
 			ceph_decode_32_safe(&p, end, len, bad);
+			ceph_decode_need(&p, end, len, bad);
 			val = p;
 			p += len;
 
@@ -1054,7 +1055,7 @@ handle_non_vxattrs:
 	if (current->journal_info &&
 	    !strncmp(name, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN) &&
 	    security_ismaclabel(name + XATTR_SECURITY_PREFIX_LEN))
-		ci->i_ceph_flags |= CEPH_I_SEC_INITED;
+		set_bit(CEPH_I_SEC_INITED_BIT, &ci->i_ceph_flags);
 out:
 	spin_unlock(&ci->i_ceph_lock);
 	return err;
@@ -1351,7 +1352,7 @@ static int ceph_get_xattr_handler(const struct xattr_handler *handler,
 }
 
 static int ceph_set_xattr_handler(const struct xattr_handler *handler,
-				  struct mnt_idmap *idmap,
+				  const struct mnt_idmap *idmap,
 				  struct dentry *unused, struct inode *inode,
 				  const char *name, const void *value,
 				  size_t size, int flags)

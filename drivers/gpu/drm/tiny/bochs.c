@@ -20,6 +20,7 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_module.h>
 #include <drm/drm_panic.h>
+#include <drm/drm_panic_helper.h>
 #include <drm/drm_plane_helper.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
@@ -419,7 +420,7 @@ static const uint32_t bochs_primary_plane_formats[] = {
 };
 
 static int bochs_primary_plane_helper_atomic_check(struct drm_plane *plane,
-						   struct drm_atomic_state *state)
+						   struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc *new_crtc = new_plane_state->crtc;
@@ -442,7 +443,7 @@ static int bochs_primary_plane_helper_atomic_check(struct drm_plane *plane,
 }
 
 static void bochs_primary_plane_helper_atomic_update(struct drm_plane *plane,
-						     struct drm_atomic_state *state)
+						     struct drm_atomic_commit *state)
 {
 	struct drm_device *dev = plane->dev;
 	struct bochs_device *bochs = to_bochs_device(dev);
@@ -501,7 +502,8 @@ static const struct drm_plane_funcs bochs_primary_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.destroy = drm_plane_cleanup,
-	DRM_GEM_SHADOW_PLANE_FUNCS
+	DRM_GEM_SHADOW_PLANE_FUNCS,
+	DRM_PANIC_PLANE_FUNCS,
 };
 
 static void bochs_crtc_helper_mode_set_nofb(struct drm_crtc *crtc)
@@ -513,7 +515,7 @@ static void bochs_crtc_helper_mode_set_nofb(struct drm_crtc *crtc)
 }
 
 static int bochs_crtc_helper_atomic_check(struct drm_crtc *crtc,
-					  struct drm_atomic_state *state)
+					  struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
@@ -524,7 +526,7 @@ static int bochs_crtc_helper_atomic_check(struct drm_crtc *crtc,
 }
 
 static void bochs_crtc_helper_atomic_enable(struct drm_crtc *crtc,
-					    struct drm_atomic_state *state)
+					    struct drm_atomic_commit *state)
 {
 	struct bochs_device *bochs = to_bochs_device(crtc->dev);
 
@@ -533,7 +535,7 @@ static void bochs_crtc_helper_atomic_enable(struct drm_crtc *crtc,
 }
 
 static void bochs_crtc_helper_atomic_disable(struct drm_crtc *crtc,
-					     struct drm_atomic_state *crtc_state)
+					     struct drm_atomic_commit *crtc_state)
 {
 	struct bochs_device *bochs = to_bochs_device(crtc->dev);
 
@@ -550,7 +552,7 @@ static const struct drm_crtc_helper_funcs bochs_crtc_helper_funcs = {
 };
 
 static const struct drm_crtc_funcs bochs_crtc_funcs = {
-	.reset = drm_atomic_helper_crtc_reset,
+	.atomic_create_state = drm_atomic_helper_crtc_create_state,
 	.destroy = drm_crtc_cleanup,
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,

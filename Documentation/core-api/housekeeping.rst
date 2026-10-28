@@ -9,7 +9,7 @@ extreme workloads can't stand, such as in some DPDK usecases.
 
 The kernel work moved away by CPU isolation is commonly described as
 "housekeeping" because it includes ground work that performs cleanups,
-statistics maintainance and actions relying on them, memory release,
+statistics maintenance and actions relying on them, memory release,
 various deferrals etc...
 
 Sometimes housekeeping is just some unbound work (unbound workqueues,
@@ -99,7 +99,7 @@ the same RCU read side critical section.
 A typical layout example would look like this on the update side
 (``housekeeping_update()``)::
 
-	rcu_assign_pointer(housekeeping_cpumasks[type], trial);
+	rcu_assign_pointer(housekeeping.cpumasks[type], trial);
 	synchronize_rcu();
 	flush_workqueue(example_workqueue);
 

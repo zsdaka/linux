@@ -29,7 +29,7 @@
 
 #include "internal.h"
 
-int simple_getattr(struct mnt_idmap *idmap, const struct path *path,
+int simple_getattr(const struct mnt_idmap *idmap, const struct path *path,
 		   struct kstat *stat, u32 request_mask,
 		   unsigned int query_flags)
 {
@@ -78,8 +78,7 @@ struct dentry *simple_lookup(struct inode *dir, struct dentry *dentry, unsigned 
 	if (IS_ENABLED(CONFIG_UNICODE) && IS_CASEFOLDED(dir))
 		return NULL;
 
-	d_add(dentry, NULL);
-	return NULL;
+	return d_splice_alias(NULL, dentry);
 }
 EXPORT_SYMBOL(simple_lookup);
 
@@ -736,6 +735,7 @@ struct pseudo_fs_context *init_pseudo(struct fs_context *fc,
 		fc->fs_private = ctx;
 		fc->ops = &pseudo_fs_context_ops;
 		fc->sb_flags |= SB_NOUSER;
+		fc->s_iflags |= SB_I_NOEXEC | SB_I_NODEV;
 		fc->global = true;
 	}
 	return ctx;
@@ -867,7 +867,7 @@ int simple_rename_exchange(struct inode *old_dir, struct dentry *old_dentry,
 }
 EXPORT_SYMBOL_GPL(simple_rename_exchange);
 
-int simple_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+int simple_rename(const struct mnt_idmap *idmap, struct inode *old_dir,
 		  struct dentry *old_dentry, struct inode *new_dir,
 		  struct dentry *new_dentry, unsigned int flags)
 {
@@ -913,7 +913,7 @@ EXPORT_SYMBOL(simple_rename);
  * on simple regular filesystems.  Anything that needs to change on-disk
  * or wire state on size changes needs its own setattr method.
  */
-int simple_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+int simple_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 		   struct iattr *iattr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -1258,7 +1258,7 @@ char *simple_transaction_get(struct file *file, const char __user *buf, size_t s
 	if (size > SIMPLE_TRANSACTION_LIMIT - 1)
 		return ERR_PTR(-EFBIG);
 
-	ar = (struct simple_transaction_argresp *)get_zeroed_page(GFP_KERNEL);
+	ar = kzalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!ar)
 		return ERR_PTR(-ENOMEM);
 
@@ -1267,7 +1267,7 @@ char *simple_transaction_get(struct file *file, const char __user *buf, size_t s
 	/* only one write allowed per open */
 	if (file->private_data) {
 		spin_unlock(&simple_transaction_lock);
-		free_page((unsigned long)ar);
+		kfree(ar);
 		return ERR_PTR(-EBUSY);
 	}
 
@@ -1294,7 +1294,7 @@ EXPORT_SYMBOL(simple_transaction_read);
 
 int simple_transaction_release(struct inode *inode, struct file *file)
 {
-	free_page((unsigned long)file->private_data);
+	kfree(file->private_data);
 	return 0;
 }
 EXPORT_SYMBOL(simple_transaction_release);
@@ -1559,9 +1559,12 @@ int simple_fsync_noflush(struct file *file, loff_t start, loff_t end,
 	if (err)
 		return err;
 
-	if (!(inode_state_read_once(inode) & I_DIRTY_ALL))
+	if (!(inode_state_read_once(inode) &
+			(I_DIRTY_ALL | I_SYNC | I_METADATA_WRITEBACK)))
 		goto out;
-	if (datasync && !(inode_state_read_once(inode) & I_DIRTY_DATASYNC))
+	if (datasync &&
+	    !(inode_state_read_once(inode) &
+			(I_DIRTY_DATASYNC | I_SYNC | I_METADATA_WRITEBACK)))
 		goto out;
 
 	ret = sync_inode_metadata(inode, 1);
@@ -1724,7 +1727,7 @@ static struct dentry *empty_dir_lookup(struct inode *dir, struct dentry *dentry,
 	return ERR_PTR(-ENOENT);
 }
 
-static int empty_dir_setattr(struct mnt_idmap *idmap,
+static int empty_dir_setattr(const struct mnt_idmap *idmap,
 			     struct dentry *dentry, struct iattr *attr)
 {
 	return -EPERM;

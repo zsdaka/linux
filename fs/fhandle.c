@@ -201,7 +201,7 @@ static int vfs_dentry_acceptable(void *context, struct dentry *dentry)
 	struct handle_to_path_ctx *ctx = context;
 	struct user_namespace *user_ns = current_user_ns();
 	struct dentry *d, *root = ctx->root.dentry;
-	struct mnt_idmap *idmap = mnt_idmap(ctx->root.mnt);
+	const struct mnt_idmap *idmap = mnt_idmap(ctx->root.mnt);
 	int retval = 0;
 
 	if (!root)
@@ -285,6 +285,35 @@ static int do_handle_to_path(struct file_handle *handle, struct path *path,
 	return 0;
 }
 
+static bool capable_wrt_mount(struct mount *mount)
+{
+	struct mnt_namespace *mnt_ns;
+
+	/*
+	 * For ->mnt_ns access.
+	 * The following READ_ONCE() is semantically rcu_dereference().
+	 */
+	guard(rcu)();
+	mnt_ns = READ_ONCE(mount->mnt_ns);
+	return mnt_ns && ns_capable(mnt_ns->user_ns, CAP_SYS_ADMIN);
+}
+
+/*
+ * Does the caller have an unobstructed way to everything below @root? Only
+ * if the mount is mounted, the caller is privileged over its mount namespace
+ * and no locked child covers something below @root->dentry. One answer from
+ * under mount_lock: an umount in between clears ->mnt_ns and takes the
+ * children off the mount, the locked ones too.
+ */
+static bool subtree_unobstructed(const struct path *root)
+{
+	struct mount *mnt = real_mount(root->mnt);
+
+	guard(mount_locked_reader)();
+	return is_mounted(root->mnt) && capable_wrt_mount(mnt) &&
+	       !has_locked_children(mnt, root->dentry);
+}
+
 static inline int may_decode_fh(struct handle_to_path_ctx *ctx,
 				unsigned int o_flags)
 {
@@ -319,10 +348,7 @@ static inline int may_decode_fh(struct handle_to_path_ctx *ctx,
 
 	if (ns_capable(root->mnt->mnt_sb->s_user_ns, CAP_SYS_ADMIN))
 		ctx->flags = HANDLE_CHECK_PERMS;
-	else if (is_mounted(root->mnt) &&
-		 ns_capable(real_mount(root->mnt)->mnt_ns->user_ns,
-			    CAP_SYS_ADMIN) &&
-		 !has_locked_children(real_mount(root->mnt), root->dentry))
+	else if (subtree_unobstructed(root))
 		ctx->flags = HANDLE_CHECK_PERMS | HANDLE_CHECK_SUBTREE;
 	else
 		return -EPERM;

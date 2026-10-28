@@ -317,7 +317,6 @@ check_attr_tree_state_again:
 		next_node++;
 	}
 
-	hfsplus_mark_inode_dirty(HFSPLUS_ATTR_TREE_I(sb), HFSPLUS_I_ATTR_DIRTY);
 	hfsplus_mark_inode_dirty(attr_file, HFSPLUS_I_ATTR_DIRTY);
 
 	sbi->attr_tree = hfs_btree_open(sb, HFSPLUS_ATTR_CNID);
@@ -1009,7 +1008,7 @@ static int hfsplus_osx_getxattr(const struct xattr_handler *handler,
 }
 
 static int hfsplus_osx_setxattr(const struct xattr_handler *handler,
-				struct mnt_idmap *idmap,
+				const struct mnt_idmap *idmap,
 				struct dentry *unused, struct inode *inode,
 				const char *name, const void *buffer,
 				size_t size, int flags)

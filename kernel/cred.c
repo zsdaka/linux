@@ -384,8 +384,9 @@ int commit_creds(struct cred *new)
 	    !uid_eq(old->fsuid, new->fsuid) ||
 	    !gid_eq(old->fsgid, new->fsgid) ||
 	    !cred_cap_issubset(old, new)) {
+		/* mm-less tasks share init_task's exec_state */
 		if (task->mm)
-			set_dumpable(task->mm, suid_dumpable);
+			task_exec_state_set_dumpable(suid_dumpable);
 		task->pdeath_signal = 0;
 		/*
 		 * If a task drops privileges and becomes nondumpable,
@@ -413,7 +414,7 @@ int commit_creds(struct cred *new)
 		inc_rlimit_ucounts(new->ucounts, UCOUNT_RLIMIT_NPROC, 1);
 
 	rcu_assign_pointer(task->real_cred, new);
-	rcu_assign_pointer(task->cred, new);
+	task->cred = new;
 	if (new->user != old->user || new->user_ns != old->user_ns)
 		dec_rlimit_ucounts(old->ucounts, UCOUNT_RLIMIT_NPROC, 1);
 	if (new->user_ns != old->user_ns)
@@ -536,7 +537,8 @@ void __init cred_init(void)
 {
 	/* allocate a slab in which we can store credentials */
 	cred_jar = KMEM_CACHE(cred,
-			      SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT);
+			      SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT |
+			      SLAB_NO_MERGE);
 }
 
 /**

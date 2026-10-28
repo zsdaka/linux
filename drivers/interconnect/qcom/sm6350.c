@@ -6,7 +6,6 @@
 #include <linux/device.h>
 #include <linux/interconnect.h>
 #include <linux/interconnect-provider.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <dt-bindings/interconnect/qcom,sm6350.h>
@@ -150,7 +149,7 @@ static struct qcom_icc_node qhm_a1noc_cfg = {
 	.link_nodes = { &srvc_aggre1_noc },
 };
 
-static struct qcom_icc_qosbox qhm_qup_0_qos = {
+static const struct qcom_icc_qosbox qhm_qup_0_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xa000 },
 	.prio = 2,
@@ -166,7 +165,7 @@ static struct qcom_icc_node qhm_qup_0 = {
 	.link_nodes = { &qns_a1noc_snoc },
 };
 
-static struct qcom_icc_qosbox xm_emmc_qos = {
+static const struct qcom_icc_qosbox xm_emmc_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x7000 },
 	.prio = 2,
@@ -182,7 +181,7 @@ static struct qcom_icc_node xm_emmc = {
 	.link_nodes = { &qns_a1noc_snoc },
 };
 
-static struct qcom_icc_qosbox xm_ufs_mem_qos = {
+static const struct qcom_icc_qosbox xm_ufs_mem_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x8000 },
 	.prio = 4,
@@ -206,7 +205,7 @@ static struct qcom_icc_node qhm_a2noc_cfg = {
 	.link_nodes = { &srvc_aggre2_noc },
 };
 
-static struct qcom_icc_qosbox qhm_qdss_bam_qos = {
+static const struct qcom_icc_qosbox qhm_qdss_bam_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xb000 },
 	.prio = 2,
@@ -222,7 +221,7 @@ static struct qcom_icc_node qhm_qdss_bam = {
 	.link_nodes = { &qns_a2noc_snoc },
 };
 
-static struct qcom_icc_qosbox qhm_qup_1_qos = {
+static const struct qcom_icc_qosbox qhm_qup_1_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x9000 },
 	.prio = 2,
@@ -237,7 +236,7 @@ static struct qcom_icc_node qhm_qup_1 = {
 	.link_nodes = { &qns_a2noc_snoc },
 };
 
-static struct qcom_icc_qosbox qxm_crypto_qos = {
+static const struct qcom_icc_qosbox qxm_crypto_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x6000 },
 	.prio = 2,
@@ -253,7 +252,7 @@ static struct qcom_icc_node qxm_crypto = {
 	.link_nodes = { &qns_a2noc_snoc },
 };
 
-static struct qcom_icc_qosbox qxm_ipa_qos = {
+static const struct qcom_icc_qosbox qxm_ipa_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x7000 },
 	.prio = 2,
@@ -269,7 +268,7 @@ static struct qcom_icc_node qxm_ipa = {
 	.link_nodes = { &qns_a2noc_snoc },
 };
 
-static struct qcom_icc_qosbox xm_qdss_etr_qos = {
+static const struct qcom_icc_qosbox xm_qdss_etr_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xc000 },
 	.prio = 2,
@@ -285,7 +284,7 @@ static struct qcom_icc_node xm_qdss_etr = {
 	.link_nodes = { &qns_a2noc_snoc },
 };
 
-static struct qcom_icc_qosbox xm_sdc2_qos = {
+static const struct qcom_icc_qosbox xm_sdc2_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x18000 },
 	.prio = 2,
@@ -301,7 +300,7 @@ static struct qcom_icc_node xm_sdc2 = {
 	.link_nodes = { &qns_a2noc_snoc },
 };
 
-static struct qcom_icc_qosbox xm_usb3_0_qos = {
+static const struct qcom_icc_qosbox xm_usb3_0_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xd000 },
 	.prio = 2,
@@ -357,7 +356,7 @@ static struct qcom_icc_node qup1_core_master = {
 	.link_nodes = { &qup1_core_slave },
 };
 
-static struct qcom_icc_qosbox qnm_npu_qos = {
+static const struct qcom_icc_qosbox qnm_npu_qos = {
 	.num_ports = 2,
 	.port_offsets = { 0xf000, 0x11000 },
 	.prio = 0,
@@ -373,7 +372,7 @@ static struct qcom_icc_node qnm_npu = {
 	.link_nodes = { &qns_cdsp_gemnoc },
 };
 
-static struct qcom_icc_qosbox qxm_npu_dsp_qos = {
+static const struct qcom_icc_qosbox qxm_npu_dsp_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x13000 },
 	.prio = 0,
@@ -496,7 +495,7 @@ static struct qcom_icc_node qhm_cnoc_dc_noc = {
 			&qhs_gemnoc },
 };
 
-static struct qcom_icc_qosbox acm_apps_qos = {
+static const struct qcom_icc_qosbox acm_apps_qos = {
 	.num_ports = 2,
 	.port_offsets = { 0x2f100, 0x2f000 },
 	.prio = 0,
@@ -513,7 +512,7 @@ static struct qcom_icc_node acm_apps = {
 			&qns_gem_noc_snoc },
 };
 
-static struct qcom_icc_qosbox acm_sys_tcu_qos = {
+static const struct qcom_icc_qosbox acm_sys_tcu_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x35000 },
 	.prio = 6,
@@ -540,7 +539,7 @@ static struct qcom_icc_node qhm_gemnoc_cfg = {
 			&qhs_mdsp_ms_mpu_cfg },
 };
 
-static struct qcom_icc_qosbox qnm_cmpnoc_qos = {
+static const struct qcom_icc_qosbox qnm_cmpnoc_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x2e000 },
 	.prio = 0,
@@ -557,7 +556,7 @@ static struct qcom_icc_node qnm_cmpnoc = {
 			&qns_gem_noc_snoc },
 };
 
-static struct qcom_icc_qosbox qnm_mnoc_hf_qos = {
+static const struct qcom_icc_qosbox qnm_mnoc_hf_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x30000 },
 	.prio = 0,
@@ -574,7 +573,7 @@ static struct qcom_icc_node qnm_mnoc_hf = {
 			&qns_gem_noc_snoc },
 };
 
-static struct qcom_icc_qosbox qnm_mnoc_sf_qos = {
+static const struct qcom_icc_qosbox qnm_mnoc_sf_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x34000 },
 	.prio = 0,
@@ -591,7 +590,7 @@ static struct qcom_icc_node qnm_mnoc_sf = {
 			&qns_gem_noc_snoc },
 };
 
-static struct qcom_icc_qosbox qnm_snoc_gc_qos = {
+static const struct qcom_icc_qosbox qnm_snoc_gc_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x32000 },
 	.prio = 0,
@@ -607,7 +606,7 @@ static struct qcom_icc_node qnm_snoc_gc = {
 	.link_nodes = { &qns_llcc },
 };
 
-static struct qcom_icc_qosbox qnm_snoc_sf_qos = {
+static const struct qcom_icc_qosbox qnm_snoc_sf_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x31000 },
 	.prio = 0,
@@ -623,7 +622,7 @@ static struct qcom_icc_node qnm_snoc_sf = {
 	.link_nodes = { &qns_llcc },
 };
 
-static struct qcom_icc_qosbox qxm_gpu_qos = {
+static const struct qcom_icc_qosbox qxm_gpu_qos = {
 	.num_ports = 2,
 	.port_offsets = { 0x33000, 0x33080 },
 	.prio = 0,
@@ -656,7 +655,7 @@ static struct qcom_icc_node qhm_mnoc_cfg = {
 	.link_nodes = { &srvc_mnoc },
 };
 
-static struct qcom_icc_qosbox qnm_video0_qos = {
+static const struct qcom_icc_qosbox qnm_video0_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xf000 },
 	.prio = 2,
@@ -672,7 +671,7 @@ static struct qcom_icc_node qnm_video0 = {
 	.link_nodes = { &qns_mem_noc_sf },
 };
 
-static struct qcom_icc_qosbox qnm_video_cvp_qos = {
+static const struct qcom_icc_qosbox qnm_video_cvp_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xe000 },
 	.prio = 5,
@@ -688,7 +687,7 @@ static struct qcom_icc_node qnm_video_cvp = {
 	.link_nodes = { &qns_mem_noc_sf },
 };
 
-static struct qcom_icc_qosbox qxm_camnoc_hf_qos = {
+static const struct qcom_icc_qosbox qxm_camnoc_hf_qos = {
 	.num_ports = 2,
 	.port_offsets = { 0xa000, 0xb000 },
 	.prio = 3,
@@ -704,7 +703,7 @@ static struct qcom_icc_node qxm_camnoc_hf = {
 	.link_nodes = { &qns_mem_noc_hf },
 };
 
-static struct qcom_icc_qosbox qxm_camnoc_icp_qos = {
+static const struct qcom_icc_qosbox qxm_camnoc_icp_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xd000 },
 	.prio = 5,
@@ -720,7 +719,7 @@ static struct qcom_icc_node qxm_camnoc_icp = {
 	.link_nodes = { &qns_mem_noc_sf },
 };
 
-static struct qcom_icc_qosbox qxm_camnoc_sf_qos = {
+static const struct qcom_icc_qosbox qxm_camnoc_sf_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0x9000 },
 	.prio = 3,
@@ -736,7 +735,7 @@ static struct qcom_icc_node qxm_camnoc_sf = {
 	.link_nodes = { &qns_mem_noc_sf },
 };
 
-static struct qcom_icc_qosbox qxm_mdp0_qos = {
+static const struct qcom_icc_qosbox qxm_mdp0_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xc000 },
 	.prio = 3,
@@ -823,7 +822,7 @@ static struct qcom_icc_node qnm_gemnoc = {
 			&xs_qdss_stm },
 };
 
-static struct qcom_icc_qosbox qxm_pimem_qos = {
+static const struct qcom_icc_qosbox qxm_pimem_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xd000 },
 	.prio = 2,
@@ -840,7 +839,7 @@ static struct qcom_icc_node qxm_pimem = {
 			&qxs_imem },
 };
 
-static struct qcom_icc_qosbox xm_gic_qos = {
+static const struct qcom_icc_qosbox xm_gic_qos = {
 	.num_ports = 1,
 	.port_offsets = { 0xb000 },
 	.prio = 3,

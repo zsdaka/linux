@@ -480,8 +480,9 @@ struct io_ring_ctx_rings {
 static void io_register_free_rings(struct io_ring_ctx *ctx,
 				   struct io_ring_ctx_rings *r)
 {
-	io_free_region(ctx->user, &r->sq_region);
-	io_free_region(ctx->user, &r->ring_region);
+	/* ring memory is not charged to RLIMIT_MEMLOCK, hence no user */
+	io_free_region(NULL, &r->sq_region);
+	io_free_region(NULL, &r->ring_region);
 }
 
 #define swap_old(ctx, o, n, field)		\
@@ -495,6 +496,17 @@ static void io_register_free_rings(struct io_ring_ctx *ctx,
 			 IORING_SETUP_CQE32 | IORING_SETUP_NO_MMAP | \
 			 IORING_SETUP_CQE_MIXED | IORING_SETUP_SQE_MIXED)
 
+static bool io_sqe_is_128(struct io_ring_ctx *ctx,
+			  const struct io_uring_sqe *sqe)
+{
+	u8 opcode = READ_ONCE(sqe->opcode);
+
+	if (!(ctx->flags & IORING_SETUP_SQE_MIXED) || opcode >= IORING_OP_LAST)
+		return false;
+	opcode = array_index_nospec(opcode, IORING_OP_LAST);
+	return io_issue_defs[opcode].is_128;
+}
+
 static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 {
 	struct io_ctx_config config;
@@ -503,6 +515,9 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	unsigned i, tail, old_head;
 	struct io_uring_params *p = &config.p;
 	struct io_rings_layout *rl = &config.layout;
+	u32 *o_sq_array, *n_sq_array = NULL;
+	bool cqe32_tail = false;
+	unsigned int sqe128_src = 0;
 	int ret;
 
 	memset(&config, 0, sizeof(config));
@@ -528,7 +543,7 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 		rd.user_addr = p->cq_off.user_addr;
 		rd.flags |= IORING_MEM_REGION_TYPE_USER;
 	}
-	ret = io_create_region(ctx, &n.ring_region, &rd, IORING_OFF_CQ_RING);
+	ret = io_create_region(NULL, &n.ring_region, &rd, IORING_OFF_CQ_RING);
 	if (ret)
 		return ret;
 
@@ -558,7 +573,7 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 		rd.user_addr = p->sq_off.user_addr;
 		rd.flags |= IORING_MEM_REGION_TYPE_USER;
 	}
-	ret = io_create_region(ctx, &n.sq_region, &rd, IORING_OFF_SQES);
+	ret = io_create_region(NULL, &n.sq_region, &rd, IORING_OFF_SQES);
 	if (ret) {
 		io_register_free_rings(ctx, &n);
 		return ret;
@@ -589,6 +604,9 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	ctx->rings = NULL;
 	o.sq_sqes = ctx->sq_sqes;
 	ctx->sq_sqes = NULL;
+	o_sq_array = ctx->sq_array;
+	if (!(ctx->flags & IORING_SETUP_NO_SQARRAY))
+		n_sq_array = (u32 *)((char *)n.rings + rl->sq_array_offset);
 
 	/*
 	 * Now copy SQ and CQ entries, if any. If either of the destination
@@ -598,21 +616,48 @@ static int io_register_resize_rings(struct io_ring_ctx *ctx, void __user *arg)
 	old_head = READ_ONCE(o.rings->sq.head);
 	if (tail - old_head > p->sq_entries)
 		goto overflow;
-	for (i = old_head; i < tail; i++) {
-		unsigned index, dst_mask, src_mask;
+	for (i = old_head; i != tail; i++) {
+		bool sqe128_tail = sqe128_src;
+		unsigned int dst, src;
 		size_t sq_size;
 
-		index = i;
-		sq_size = sizeof(struct io_uring_sqe);
-		src_mask = ctx->sq_entries - 1;
-		dst_mask = p->sq_entries - 1;
-		if (ctx->flags & IORING_SETUP_SQE128) {
-			index <<= 1;
-			sq_size <<= 1;
-			src_mask = (ctx->sq_entries << 1) - 1;
-			dst_mask = (p->sq_entries << 1) - 1;
+		dst = i & (p->sq_entries - 1);
+		src = i & (ctx->sq_entries - 1);
+		if (sqe128_tail) {
+			/* it follows the first half, whatever the array says */
+			src = sqe128_src;
+			sqe128_src = 0;
+			if (n_sq_array)
+				WRITE_ONCE(n_sq_array[dst], dst);
+		} else if (n_sq_array) {
+			src = READ_ONCE(o_sq_array[src]);
+			if (unlikely(src >= ctx->sq_entries)) {
+				WRITE_ONCE(n_sq_array[dst], UINT_MAX);
+				continue;
+			}
+			WRITE_ONCE(n_sq_array[dst], dst);
 		}
-		memcpy(&n.sq_sqes[index & dst_mask], &o.sq_sqes[index & src_mask], sq_size);
+
+		/*
+		 * A 128b SQE on a SQE_MIXED ring takes two contiguous entries
+		 * and must not wrap. A smaller ring may place it on the last
+		 * entry, fail the resize if that happens.
+		 */
+		if (!sqe128_tail && i + 1 != tail &&
+		    src < ctx->sq_entries - 1 &&
+		    io_sqe_is_128(ctx, &o.sq_sqes[src])) {
+			if (dst == p->sq_entries - 1)
+				goto overflow;
+			sqe128_src = src + 1;
+		}
+
+		sq_size = sizeof(struct io_uring_sqe);
+		if (ctx->flags & IORING_SETUP_SQE128) {
+			dst <<= 1;
+			src <<= 1;
+			sq_size <<= 1;
+		}
+		memcpy(&n.sq_sqes[dst], &o.sq_sqes[src], sq_size);
 	}
 	WRITE_ONCE(n.rings->sq.head, old_head);
 	WRITE_ONCE(n.rings->sq.tail, tail);
@@ -628,7 +673,7 @@ overflow:
 		ret = -EOVERFLOW;
 		goto out;
 	}
-	for (i = old_head; i < tail; i++) {
+	for (i = old_head; i != tail; i++) {
 		unsigned index, dst_mask, src_mask;
 		size_t cq_size;
 
@@ -641,6 +686,21 @@ overflow:
 			cq_size <<= 1;
 			src_mask = (ctx->cq_entries << 1) - 1;
 			dst_mask = (p->cq_entries << 1) - 1;
+		}
+		/*
+		 * A 32b CQE on a CQE_MIXED ring takes two contiguous entries
+		 * and must not wrap. A smaller ring may place it on the last
+		 * entry, fail the resize if that happens.
+		 */
+		if (ctx->flags & IORING_SETUP_CQE_MIXED) {
+			if (cqe32_tail) {
+				cqe32_tail = false;
+			} else if (READ_ONCE(o.rings->cqes[index & src_mask].flags) &
+				   IORING_CQE_F_32) {
+				if ((index & dst_mask) == dst_mask)
+					goto overflow;
+				cqe32_tail = true;
+			}
 		}
 		memcpy(&n.rings->cqes[index & dst_mask], &o.rings->cqes[index & src_mask], cq_size);
 	}
@@ -655,8 +715,8 @@ overflow:
 	WRITE_ONCE(n.rings->cq_overflow, READ_ONCE(o.rings->cq_overflow));
 
 	/* all done, store old pointers and assign new ones */
-	if (!(ctx->flags & IORING_SETUP_NO_SQARRAY))
-		ctx->sq_array = (u32 *)((char *)n.rings + rl->sq_array_offset);
+	if (n_sq_array)
+		ctx->sq_array = n_sq_array;
 
 	ctx->sq_entries = p->sq_entries;
 	ctx->cq_entries = p->cq_entries;
@@ -719,7 +779,8 @@ static int io_register_mem_region(struct io_ring_ctx *ctx, void __user *uarg)
 	    !(ctx->flags & IORING_SETUP_R_DISABLED))
 		return -EINVAL;
 
-	ret = io_create_region(ctx, &region, &rd, IORING_MAP_OFF_PARAM_REGION);
+	ret = io_create_region(ctx->user, &region, &rd,
+			       IORING_MAP_OFF_PARAM_REGION);
 	if (ret)
 		return ret;
 	if (copy_to_user(rd_uptr, &rd, sizeof(rd))) {
@@ -753,7 +814,14 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 	if (ctx->submitter_task && ctx->submitter_task != current)
 		return -EEXIST;
 
-	if ((ctx->int_flags & IO_RING_F_REG_RESTRICTED) && !(ctx->flags & IORING_SETUP_R_DISABLED)) {
+	/*
+	 * A disabled ring is exempt from its own register restrictions, so
+	 * that the creator can set them up and then enable the ring. That
+	 * does not apply to restrictions inherited from the task.
+	 */
+	if ((ctx->int_flags & IO_RING_F_REG_RESTRICTED) &&
+	    (!(ctx->flags & IORING_SETUP_R_DISABLED) ||
+	     (ctx->int_flags & IO_RING_F_RESTRICT_INHERITED))) {
 		opcode = array_index_nospec(opcode, IORING_REGISTER_LAST);
 		if (!test_bit(opcode, ctx->restrictions.register_op))
 			return -EACCES;

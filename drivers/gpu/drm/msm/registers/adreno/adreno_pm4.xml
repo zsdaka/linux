@@ -152,6 +152,8 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	<!-- TODO: deal with name conflicts with other gens -->
 	<value name="CACHE_FLUSH7" value="0x32" variants="A7XX-"/>
 	<value name="CACHE_INVALIDATE7" value="0x33" variants="A7XX-"/>
+	<value name="SUBPASS_FENCE" value="0x35" variants="A7XX-"/>
+	<value name="SUBPASS_SLICE_FENCE" value="0x36" variants="A8XX-"/>
 	<value name="DEPTH_BUFFER_FLIP" value="0x3d" variants="A8XX-"/>
 	<value name="CCH_FAST_CLEAR_CLEAN" value="0x1b" variants="A8XX-"/>
 </enum>
@@ -644,10 +646,10 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	<value name="CP_NON_CONTEXT_REG_BUNCH" value="0x5d" variants="A7XX-"/>
 	<doc>
 		Write to a scratch memory that is read by CP_REG_TEST with
-		SOURCE_SCRATCH_MEM set. It's not the same scratch as scratch registers.
+		SOURCE_OC_MEM set. It's not the same scratch as scratch registers.
 		However it uses the same memory space.
 	</doc>
-	<value name="CP_MEM_TO_SCRATCH_MEM" value="0x49" variants="A7XX-"/>
+	<value name="CP_MEM_TO_OC_MEM" value="0x49" variants="A7XX-"/>
 
 	<doc>
 		Executes an array of fixed-size command buffers where each
@@ -1037,6 +1039,11 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 </domain>
 
 <domain name="CP_DRAW_AUTO" width="32">
+	<doc>
+		Draws (counter - NUM_VERTICES_OFFSET / 4) / STRIDE vertices, counter
+		read from NUM_VERTICES_BASE.  a7xx divides the counter by four too,
+		earlier gens use it as-is.
+	</doc>
 	<reg32 offset="0" name="0" type="vgt_draw_initiator_a4xx"/>
 	<reg32 offset="1" name="1">
 		<bitfield name="NUM_INSTANCES" low="0" high="31" type="uint"/>
@@ -1046,7 +1053,8 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 		<bitfield name="NUM_VERTICES_OFFSET" low="0" high="31" type="uint"/>
 	</reg32>
 	<reg32 offset="5" name="5">
-		<bitfield name="STRIDE" low="0" high="31" type="uint"/>
+		<!-- the CP masks the stride to 11 bits before forwarding it -->
+		<bitfield name="STRIDE" low="0" high="10" type="uint"/>
 	</reg32>
 </domain>
 
@@ -1095,7 +1103,7 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 			<bitfield name="DIRTY" pos="16" type="boolean"/>
 			<bitfield name="DISABLE" pos="17" type="boolean"/>
 			<bitfield name="DISABLE_ALL_GROUPS" pos="18" type="boolean"/>
-			<bitfield name="LOAD_IMMED" pos="19" type="boolean"/>
+			<bitfield name="LOAD_IMMED" pos="19" type="boolean" variants="A5XX"/>
 			<bitfield name="BINNING" pos="20" varset="chip" variants="A6XX-" type="boolean"/>
 			<bitfield name="GMEM" pos="21" varset="chip" variants="A6XX-" type="boolean"/>
 			<bitfield name="SYSMEM" pos="22" varset="chip" variants="A6XX-" type="boolean"/>
@@ -1253,6 +1261,11 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 			$dst = (($dst &amp; $src0) rot $rotate) | $src1
 
 		Here "rot" means rotate left.
+		If SRCn_IS_REG, the corresponding src is a register offset,
+		otherwise it is an immediate.
+
+		If DST_SCRATCH is set then the value modified is a scratch
+		ram address, instead of a register.
 	</doc>
 	<reg32 offset="0" name="0">
 		<bitfield name="DST_REG" low="0" high="17" type="hex"/>
@@ -1275,9 +1288,16 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 <domain name="CP_REG_TO_MEM" width="32" prefix="chip">
 	<reg32 offset="0" name="0">
 		<bitfield name="REG" low="0" high="17" type="hex"/>
-		<!-- number of registers/dwords copied is max(CNT, 1). -->
+		<!--
+			Number of registers/dwords copied is max(CNT, 1).
+			With 64B it gets rounded to the next 64B boundary.
+		-->
 		<bitfield name="CNT" low="18" high="29" type="uint"/>
-		<bitfield name="64B" pos="30" type="boolean"/>
+		<!--
+			Treat things as 64B, allowing for a 64B atomic read of
+			registers.
+		-->
+		<bitfield name="IS_64B" pos="30" type="boolean"/>
 		<bitfield name="ACCUMULATE" pos="31" type="boolean"/>
 	</reg32>
 	<stripe varset="chip" variants="A2XX-A4XX">
@@ -1298,7 +1318,7 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 		<bitfield name="REG" low="0" high="17" type="hex"/>
 		<!-- number of registers/dwords copied is max(CNT, 1). -->
 		<bitfield name="CNT" low="18" high="29" type="uint"/>
-		<bitfield name="64B" pos="30" type="boolean"/>
+		<bitfield name="IS_64B" pos="30" type="boolean"/>
 		<bitfield name="ACCUMULATE" pos="31" type="boolean"/>
 	</reg32>
 	<reg64 offset="1" name="DEST" type="waddress"/>
@@ -1318,7 +1338,7 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 		<bitfield name="REG" low="0" high="17" type="hex"/>
 		<!-- number of registers/dwords copied is max(CNT, 1). -->
 		<bitfield name="CNT" low="18" high="29" type="uint"/>
-		<bitfield name="64B" pos="30" type="boolean"/>
+		<bitfield name="IS_64B" pos="30" type="boolean"/>
 		<bitfield name="ACCUMULATE" pos="31" type="boolean"/>
 	</reg32>
 	<reg64 offset="1" name="DEST" type="waddress"/>
@@ -1328,12 +1348,13 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 <domain name="CP_MEM_TO_REG" width="32">
 	<reg32 offset="0" name="0">
 		<bitfield name="REG" low="0" high="17" type="hex"/>
+		<!-- if set, all writes are to the same reg -->
+		<bitfield name="ONE_REG_WR" pos="18" type="boolean"/>
 		<!-- number of registers/dwords copied is max(CNT, 1). -->
 		<bitfield name="CNT" low="19" high="29" type="uint"/>
 		<!-- shift each DWORD left by 2 while copying -->
 		<bitfield name="SHIFT_BY_2" pos="30" type="boolean"/>
-		<!-- does the same thing as CP_MEM_TO_MEM::UNK31 -->
-		<bitfield name="UNK31" pos="31" type="boolean"/>
+		<bitfield name="WAIT_CACHE_FLUSH" pos="31" type="boolean"/>
 	</reg32>
 	<stripe varset="chip" variants="A2XX-A4XX">
 		<reg32 offset="1" name="SRC" type="address"/>
@@ -1357,8 +1378,7 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 		<bitfield name="DOUBLE" pos="29" type="boolean"/>
 		<!-- execute CP_WAIT_FOR_MEM_WRITES beforehand -->
 		<bitfield name="WAIT_FOR_MEM_WRITES" pos="30" type="boolean"/>
-		<!-- some other kind of wait -->
-		<bitfield name="UNK31" pos="31" type="boolean"/>
+		<bitfield name="WAIT_CACHE_FLUSH" pos="31" type="boolean"/>
 	</reg32>
 	<reg64 offset="1" name="DST" type="waddress"/>
 	<reg64 offset="3" name="SRC_A" type="address"/>
@@ -1469,6 +1489,7 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 	<value value="1" name="POLL_MEMORY"/>
 	<value value="2" name="POLL_SCRATCH"/>
 	<value value="3" name="POLL_ON_CHIP" varset="chip" variants="A7XX-"/>
+	<value value="4" name="POLL_SYSTEM_VARIABLE" varset="chip" variants="A8XX-"/>
 </enum>
 
 <domain name="CP_COND_WRITE5" width="32">
@@ -1476,7 +1497,7 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 		<bitfield name="FUNCTION" low="0" high="2" type="cp_cond_function"/>
 		<bitfield name="SIGNED_COMPARE" pos="3" type="boolean"/>
 		<!-- POLL_REGISTER polls a register at POLL_ADDR_LO. -->
-		<bitfield name="POLL" low="4" high="5" type="poll_memory_type"/>
+		<bitfield name="POLL" low="4" high="6" type="poll_memory_type"/>
 		<bitfield name="WRITE_MEMORY" pos="8" type="boolean"/>
 	</reg32>
 	<reg64 offset="1" name="POLL_ADDR" type="address"/>
@@ -1944,13 +1965,13 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 	<enum name="source_type">
 		<value value="0" name="SOURCE_REG"/>
 		<!-- Don't confuse with scratch registers, this is a separate memory
-			 written into by CP_MEM_TO_SCRATCH_MEM. -->
-		<value value="1" name="SOURCE_SCRATCH_MEM" varset="chip" variants="A7XX-"/>
+			 written into by CP_MEM_TO_OC_MEM. -->
+		<value value="1" name="SOURCE_OC_MEM" varset="chip" variants="A7XX-"/>
 	</enum>
 	<reg32 offset="0" name="0">
 		<!-- the register to test -->
 		<bitfield name="REG" low="0" high="17" varset="source_type" variants="SOURCE_REG"/>
-		<bitfield name="SCRATCH_MEM_OFFSET" low="0" high="17" varset="source_type" variants="SOURCE_SCRATCH_MEM"/>
+		<bitfield name="OC_MEM_OFFSET" low="0" high="17" varset="source_type" variants="SOURCE_OC_MEM"/>
 		<bitfield name="SOURCE" pos="18" type="source_type" addvariant="yes"/>
 		<!-- the bit to test -->
 		<bitfield name="BIT" low="20" high="24" type="uint"/>
@@ -2055,28 +2076,20 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 
 <domain name="CP_COND_EXEC" width="32">
 	<doc>
-                Executes the following DWORDs of commands if the dword at ADDR0
-                is not equal to 0 and the dword at ADDR1 is less than REF
-                (signed comparison).
+		Executes the following DWORDs of commands if the dword
+		at BOOL_ADDR is not equal to 0 and the the timestamp
+		value ACTIVE_TIMESTAMP is ahead of the value fetched
+		from TIMESTAMP_ADDR.
+
+		The timestamp comparision is an unsigned compare with
+		wraparound, ie:
+
+			(ACTIVE_TIMESTAMP - *TIMESTAMP_ADDR) &lt; 0x80000000
 	</doc>
-	<reg32 offset="0" name="0">
-		<bitfield name="ADDR0_LO" low="0" high="31"/>
-	</reg32>
-	<reg32 offset="1" name="1">
-		<bitfield name="ADDR0_HI" low="0" high="31"/>
-	</reg32>
-	<reg32 offset="2" name="2">
-		<bitfield name="ADDR1_LO" low="0" high="31"/>
-	</reg32>
-	<reg32 offset="3" name="3">
-		<bitfield name="ADDR1_HI" low="0" high="31"/>
-	</reg32>
-	<reg32 offset="4" name="4">
-		<bitfield name="REF" low="0" high="31"/>
-	</reg32>
-	<reg32 offset="5" name="5">
-		<bitfield name="DWORDS" low="0" high="31" type="uint"/>
-	</reg32>
+	<reg64 offset="0" name="BOOL_ADDR" type="address"/>
+	<reg64 offset="2" name="TIMESTAMP_ADDR" type="address"/>
+	<reg32 offset="4" name="ACTIVE_TIMESTAMP"/>
+	<reg32 offset="5" name="DWORDS"/>
 </domain>
 
 <domain name="CP_SET_AMBLE" width="32">
@@ -2275,10 +2288,10 @@ opcode: CP_LOAD_STATE4 (30) (4 dwords)
 	</reg32>
 </domain>
 
-<domain name="CP_MEM_TO_SCRATCH_MEM" width="32">
+<domain name="CP_MEM_TO_OC_MEM" width="32">
 	<doc>
 		Best guess is that it is a faster way to fetch all the VSC_CHANNEL_VISIBILITY registers
-		and keep them in a local scratch memory instead of fetching every time
+		and keep them in a local on-chip memory instead of fetching every time
 		when skipping IBs.
 	</doc>
 	<reg32 offset="0" name="0">

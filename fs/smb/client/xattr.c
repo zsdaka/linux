@@ -91,7 +91,7 @@ static int cifs_creation_time_set(unsigned int xid, struct cifs_tcon *pTcon,
 }
 
 static int cifs_xattr_set(const struct xattr_handler *handler,
-			  struct mnt_idmap *idmap,
+			  const struct mnt_idmap *idmap,
 			  struct dentry *dentry, struct inode *inode,
 			  const char *name, const void *value,
 			  size_t size, int flags)
@@ -155,7 +155,7 @@ static int cifs_xattr_set(const struct xattr_handler *handler,
 		if (pTcon->ses->server->ops->set_EA) {
 			rc = pTcon->ses->server->ops->set_EA(xid, pTcon,
 				full_path, name, value, (__u16)size,
-				cifs_sb->local_nls, cifs_sb);
+				cifs_sb);
 			if (rc == 0)
 				inode_set_ctime_current(inode);
 		}
@@ -272,7 +272,7 @@ static int cifs_xattr_get(const struct xattr_handler *handler,
 			  struct dentry *dentry, struct inode *inode,
 			  const char *name, void *value, size_t size)
 {
-	ssize_t rc = -EOPNOTSUPP;
+	int rc = -EOPNOTSUPP;
 	unsigned int xid;
 	struct super_block *sb = dentry->d_sb;
 	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
@@ -354,7 +354,7 @@ static int cifs_xattr_get(const struct xattr_handler *handler,
 				inode, full_path, &acllen, extra_info);
 		if (IS_ERR(pacl)) {
 			rc = PTR_ERR(pacl);
-			cifs_dbg(VFS, "%s: error %zd getting sec desc\n",
+			cifs_dbg(VFS, "%s: error %d getting sec desc\n",
 				 __func__, rc);
 		} else {
 			if (value) {

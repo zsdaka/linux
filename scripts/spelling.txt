@@ -176,6 +176,7 @@ assgined||assigned
 assiged||assigned
 assigment||assignment
 assigments||assignments
+assinged||assigned
 assistent||assistant
 assocaited||associated
 assocated||associated
@@ -871,8 +872,8 @@ infromation||information
 ingore||ignore
 inheritence||inheritance
 inital||initial
-initalised||initialized
-initalise||initialize
+initalised||initialised
+initalise||initialise
 initalized||initialized
 initalize||initialize
 initation||initiation

@@ -257,6 +257,7 @@ static u32 initiate_file_draining(struct nfs_client *clp,
 	struct pnfs_layout_hdr *lo;
 	u32 rv = NFS4ERR_NOMATCHING_LAYOUT;
 	LIST_HEAD(free_me_list);
+	bool return_range = false;
 
 	ino = nfs_layout_find_inode(clp, &args->cbl_fh, &args->cbl_stateid);
 	if (IS_ERR(ino)) {
@@ -290,7 +291,8 @@ static u32 initiate_file_draining(struct nfs_client *clp,
 	pnfs_set_layout_stateid(lo, &args->cbl_stateid, NULL, true);
 	switch (pnfs_mark_matching_lsegs_return(lo, &free_me_list,
 				&args->cbl_range,
-				be32_to_cpu(args->cbl_stateid.seqid))) {
+				be32_to_cpu(args->cbl_stateid.seqid),
+				args->cbl_layoutchanged, NULL)) {
 	case 0:
 	case -EBUSY:
 		/* There are layout segments that need to be returned */
@@ -301,13 +303,13 @@ static u32 initiate_file_draining(struct nfs_client *clp,
 		/* Embrace your forgetfulness! */
 		rv = NFS4ERR_NOMATCHING_LAYOUT;
 
-		if (NFS_SERVER(ino)->pnfs_curr_ld->return_range) {
-			NFS_SERVER(ino)->pnfs_curr_ld->return_range(lo,
-				&args->cbl_range);
-		}
+		return_range = true;
 	}
 unlock:
 	spin_unlock(&ino->i_lock);
+	if (return_range && NFS_SERVER(ino)->pnfs_curr_ld->return_range)
+		NFS_SERVER(ino)->pnfs_curr_ld->return_range(lo,
+			&args->cbl_range);
 	pnfs_free_lseg_list(&free_me_list);
 	/* Free all lsegs that are attached to commit buckets */
 	nfs_commit_inode(ino, 0);
@@ -316,7 +318,7 @@ out:
 	nfs_iput_and_deactive(ino);
 out_noput:
 	trace_nfs4_cb_layoutrecall_file(clp, &args->cbl_fh, ino,
-			&args->cbl_stateid, -rv);
+			&args->cbl_stateid, args->cbl_layoutchanged, -rv);
 	return rv;
 }
 
@@ -389,7 +391,26 @@ __be32 nfs4_callback_devicenotify(void *argp, void *resp,
 			if (!ld)
 				continue;
 		}
-		nfs4_delete_deviceid(ld, cps->clp, &dev->cbd_dev_id);
+		/*
+		 * Bump the epoch before touching the cache so a
+		 * GETDEVICEINFO already in flight can detect that it
+		 * predates the notification.  A referenced DELETE may be
+		 * racing revocation, so defer it to the state manager --
+		 * this thread cannot issue fore-channel RPCs.
+		 */
+		nfs4_deviceid_bump_change_epoch(cps->clp);
+		if (dev->cbd_notify_type == NOTIFY_DEVICEID4_CHANGE) {
+			nfs4_delete_deviceid(ld, cps->clp, &dev->cbd_dev_id);
+			pnfs_layout_reresolve_deviceid_byclid(cps->clp, ld,
+							&dev->cbd_dev_id,
+							dev->cbd_immediate);
+		} else if (pnfs_layout_deviceid_referenced_byclid(cps->clp,
+						ld, &dev->cbd_dev_id)) {
+			pnfs_deviceid_delete_mark(cps->clp, ld,
+						  &dev->cbd_dev_id);
+		} else {
+			nfs4_delete_deviceid(ld, cps->clp, &dev->cbd_dev_id);
+		}
 	}
 	pnfs_put_layoutdriver(ld);
 out:

@@ -373,6 +373,7 @@ static int ub913_set_routing(struct v4l2_subdev *sd,
 }
 
 static int ub913_set_fmt(struct v4l2_subdev *sd,
+			 const struct v4l2_subdev_client_info *ci,
 			 struct v4l2_subdev_state *state,
 			 struct v4l2_subdev_format *format)
 {
@@ -872,8 +873,8 @@ static void ub913_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id ub913_id[] = {
-	{ "ds90ub913a-q1" },
-	{}
+	{ .name = "ds90ub913a-q1" },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, ub913_id);
 

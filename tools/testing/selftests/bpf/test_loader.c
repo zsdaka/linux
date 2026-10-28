@@ -33,6 +33,7 @@ static inline const char *str_has_pfx(const char *str, const char *pfx)
 #endif
 
 static int sysctl_unpriv_disabled = -1;
+static int unpriv_mitigations_disabled = -1;
 
 enum mode {
 	PRIV = 1,
@@ -42,6 +43,11 @@ enum mode {
 enum load_mode {
 	JITED		= 1 << 0,
 	NO_JITED	= 1 << 1,
+};
+
+enum stack_mode {
+	LARGE_STACK	= 1 << 0,
+	SMALL_STACK	= 1 << 1,
 };
 
 struct test_subspec {
@@ -63,12 +69,16 @@ struct test_spec {
 	struct test_subspec priv;
 	struct test_subspec unpriv;
 	const char *btf_custom_path;
+	const char *btf_custom_func_path;
 	int log_level;
 	int prog_flags;
 	int mode_mask;
 	int arch_mask;
 	int load_mask;
+	int stack_mask;
 	int linear_sz;
+	const char *skip_reason;
+	bool prepare_priv;
 	bool auxiliary;
 	bool valid;
 };
@@ -93,7 +103,7 @@ void test_loader_fini(struct test_loader *tester)
 	free(tester->log_buf);
 }
 
-static void free_msgs(struct expected_msgs *msgs)
+void free_msgs(struct expected_msgs *msgs)
 {
 	int i;
 
@@ -376,6 +386,7 @@ enum arch {
 	ARCH_ARM64	= 0x4,
 	ARCH_RISCV64	= 0x8,
 	ARCH_S390X	= 0x10,
+	ARCH_LOONGARCH	= 0x20,
 };
 
 static int get_current_arch(void)
@@ -388,6 +399,8 @@ static int get_current_arch(void)
 	return ARCH_RISCV64;
 #elif defined(__s390x__)
 	return ARCH_S390X;
+#elif defined(__loongarch__)
+	return ARCH_LOONGARCH;
 #endif
 	return ARCH_UNKNOWN;
 }
@@ -418,6 +431,7 @@ static int parse_test_spec(struct test_loader *tester,
 	int err = 0;
 	u32 arch_mask = 0;
 	u32 load_mask = 0;
+	u32 stack_mask = 0;
 	struct btf *btf;
 	enum arch arch;
 
@@ -452,6 +466,8 @@ static int parse_test_spec(struct test_loader *tester,
 			continue;
 		if ((val = str_has_pfx(s, "test_description="))) {
 			description = val;
+		} else if ((val = str_has_pfx(s, "test_skip="))) {
+			spec->skip_reason = val;
 		} else if (strcmp(s, "test_expect_failure") == 0) {
 			spec->priv.expect_failure = true;
 			spec->mode_mask |= PRIV;
@@ -489,6 +505,16 @@ static int parse_test_spec(struct test_loader *tester,
 			spec->mode_mask |= UNPRIV;
 		} else if ((msg = str_has_pfx(s, "test_expect_not_msg_unpriv="))) {
 			err = push_msg(msg, true, &spec->unpriv.expect_msgs);
+			if (err)
+				goto cleanup;
+			spec->mode_mask |= UNPRIV;
+		} else if ((msg = str_has_pfx(s, "test_expect_msg_next="))) {
+			err = __push_msg(msg, true, false, &spec->priv.expect_msgs);
+			if (err)
+				goto cleanup;
+			spec->mode_mask |= PRIV;
+		} else if ((msg = str_has_pfx(s, "test_expect_msg_next_unpriv="))) {
+			err = __push_msg(msg, true, false, &spec->unpriv.expect_msgs);
 			if (err)
 				goto cleanup;
 			spec->mode_mask |= UNPRIV;
@@ -564,6 +590,8 @@ static int parse_test_spec(struct test_loader *tester,
 				update_flags(&spec->prog_flags, BPF_F_XDP_HAS_FRAGS, clear);
 			} else if (strcmp(val, "BPF_F_TEST_REG_INVARIANTS") == 0) {
 				update_flags(&spec->prog_flags, BPF_F_TEST_REG_INVARIANTS, clear);
+			} else if (strcmp(val, "BPF_F_ARENA_SCALAR") == 0) {
+				update_flags(&spec->prog_flags, BPF_F_ARENA_SCALAR, clear);
 			} else /* assume numeric value */ {
 				err = parse_int(val, &flags, "test prog flags");
 				if (err)
@@ -579,6 +607,8 @@ static int parse_test_spec(struct test_loader *tester,
 				arch = ARCH_RISCV64;
 			} else if (strcmp(val, "s390x") == 0) {
 				arch = ARCH_S390X;
+			} else if (strcmp(val, "LOONGARCH") == 0) {
+				arch = ARCH_LOONGARCH;
 			} else {
 				PRINT_FAIL("bad arch spec: '%s'\n", val);
 				err = -EINVAL;
@@ -590,11 +620,15 @@ static int parse_test_spec(struct test_loader *tester,
 			jit_on_next_line = true;
 		} else if ((val = str_has_pfx(s, "test_btf_path="))) {
 			spec->btf_custom_path = val;
+		} else if ((val = str_has_pfx(s, "test_btf_func_path="))) {
+			spec->btf_custom_func_path = val;
 		} else if ((val = str_has_pfx(s, "test_caps_unpriv="))) {
 			err = parse_caps(val, &spec->unpriv.caps, "test caps");
 			if (err)
 				goto cleanup;
 			spec->mode_mask |= UNPRIV;
+		} else if (strcmp(s, "test_prepare_priv") == 0) {
+			spec->prepare_priv = true;
 		} else if ((val = str_has_pfx(s, "load_mode="))) {
 			if (strcmp(val, "jited") == 0) {
 				load_mask = JITED;
@@ -602,6 +636,16 @@ static int parse_test_spec(struct test_loader *tester,
 				load_mask = NO_JITED;
 			} else {
 				PRINT_FAIL("bad load spec: '%s'", val);
+				err = -EINVAL;
+				goto cleanup;
+			}
+		} else if ((val = str_has_pfx(s, "stack_mode="))) {
+			if (strcmp(val, "large") == 0) {
+				stack_mask = LARGE_STACK;
+			} else if (strcmp(val, "small") == 0) {
+				stack_mask = SMALL_STACK;
+			} else {
+				PRINT_FAIL("bad stack spec: '%s'", val);
 				err = -EINVAL;
 				goto cleanup;
 			}
@@ -644,6 +688,7 @@ static int parse_test_spec(struct test_loader *tester,
 
 	spec->arch_mask = arch_mask ?: -1;
 	spec->load_mask = load_mask ?: (JITED | NO_JITED);
+	spec->stack_mask = stack_mask ?: (LARGE_STACK | SMALL_STACK);
 
 	if (spec->mode_mask == 0)
 		spec->mode_mask = PRIV;
@@ -737,7 +782,7 @@ static void prepare_case(struct test_loader *tester,
 			 struct bpf_object *obj,
 			 struct bpf_program *prog)
 {
-	int min_log_level = 0, prog_flags;
+	int min_log_level = 0;
 
 	if (env.verbosity > VERBOSE_NONE)
 		min_log_level = 1;
@@ -755,8 +800,7 @@ static void prepare_case(struct test_loader *tester,
 	else
 		bpf_program__set_log_level(prog, spec->log_level);
 
-	prog_flags = bpf_program__flags(prog);
-	bpf_program__set_flags(prog, prog_flags | spec->prog_flags);
+	bpf_program__add_flags(prog, spec->prog_flags);
 
 	tester->log_buf[0] = '\0';
 }
@@ -787,6 +831,43 @@ static void emit_stderr(const char *stderr, bool force)
 	if (!force && env.verbosity == VERBOSE_NONE)
 		return;
 	fprintf(stdout, "STDERR:\n=============\n%s=============\n", stderr);
+}
+
+static void verify_stderr(int prog_fd, struct expected_msgs *msgs)
+{
+	LIBBPF_OPTS(bpf_prog_stream_read_opts, ropts);
+	char *buf;
+	int ret;
+
+	if (!msgs->cnt)
+		return;
+
+	buf = malloc(TEST_LOADER_LOG_BUF_SZ);
+	if (!ASSERT_NEQ(buf, NULL, "malloc"))
+		return;
+
+	ret = bpf_prog_stream_read(prog_fd, 2, buf, TEST_LOADER_LOG_BUF_SZ - 1,
+				    &ropts);
+	if (ret > 0) {
+		buf[ret] = '\0';
+		emit_stderr(buf, false);
+		validate_msgs(buf, msgs, emit_stderr);
+	} else {
+		ASSERT_GT(ret, 0, "stderr stream read");
+	}
+
+	free(buf);
+}
+
+void verify_test_stderr(struct bpf_object *obj, struct bpf_program *prog)
+{
+	struct test_spec spec = {};
+
+	if (parse_test_spec(NULL, obj, prog, &spec))
+		return;
+
+	verify_stderr(bpf_program__fd(prog), &spec.priv.stderr);
+	free_test_spec(&spec);
 }
 
 static void emit_stdout(const char *bpf_stdout, bool force)
@@ -927,6 +1008,7 @@ void validate_msgs(const char *log_buf, struct expected_msgs *msgs,
 
 		no_match   = !msg->negative && !match->start;
 		wrong_line = !msg->negative &&
+			     match->start &&
 			     msg->on_next_line &&
 			     prev_match && prev_match->line + 1 != match->line;
 		unexpected = msg->negative && match->start;
@@ -968,10 +1050,10 @@ struct cap_state {
 	bool initialized;
 };
 
-static int drop_capabilities(struct cap_state *caps)
+static int drop_capabilities(struct cap_state *caps, __u64 keep_caps)
 {
 	const __u64 caps_to_drop = (1ULL << CAP_SYS_ADMIN | 1ULL << CAP_NET_ADMIN |
-				    1ULL << CAP_PERFMON   | 1ULL << CAP_BPF);
+				    1ULL << CAP_PERFMON   | 1ULL << CAP_BPF) & ~keep_caps;
 	int err;
 
 	err = cap_disable_effective(caps_to_drop, &caps->old_caps);
@@ -981,6 +1063,13 @@ static int drop_capabilities(struct cap_state *caps)
 	}
 
 	caps->initialized = true;
+	if (keep_caps) {
+		err = cap_enable_effective(keep_caps, NULL);
+		if (err) {
+			PRINT_FAIL("failed to set capabilities: %i, %s\n", err, strerror(-err));
+			return err;
+		}
+	}
 	return 0;
 }
 
@@ -1001,8 +1090,12 @@ static int restore_capabilities(struct cap_state *caps)
 static bool can_execute_unpriv(struct test_loader *tester, struct test_spec *spec)
 {
 	if (sysctl_unpriv_disabled < 0)
-		sysctl_unpriv_disabled = get_unpriv_disabled() ? 1 : 0;
-	if (sysctl_unpriv_disabled)
+		sysctl_unpriv_disabled = get_unpriv_sysctl_disabled();
+	if (sysctl_unpriv_disabled && !(spec->unpriv.caps & (1ULL << CAP_BPF)))
+		return false;
+	if (unpriv_mitigations_disabled < 0)
+		unpriv_mitigations_disabled = get_unpriv_mitigations_disabled();
+	if (unpriv_mitigations_disabled)
 		return false;
 	if ((spec->prog_flags & BPF_F_ANY_ALIGNMENT) && !EFFICIENT_UNALIGNED_ACCESS)
 		return false;
@@ -1138,6 +1231,123 @@ static int get_stream(int stream_id, int prog_fd, char *text, size_t text_sz)
 	return ret;
 }
 
+/*
+ * Fix up the program's BTF using BTF from a separate file.
+ *
+ * For __naked subprogs, clang drops parameter names from BTF. Find FUNC
+ * entries with anonymous parameters and replace their FUNC_PROTO with the
+ * properly-named version from the custom file.
+ */
+static int fixup_btf_from_path(struct bpf_object *obj, const char *path)
+{
+	struct btf *prog_btf, *custom_btf;
+	__u32 i, j, cnt, custom_cnt;
+	int err = 0;
+
+	prog_btf = bpf_object__btf(obj);
+	if (!prog_btf)
+		return 0;
+
+	custom_btf = btf__parse(path, NULL);
+	if (!ASSERT_OK_PTR(custom_btf, "parse_custom_btf"))
+		return -EINVAL;
+
+	cnt = btf__type_cnt(prog_btf);
+	custom_cnt = btf__type_cnt(custom_btf);
+
+	/* Fix up FUNC entries with anonymous params.
+	 * Save all data from prog_btf BEFORE calling btf__add_*,
+	 * since those calls may reallocate the BTF data buffer
+	 * and invalidate any pointers obtained from btf__type_by_id.
+	 */
+	for (i = 1; i < cnt; i++) {
+		const struct btf_type *t = btf__type_by_id(prog_btf, i);
+		const struct btf_type *fp, *custom_t, *custom_fp;
+		const struct btf_param *params, *custom_params;
+		__u32 ret_type_id, vlen;
+		__u32 *prog_param_types = NULL;
+		const char *name;
+		int new_proto_id;
+
+		if (!btf_is_func(t))
+			continue;
+
+		fp = btf__type_by_id(prog_btf, t->type);
+		if (!fp || !btf_is_func_proto(fp) || btf_vlen(fp) == 0)
+			continue;
+
+		/* Check if any param is anonymous */
+		params = btf_params(fp);
+		if (params[0].name_off != 0)
+			continue;
+
+		/* Find matching FUNC by name in custom BTF */
+		name = btf__name_by_offset(prog_btf, t->name_off);
+		if (!name)
+			continue;
+
+		for (j = 1; j < custom_cnt; j++) {
+			const char *cname;
+
+			custom_t = btf__type_by_id(custom_btf, j);
+			if (!btf_is_func(custom_t))
+				continue;
+			cname = btf__name_by_offset(custom_btf, custom_t->name_off);
+			if (cname && strcmp(name, cname) == 0)
+				break;
+		}
+		if (j >= custom_cnt)
+			continue;
+
+		custom_fp = btf__type_by_id(custom_btf, custom_t->type);
+		if (!custom_fp || !btf_is_func_proto(custom_fp))
+			continue;
+
+		vlen = btf_vlen(fp);
+		if (vlen != btf_vlen(custom_fp))
+			continue;
+
+		/* Save data before btf__add_* calls invalidate pointers */
+		ret_type_id = fp->type;
+		prog_param_types = malloc(vlen * sizeof(*prog_param_types));
+		if (!prog_param_types) {
+			err = -ENOMEM;
+			break;
+		}
+		for (j = 0; j < vlen; j++)
+			prog_param_types[j] = params[j].type;
+
+		/* Add a new FUNC_PROTO: param names from custom, types from prog */
+		new_proto_id = btf__add_func_proto(prog_btf, ret_type_id);
+		if (new_proto_id < 0) {
+			err = new_proto_id;
+			free(prog_param_types);
+			break;
+		}
+
+		custom_params = btf_params(custom_fp);
+		for (j = 0; j < vlen; j++) {
+			const char *pname;
+
+			pname = btf__name_by_offset(custom_btf, custom_params[j].name_off);
+			err = btf__add_func_param(prog_btf, pname ?: "", prog_param_types[j]);
+			if (err)
+				break;
+		}
+		free(prog_param_types);
+		if (err)
+			break;
+
+		/* Update the FUNC to point to the new FUNC_PROTO (re-fetch
+		 * since btf__add_* may have reallocated the data buffer).
+		 */
+		((struct btf_type *)btf__type_by_id(prog_btf, i))->type = new_proto_id;
+	}
+
+	btf__free(custom_btf);
+	return err;
+}
+
 /* this function is forced noinline and has short generic name to look better
  * in test_progs output (in case of a failure)
  */
@@ -1152,6 +1362,7 @@ void run_subtest(struct test_loader *tester,
 {
 	struct test_subspec *subspec = unpriv ? &spec->unpriv : &spec->priv;
 	int current_runtime = is_jit_enabled() ? JITED : NO_JITED;
+	int current_stack = is_large_stack_supported() ? LARGE_STACK : SMALL_STACK;
 	struct bpf_program *tprog = NULL, *tprog_iter;
 	struct bpf_link *link, *links[32] = {};
 	struct test_spec *spec_iter;
@@ -1165,6 +1376,12 @@ void run_subtest(struct test_loader *tester,
 	if (!test__start_subtest_with_desc(subspec->name, subspec->description))
 		return;
 
+	if (spec->skip_reason) {
+		printf("%s:SKIP: %s\n", __func__, spec->skip_reason);
+		test__skip();
+		return;
+	}
+
 	if ((get_current_arch() & spec->arch_mask) == 0) {
 		test__skip();
 		return;
@@ -1175,31 +1392,41 @@ void run_subtest(struct test_loader *tester,
 		return;
 	}
 
+	if ((current_stack & spec->stack_mask) == 0) {
+		test__skip();
+		return;
+	}
+
 	if (unpriv) {
 		if (!can_execute_unpriv(tester, spec)) {
 			test__skip();
 			test__end_subtest();
 			return;
 		}
-		if (drop_capabilities(&caps)) {
-			test__end_subtest();
-			return;
-		}
-		if (subspec->caps) {
-			err = cap_enable_effective(subspec->caps, NULL);
-			if (err) {
-				PRINT_FAIL("failed to set capabilities: %i, %s\n", err, strerror(-err));
-				goto subtest_cleanup;
-			}
-		}
+		if (!spec->prepare_priv && drop_capabilities(&caps, subspec->caps))
+			goto subtest_cleanup;
 	}
 
-	/* Implicitly reset to NULL if next test case doesn't specify */
+	/* Implicitly reset to NULL if next test case doesn't specify.
+	 * btf_custom_func_path also serves as btf_custom_path for kfunc resolution.
+	 */
 	open_opts->btf_custom_path = spec->btf_custom_path;
+	if (!open_opts->btf_custom_path)
+		open_opts->btf_custom_path = spec->btf_custom_func_path;
 
 	tobj = bpf_object__open_mem(obj_bytes, obj_byte_cnt, open_opts);
 	if (!ASSERT_OK_PTR(tobj, "obj_open_mem")) /* shouldn't happen */
 		goto subtest_cleanup;
+
+	/* Fix up __naked subprog BTF using a separate file with named params */
+	if (spec->btf_custom_func_path) {
+		err = fixup_btf_from_path(tobj, spec->btf_custom_func_path);
+		if (err) {
+			PRINT_FAIL("failed to fixup BTF from %s: %d\n",
+				   spec->btf_custom_func_path, err);
+			goto tobj_cleanup;
+		}
+	}
 
 	i = 0;
 	bpf_object__for_each_program(tprog_iter, tobj) {
@@ -1229,6 +1456,18 @@ void run_subtest(struct test_loader *tester,
 	 */
 	bpf_object__for_each_map(map, tobj)
 		bpf_map__set_autocreate(map, !unpriv || is_unpriv_capable_map(map));
+
+	if (unpriv && spec->prepare_priv) {
+		/*
+		 * Module BTF lookup needs CAP_SYS_ADMIN. Allow tests to prepare
+		 * their objects first, then verify programs with the requested caps.
+		 */
+		err = bpf_object__prepare(tobj);
+		if (!ASSERT_OK(err, "obj_prepare"))
+			goto tobj_cleanup;
+		if (drop_capabilities(&caps, subspec->caps))
+			goto tobj_cleanup;
+	}
 
 	err = bpf_object__load(tobj);
 	if (subspec->expect_failure) {
@@ -1307,24 +1546,15 @@ void run_subtest(struct test_loader *tester,
 		}
 
 		err = do_prog_test_run(bpf_program__fd(tprog), &retval,
-				       bpf_program__type(tprog) == BPF_PROG_TYPE_SYSCALL ? true : false,
+				       bpf_program__type(tprog) == BPF_PROG_TYPE_SYSCALL ||
+				       bpf_program__type(tprog) == BPF_PROG_TYPE_RAW_TRACEPOINT,
 				       spec->linear_sz);
 		if (!err && retval != subspec->retval && subspec->retval != POINTER_VALUE) {
 			PRINT_FAIL("Unexpected retval: %d != %d\n", retval, subspec->retval);
 			goto tobj_cleanup;
 		}
 
-		if (subspec->stderr.cnt) {
-			err = get_stream(2, bpf_program__fd(tprog),
-					 tester->log_buf, tester->log_buf_sz);
-			if (err <= 0) {
-				PRINT_FAIL("Unexpected retval from get_stream(): %d, errno = %d\n",
-					   err, errno);
-				goto tobj_cleanup;
-			}
-			emit_stderr(tester->log_buf, false /*force*/);
-			validate_msgs(tester->log_buf, &subspec->stderr, emit_stderr);
-		}
+		verify_stderr(bpf_program__fd(tprog), &subspec->stderr);
 
 		if (subspec->stdout.cnt) {
 			err = get_stream(1, bpf_program__fd(tprog),

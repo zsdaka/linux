@@ -71,7 +71,7 @@ bool is_ima_appraise_enabled(void)
  *
  * Return 1 to appraise or hash
  */
-int ima_must_appraise(struct mnt_idmap *idmap, struct inode *inode,
+int ima_must_appraise(const struct mnt_idmap *idmap, struct inode *inode,
 		      int mask, enum ima_hooks func)
 {
 	struct lsm_prop prop;
@@ -89,6 +89,11 @@ static int ima_fix_xattr(struct dentry *dentry, struct ima_iint_cache *iint)
 {
 	int rc, offset;
 	u8 algo = iint->ima_hash->algo;
+
+	if (IS_RDONLY(d_inode(dentry)))
+		return -EROFS;
+	if (IS_IMMUTABLE(d_inode(dentry)))
+		return -EPERM;
 
 	if (algo <= HASH_ALGO_SHA1) {
 		offset = 1;
@@ -195,8 +200,9 @@ enum hash_algo ima_get_hash_algo(const struct evm_ima_xattr_data *xattr_value,
 		return sig->hash_algo;
 	case EVM_IMA_XATTR_DIGSIG:
 		sig = (typeof(sig))xattr_value;
-		if (sig->version != 2 || xattr_len <= sizeof(*sig)
-		    || sig->hash_algo >= HASH_ALGO__LAST)
+		if ((sig->version != 2 && sig->version != 3) ||
+		    xattr_len <= sizeof(*sig) ||
+		    sig->hash_algo >= HASH_ALGO__LAST)
 			return ima_hash_algo;
 		return sig->hash_algo;
 	case IMA_XATTR_DIGEST_NG:
@@ -268,8 +274,13 @@ static int xattr_verify(enum ima_hooks func, struct ima_iint_cache *iint,
 		} else {
 			set_bit(IMA_DIGSIG, &iint->atomic_flags);
 		}
-		if (xattr_len - sizeof(xattr_value->type) - hash_start >=
-				iint->ima_hash->length)
+		/*
+		 * Use addition, not subtraction: sizeof() forces unsigned
+		 * math and a short xattr_len would wrap around, bypassing
+		 * this bounds check.
+		 */
+		if (xattr_len >= (int)sizeof(xattr_value->type) + hash_start +
+				(int)iint->ima_hash->length)
 			/*
 			 * xattr length may be longer. md5 hash in previous
 			 * version occupied 20 bytes in xattr, instead of 16
@@ -553,7 +564,7 @@ out:
 		status = INTEGRITY_FAIL;
 		cause = "unverifiable-signature";
 		integrity_audit_msg(audit_msgno, inode, filename,
-				    op, cause, rc, 0);
+				    op, cause, rc, 0, rc < 0 ? rc : 0);
 	} else if (status != INTEGRITY_PASS) {
 		/* Fix mode, but don't replace file signatures. */
 		if ((ima_appraise & IMA_APPRAISE_FIX) && !try_modsig &&
@@ -578,7 +589,7 @@ out:
 		}
 
 		integrity_audit_msg(audit_msgno, inode, filename,
-				    op, cause, rc, 0);
+				    op, cause, rc, 0, rc < 0 ? rc : 0);
 	} else {
 		ima_cache_flags(iint, func);
 	}
@@ -623,7 +634,7 @@ void ima_update_xattr(struct ima_iint_cache *iint, struct file *file)
  * This function is called from notify_change(), which expects the caller
  * to lock the inode's i_mutex.
  */
-static void ima_inode_post_setattr(struct mnt_idmap *idmap,
+static void ima_inode_post_setattr(const struct mnt_idmap *idmap,
 				   struct dentry *dentry, int ia_valid)
 {
 	struct inode *inode = d_backing_inode(dentry);
@@ -737,16 +748,18 @@ static int validate_hash_algo(struct dentry *dentry,
 		return -EACCES;
 
 	path = dentry_path(dentry, pathbuf, PATH_MAX);
+	if (IS_ERR(path))
+		path = NULL;
 
 	integrity_audit_msg(AUDIT_INTEGRITY_DATA, d_inode(dentry), path,
-			    "set_data", errmsg, -EACCES, 0);
+			    "set_data", errmsg, -EACCES, 0, -EACCES);
 
 	kfree(pathbuf);
 
 	return -EACCES;
 }
 
-static int ima_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int ima_inode_setxattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 			      const char *xattr_name, const void *xattr_value,
 			      size_t xattr_value_len, int flags)
 {
@@ -779,7 +792,7 @@ static int ima_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	return result;
 }
 
-static int ima_inode_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+static int ima_inode_set_acl(const struct mnt_idmap *idmap, struct dentry *dentry,
 			     const char *acl_name, struct posix_acl *kacl)
 {
 	if (evm_revalidate_status(acl_name))
@@ -788,7 +801,7 @@ static int ima_inode_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 	return 0;
 }
 
-static int ima_inode_removexattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int ima_inode_removexattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 				 const char *xattr_name)
 {
 	int result, digsig = -1;
@@ -804,7 +817,7 @@ static int ima_inode_removexattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	return result;
 }
 
-static int ima_inode_remove_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+static int ima_inode_remove_acl(const struct mnt_idmap *idmap, struct dentry *dentry,
 				const char *acl_name)
 {
 	return ima_inode_set_acl(idmap, dentry, acl_name, NULL);

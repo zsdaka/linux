@@ -103,7 +103,7 @@ static int hns_roce_create_srqc(struct hns_roce_dev *hr_dev,
 	ret = hns_roce_create_hw_ctx(hr_dev, mailbox, HNS_ROCE_CMD_CREATE_SRQ,
 				     srq->srqn);
 	if (ret)
-		ibdev_err(ibdev, "failed to config SRQC, ret = %d.\n", ret);
+		ibdev_err_ratelimited(ibdev, "failed to config SRQC, ret = %d.\n", ret);
 
 err_mbox:
 	hns_roce_free_cmd_mailbox(hr_dev, mailbox);
@@ -180,7 +180,7 @@ static int alloc_srq_idx(struct hns_roce_dev *hr_dev, struct hns_roce_srq *srq,
 
 	ret = hns_roce_mtr_create(hr_dev, &idx_que->mtr, &buf_attr,
 				  hr_dev->caps.idx_ba_pg_sz + PAGE_SHIFT,
-				  udata, addr);
+				  udata, addr, false);
 	if (ret) {
 		ibdev_err(ibdev,
 			  "failed to alloc SRQ idx mtr, ret = %d.\n", ret);
@@ -235,7 +235,7 @@ static int alloc_srq_wqe_buf(struct hns_roce_dev *hr_dev,
 
 	ret = hns_roce_mtr_create(hr_dev, &srq->buf_mtr, &buf_attr,
 				  hr_dev->caps.srqwqe_ba_pg_sz + PAGE_SHIFT,
-				  udata, addr);
+				  udata, addr, false);
 	if (ret)
 		ibdev_err(ibdev,
 			  "failed to alloc SRQ buf mtr, ret = %d.\n", ret);
@@ -477,11 +477,9 @@ int hns_roce_create_srq(struct ib_srq *ib_srq,
 	if (udata) {
 		resp.cap_flags = srq->cap_flags;
 		resp.srqn = srq->srqn;
-		if (ib_copy_to_udata(udata, &resp,
-				     min(udata->outlen, sizeof(resp)))) {
-			ret = -EFAULT;
+		ret = ib_respond_udata(udata, resp);
+		if (ret)
 			goto err_srqc;
-		}
 	}
 
 	return 0;

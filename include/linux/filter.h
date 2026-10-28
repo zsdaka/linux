@@ -21,6 +21,7 @@
 #include <linux/if_vlan.h>
 #include <linux/vmalloc.h>
 #include <linux/sockptr.h>
+#include <linux/static_call.h>
 #include <linux/u64_stats_sync.h>
 
 #include <net/sch_generic.h>
@@ -58,8 +59,9 @@ struct ctl_table_header;
 #define BPF_REG_H	BPF_REG_9	/* hlen, callee-saved */
 
 /* Kernel hidden auxiliary/helper register. */
-#define BPF_REG_AX		MAX_BPF_REG
-#define MAX_BPF_EXT_REG		(MAX_BPF_REG + 1)
+#define BPF_REG_PARAMS		MAX_BPF_REG
+#define BPF_REG_AX		(MAX_BPF_REG + 1)
+#define MAX_BPF_EXT_REG		(MAX_BPF_REG + 2)
 #define MAX_BPF_JIT_REG		MAX_BPF_EXT_REG
 
 /* unused opcode to mark special call to bpf_tail_call() helper */
@@ -96,6 +98,11 @@ struct ctl_table_header;
 
 /* BPF program can access up to 512 bytes of stack space. */
 #define MAX_BPF_STACK	512
+/*
+ * Stack budget of a program on a JIT that lays out frames of that size.
+ * The interpreter and JITs without such support keep MAX_BPF_STACK.
+ */
+#define MAX_BPF_STACK_JIT	2048
 
 /* Helper macros for filter block array initializers. */
 
@@ -247,6 +254,29 @@ static inline bool insn_is_mov_percpu_addr(const struct bpf_insn *insn)
 		.off   = 0,					\
 		.imm   = 1 })
 
+static inline bool bpf_is_unwind_goto(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_JCOND) && insn->src_reg == BPF_UNWIND_GOTO;
+}
+
+static inline bool bpf_is_unwind_exit(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_EXIT) && insn->src_reg == BPF_UNWIND_EXIT;
+}
+
+/*
+ * The caller of the main prog doesn't tell unwind_exit from exit. An extension
+ * is different: its caller is the caller of the subprog that it replaced.
+ * An exception callback returns from the frame of the main prog. After freplace
+ * or a tail call it returns to a prog that wasn't verified with the callback.
+ */
+static inline bool bpf_prog_can_unwind(const struct bpf_prog *prog)
+{
+	if (prog->aux->exception_cb)
+		return false;
+	return bpf_is_subprog(prog) || prog->type == BPF_PROG_TYPE_EXT;
+}
+
 static inline bool insn_is_zext(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_ALU | BPF_MOV | BPF_X) && insn->imm == 1;
@@ -380,6 +410,61 @@ static inline bool insn_is_cast_user(const struct bpf_insn *insn)
 
 /* Legacy alias */
 #define BPF_STX_XADD(SIZE, DST, SRC, OFF) BPF_ATOMIC_OP(SIZE, BPF_ADD, DST, SRC, OFF)
+
+/*
+ * Given a BPF_ATOMIC instruction @atomic_insn, return true if it is an
+ * atomic load or store, and false if it is a read-modify-write instruction.
+ */
+static inline bool
+bpf_atomic_is_load_store(const struct bpf_insn *atomic_insn)
+{
+	switch (atomic_insn->imm) {
+	case BPF_LOAD_ACQ:
+	case BPF_STORE_REL:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * A load-acquire is the only BPF_STX class instruction that reads into
+ * dst_reg from src_reg + off16, i.e. it has the operand roles of a BPF_LDX.
+ * Unlike bpf_atomic_is_load_store(), @insn is not assumed to be a BPF_ATOMIC
+ * instruction here, so that callers which walk all instruction classes can
+ * use this directly.
+ */
+static inline bool bpf_atomic_is_load_acq(const struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_STX &&
+	       (BPF_MODE(insn->code) == BPF_ATOMIC ||
+		BPF_MODE(insn->code) == BPF_PROBE_ATOMIC) &&
+	       insn->imm == BPF_LOAD_ACQ;
+}
+
+/*
+ * Given an instruction @insn, return the number of the BPF register that a
+ * BPF_ATOMIC reads the value at its memory operand into, or -1 if there is
+ * no such register. That is the register a BPF_PROBE_ATOMIC has to clear when
+ * the access faults. Like bpf_atomic_is_load_acq(), @insn is not assumed to
+ * be a BPF_ATOMIC here.
+ */
+static inline int bpf_atomic_load_reg(const struct bpf_insn *insn)
+{
+	if (BPF_CLASS(insn->code) != BPF_STX ||
+	    (BPF_MODE(insn->code) != BPF_ATOMIC &&
+	     BPF_MODE(insn->code) != BPF_PROBE_ATOMIC))
+		return -1;
+
+	switch (insn->imm) {
+	case BPF_LOAD_ACQ:
+		return insn->dst_reg;
+	case BPF_CMPXCHG:
+		return BPF_REG_0;
+	default:
+		return (insn->imm & BPF_FETCH) ? insn->src_reg : -1;
+	}
+}
 
 /* Memory store, *(uint *) (dst_reg + off16) = imm32 */
 
@@ -748,6 +833,27 @@ static inline u32 bpf_prog_run_pin_on_cpu(const struct bpf_prog *prog,
 	return ret;
 }
 
+static inline bool is_stack_arg_ldx(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_LDX | BPF_MEM | BPF_DW) &&
+	       insn->src_reg == BPF_REG_PARAMS &&
+	       insn->off > 0 && insn->off % 8 == 0;
+}
+
+static inline bool is_stack_arg_st(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_ST | BPF_MEM | BPF_DW) &&
+	       insn->dst_reg == BPF_REG_PARAMS &&
+	       insn->off < 0 && insn->off % 8 == 0;
+}
+
+static inline bool is_stack_arg_stx(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_STX | BPF_MEM | BPF_DW) &&
+	       insn->dst_reg == BPF_REG_PARAMS &&
+	       insn->off < 0 && insn->off % 8 == 0;
+}
+
 #define BPF_SKB_CB_LEN QDISC_CB_PRIV_LEN
 
 struct bpf_skb_data_end {
@@ -1027,6 +1133,19 @@ static inline unsigned int bpf_prog_size(unsigned int proglen)
 		   offsetof(struct bpf_prog, insns[proglen]));
 }
 
+bool bpf_prog_has_arena_insns(const struct bpf_prog *prog);
+
+/*
+ * Whether a JIT has to set up the arena base for @prog. A program bound to
+ * an arena need not touch it, libbpf binds the arena of an object to every
+ * program in it. The flag caches bpf_prog_has_arena_insns() for the function
+ * about to be JITed, see bpf_prog_jit_compile() and jit_subprogs().
+ */
+static inline bool bpf_prog_uses_arena_insns(const struct bpf_prog *prog)
+{
+	return prog->aux->uses_arena_insns;
+}
+
 static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
 {
 	/* When classic BPF programs have been loaded and the arch
@@ -1159,14 +1278,53 @@ bool bpf_jit_inlines_helper_call(s32 imm);
 bool bpf_jit_supports_subprog_tailcalls(void);
 bool bpf_jit_supports_percpu_insn(void);
 bool bpf_jit_supports_kfunc_call(void);
+bool bpf_jit_supports_callx(void);
+bool bpf_jit_supports_kfunc_ret_reg_pair(void);
+bool bpf_jit_supports_unwind(void);
+bool bpf_jit_supports_stack_args(void);
+bool bpf_jit_supports_arena_args(void);
 bool bpf_jit_supports_far_kfunc_call(void);
 bool bpf_jit_supports_exceptions(void);
 bool bpf_jit_supports_ptr_xchg(void);
 bool bpf_jit_supports_arena(void);
+bool bpf_jit_supports_arena_scalar(void);
 bool bpf_jit_supports_insn(struct bpf_insn *insn, bool in_arena);
 bool bpf_jit_supports_private_stack(void);
+bool bpf_jit_supports_large_stack(void);
 bool bpf_jit_supports_timed_may_goto(void);
 bool bpf_jit_supports_fsession(void);
+
+struct bpf_jit_arg_abi {
+	/* Argument registers of the kernel convention. */
+	u8 nr_arg_regs;
+	/* Round the register number up to an even one for 16-byte alignment. */
+	bool even_reg_align;
+	/* Round the stack slot up to an even one for 16-byte alignment. */
+	bool even_stack_align;
+	/* An argument may straddle the last register and the stack. */
+	bool split_at_boundary;
+	/* A later argument may reuse a register a stack-passed one skipped. */
+	bool backfill_after_stack;
+};
+
+const struct bpf_jit_arg_abi *bpf_jit_arg_abi(void);
+u32 bpf_jit_place_args(const struct bpf_jit_arg_abi *abi,
+		       const struct btf_func_model *fm, u8 *pos_of_slot);
+
+/* The JIT's scratch register, in place of an argument slot. */
+#define BPF_JIT_ARG_TMP		0xff
+
+/* Every argument slot moves at most once, and the scratch goes out and back. */
+#define BPF_JIT_MAX_ARG_MOVES	(MAX_BPF_FUNC_ARG_SLOTS + 2)
+
+struct bpf_jit_arg_move {
+	u8 dst;
+	u8 src;
+};
+
+u32 bpf_jit_plan_arg_moves(const struct bpf_jit_arg_abi *abi,
+			   const struct btf_func_model *fm,
+			   struct bpf_jit_arg_move *moves);
 u64 bpf_arch_uaddress_limit(void);
 void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie);
 u64 arch_bpf_timed_may_goto(void);
@@ -1187,24 +1345,11 @@ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 #ifdef CONFIG_BPF_SYSCALL
 struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
 				     const struct bpf_insn *patch, u32 len);
-struct bpf_insn_aux_data *bpf_dup_insn_aux_data(struct bpf_verifier_env *env);
-void bpf_restore_insn_aux_data(struct bpf_verifier_env *env,
-			       struct bpf_insn_aux_data *orig_insn_aux);
 #else
 static inline struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
 						   const struct bpf_insn *patch, u32 len)
 {
 	return ERR_PTR(-ENOTSUPP);
-}
-
-static inline struct bpf_insn_aux_data *bpf_dup_insn_aux_data(struct bpf_verifier_env *env)
-{
-	return NULL;
-}
-
-static inline void bpf_restore_insn_aux_data(struct bpf_verifier_env *env,
-					     struct bpf_insn_aux_data *orig_insn_aux)
-{
 }
 #endif /* CONFIG_BPF_SYSCALL */
 
@@ -1291,6 +1436,15 @@ extern long bpf_jit_limit_max;
 
 typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
 
+/*
+ * Flush the indirect branch predictors before reusing JIT memory, so that
+ * indirect jumps into a newly written program don't reuse predictions left
+ * behind by an old program that occupied the same space.
+ */
+void bpf_arch_pred_flush(void);
+DECLARE_STATIC_CALL(bpf_arch_pred_flush, bpf_arch_pred_flush);
+DECLARE_STATIC_KEY_FALSE(bpf_pred_flush_enabled);
+
 void bpf_jit_fill_hole_with_zero(void *area, unsigned int size);
 
 struct bpf_binary_header *
@@ -1305,7 +1459,7 @@ void bpf_jit_free(struct bpf_prog *fp);
 struct bpf_binary_header *
 bpf_jit_binary_pack_hdr(const struct bpf_prog *fp);
 
-void *bpf_prog_pack_alloc(u32 size, bpf_jit_fill_hole_t bpf_fill_ill_insns);
+void *bpf_prog_pack_alloc(u32 size, bpf_jit_fill_hole_t bpf_fill_ill_insns, bool was_classic);
 void bpf_prog_pack_free(void *ptr, u32 size);
 
 static inline bool bpf_prog_kallsyms_verify_off(const struct bpf_prog *fp)
@@ -1319,7 +1473,8 @@ bpf_jit_binary_pack_alloc(unsigned int proglen, u8 **ro_image,
 			  unsigned int alignment,
 			  struct bpf_binary_header **rw_hdr,
 			  u8 **rw_image,
-			  bpf_jit_fill_hole_t bpf_fill_ill_insns);
+			  bpf_jit_fill_hole_t bpf_fill_ill_insns,
+			  bool was_classic);
 int bpf_jit_binary_pack_finalize(struct bpf_binary_header *ro_header,
 				 struct bpf_binary_header *rw_header);
 void bpf_jit_binary_pack_free(struct bpf_binary_header *ro_header,
@@ -1819,6 +1974,11 @@ static __always_inline long __bpf_xdp_redirect_map(struct bpf_map *map, u64 inde
 
 	return XDP_REDIRECT;
 }
+
+int __bpf_sock_ops_load_hdr_opt(struct bpf_sock_ops_kern *bpf_sock,
+				void *search_res, u32 len, u64 flags);
+int __bpf_sock_ops_store_hdr_opt(struct bpf_sock_ops_kern *bpf_sock,
+				 const void *from, u32 len, u64 flags);
 
 #ifdef CONFIG_NET
 int __bpf_skb_load_bytes(const struct sk_buff *skb, u32 offset, void *to, u32 len);

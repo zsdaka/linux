@@ -360,6 +360,7 @@ static void rtw89_regd_setup_unii4(struct rtw89_dev *rtwdev,
 				   struct wiphy *wiphy)
 {
 	struct rtw89_regulatory_info *regulatory = &rtwdev->regulatory;
+	bool skip_acpi_dsm = rtwdev->hci.type == RTW89_HCI_TYPE_USB;
 	const struct rtw89_chip_info *chip = rtwdev->chip;
 	struct ieee80211_supported_band *sband;
 	struct rtw89_acpi_dsm_result res = {};
@@ -376,6 +377,9 @@ static void rtw89_regd_setup_unii4(struct rtw89_dev *rtwdev,
 		sband->n_channels -= RTW89_5GHZ_UNII4_CHANNEL_NUM;
 		return;
 	}
+
+	if (skip_acpi_dsm)
+		return;
 
 	bitmap_fill(regulatory->block_unii4, RTW89_REGD_MAX_COUNTRY_NUM);
 
@@ -417,21 +421,22 @@ static void __rtw89_regd_setup_policy_6ghz(struct rtw89_dev *rtwdev, bool block,
 		return;
 	}
 
-	if (block)
-		set_bit(index, regulatory->block_6ghz);
-	else
-		clear_bit(index, regulatory->block_6ghz);
+	assign_bit(index, regulatory->block_6ghz, block);
 }
 
 static void rtw89_regd_setup_policy_6ghz(struct rtw89_dev *rtwdev)
 {
 	struct rtw89_regulatory_info *regulatory = &rtwdev->regulatory;
+	bool skip_acpi_dsm = rtwdev->hci.type == RTW89_HCI_TYPE_USB;
 	const struct rtw89_acpi_country_code *country;
 	const struct rtw89_acpi_policy_6ghz *ptr;
 	struct rtw89_acpi_dsm_result res = {};
 	bool to_block;
 	int i, j;
 	int ret;
+
+	if (skip_acpi_dsm)
+		return;
 
 	ret = rtw89_acpi_evaluate_dsm(rtwdev, RTW89_ACPI_DSM_FUNC_6G_BP, &res);
 	if (ret) {
@@ -478,11 +483,15 @@ out:
 static void rtw89_regd_setup_policy_6ghz_sp(struct rtw89_dev *rtwdev)
 {
 	struct rtw89_regulatory_info *regulatory = &rtwdev->regulatory;
+	bool skip_acpi_dsm = rtwdev->hci.type == RTW89_HCI_TYPE_USB;
 	const struct rtw89_acpi_policy_6ghz_sp *ptr;
 	struct rtw89_acpi_dsm_result res = {};
 	bool enable;
 	u8 index;
 	int ret;
+
+	if (skip_acpi_dsm)
+		return;
 
 	ret = rtw89_acpi_evaluate_dsm(rtwdev, RTW89_ACPI_DSM_FUNC_6GHZ_SP_SUP, &res);
 	if (ret) {
@@ -524,12 +533,16 @@ out:
 static void rtw89_regd_setup_policy_6ghz_vlp(struct rtw89_dev *rtwdev)
 {
 	struct rtw89_regulatory_info *regulatory = &rtwdev->regulatory;
+	bool skip_acpi_dsm = rtwdev->hci.type == RTW89_HCI_TYPE_USB;
 	const struct rtw89_acpi_policy_6ghz_vlp *ptr = NULL;
 	struct rtw89_acpi_dsm_result res = {};
 	bool enable;
 	u8 index;
 	int ret;
 	u8 val;
+
+	if (skip_acpi_dsm)
+		return;
 
 	/* By default, allow 6 GHz VLP on all countries except US and CA. */
 	val = ~(RTW89_ACPI_CONF_6GHZ_VLP_US | RTW89_ACPI_CONF_6GHZ_VLP_CA);
@@ -574,6 +587,7 @@ static void rtw89_regd_setup_6ghz(struct rtw89_dev *rtwdev, struct wiphy *wiphy)
 {
 	const struct rtw89_chip_info *chip = rtwdev->chip;
 	bool chip_support_6ghz = chip->support_bands & BIT(NL80211_BAND_6GHZ);
+	bool skip_acpi_dsm = rtwdev->hci.type == RTW89_HCI_TYPE_USB;
 	bool regd_allow_6ghz = chip_support_6ghz;
 	struct ieee80211_supported_band *sband;
 	struct rtw89_acpi_dsm_result res = {};
@@ -581,6 +595,9 @@ static void rtw89_regd_setup_6ghz(struct rtw89_dev *rtwdev, struct wiphy *wiphy)
 	u8 val;
 
 	if (!chip_support_6ghz)
+		goto bottom;
+
+	if (skip_acpi_dsm)
 		goto bottom;
 
 	ret = rtw89_acpi_evaluate_dsm(rtwdev, RTW89_ACPI_DSM_FUNC_6G_DIS, &res);
@@ -646,6 +663,9 @@ static const char * const rtw89_regd_string[] = {
 	RTW89_DEF_REGD_STR(QATAR),
 	RTW89_DEF_REGD_STR(UK),
 	RTW89_DEF_REGD_STR(THAILAND),
+	RTW89_DEF_REGD_STR(NZ),
+	RTW89_DEF_REGD_STR(BR),
+	RTW89_DEF_REGD_STR(AR),
 };
 
 static_assert(ARRAY_SIZE(rtw89_regd_string) == RTW89_REGD_NUM);
@@ -661,9 +681,13 @@ const char *rtw89_regd_get_string(enum rtw89_regulation_type regd)
 static void rtw89_regd_setup_reg_rules(struct rtw89_dev *rtwdev)
 {
 	struct rtw89_regulatory_info *regulatory = &rtwdev->regulatory;
+	bool skip_acpi_dsm = rtwdev->hci.type == RTW89_HCI_TYPE_USB;
 	const struct rtw89_acpi_policy_reg_rules *ptr;
 	struct rtw89_acpi_dsm_result res = {};
 	int ret;
+
+	if (skip_acpi_dsm)
+		return;
 
 	regulatory->txpwr_uk_follow_etsi = true;
 
@@ -877,7 +901,6 @@ void rtw89_regd_notifier(struct wiphy *wiphy, struct regulatory_request *request
 	struct ieee80211_hw *hw = wiphy_to_ieee80211_hw(wiphy);
 	struct rtw89_dev *rtwdev = hw->priv;
 
-	wiphy_lock(wiphy);
 	rtw89_leave_ps_mode(rtwdev);
 
 	if (rtwdev->regulatory.programmed)
@@ -895,8 +918,6 @@ policy:
 	rtw89_regd_apply_policy_ant_gain(rtwdev);
 
 	rtw89_core_set_chip_txpwr(rtwdev);
-
-	wiphy_unlock(wiphy);
 }
 
 /* Maximum Transmit Power field (@raw) can be EIRP or PSD.
@@ -1067,7 +1088,7 @@ static bool __rtw89_reg_6ghz_power_recalc(struct rtw89_dev *rtwdev)
 	int count = 0;
 	u8 index;
 
-	rtw89_for_each_rtwvif(rtwdev, rtwvif) {
+	rtw89_for_each_active_rtwvif(rtwdev, rtwvif) {
 		rtw89_vif_for_each_link(rtwvif, rtwvif_link, link_id) {
 			chan = rtw89_chan_get(rtwdev, rtwvif_link->chanctx_idx);
 			if (chan->band_type != RTW89_BAND_6G)

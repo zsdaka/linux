@@ -4,15 +4,16 @@
  */
 
 #define _GNU_SOURCE
-#include <getopt.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <errno.h>
 #include <stdio.h>
 #include <time.h>
 
 #include "osnoise.h"
+#include "cli.h"
 
 struct osnoise_top_cpu {
 	unsigned long long	sum_runtime;
@@ -25,6 +26,7 @@ struct osnoise_top_cpu {
 	unsigned long long	irq_count;
 	unsigned long long	softirq_count;
 	unsigned long long	thread_count;
+	unsigned long long	ipi_count;
 
 	int			sum_cycles;
 };
@@ -164,6 +166,8 @@ static void osnoise_top_header(struct osnoise_tool *top)
 		goto eol;
 
 	trace_seq_printf(s, "          IRQ      Softirq       Thread");
+	if (params->common.ipi)
+		trace_seq_printf(s, "          IPI");
 
 eol:
 	if (pretty)
@@ -218,7 +222,10 @@ static void osnoise_top_print(struct osnoise_tool *tool, int cpu)
 
 	trace_seq_printf(s, "%12llu ", cpu_data->irq_count);
 	trace_seq_printf(s, "%12llu ", cpu_data->softirq_count);
-	trace_seq_printf(s, "%12llu\n", cpu_data->thread_count);
+	trace_seq_printf(s, "%12llu", cpu_data->thread_count);
+	if (params->common.ipi)
+		trace_seq_printf(s, " %12llu", cpu_data->ipi_count);
+	trace_seq_printf(s, "\n");
 }
 
 /*
@@ -242,205 +249,8 @@ osnoise_print_stats(struct osnoise_tool *top)
 
 	trace_seq_do_printf(trace->seq);
 	trace_seq_reset(trace->seq);
+	osnoise_report_invalid_events(top);
 	osnoise_report_missed_events(top);
-}
-
-/*
- * osnoise_top_usage - prints osnoise top usage message
- */
-static void osnoise_top_usage(struct osnoise_params *params)
-{
-	const char *tool, *mode, *desc;
-
-	static const char * const msg_start[] = {
-		"[-q] [-D] [-d s] [-a us] [-p us] [-r us] [-s us] [-S us] \\",
-		"	  [-T us] [-t [file]] [-e sys[:event]] [--filter <filter>] [--trigger <trigger>] \\",
-		"	  [-c cpu-list] [-H cpu-list] [-P priority] [-C [cgroup_name]] [--warm-up s]",
-		NULL,
-	};
-
-	static const char * const msg_opts[] = {
-		"	  -a/--auto: set automatic trace mode, stopping the session if argument in us sample is hit",
-		"	  -p/--period us: osnoise period in us",
-		"	  -r/--runtime us: osnoise runtime in us",
-		"	  -s/--stop us: stop trace if a single sample is higher than the argument in us",
-		"	  -S/--stop-total us: stop trace if the total sample is higher than the argument in us",
-		"	  -T/--threshold us: the minimum delta to be considered a noise",
-		"	  -c/--cpus cpu-list: list of cpus to run osnoise threads",
-		"	  -H/--house-keeping cpus: run rtla control threads only on the given cpus",
-		"	  -C/--cgroup [cgroup_name]: set cgroup, if no cgroup_name is passed, the rtla's cgroup will be inherited",
-		"	  -d/--duration time[s|m|h|d]: duration of the session",
-		"	  -D/--debug: print debug info",
-		"	  -t/--trace [file]: save the stopped trace to [file|osnoise_trace.txt]",
-		"	  -e/--event <sys:event>: enable the <sys:event> in the trace instance, multiple -e are allowed",
-		"	     --filter <filter>: enable a trace event filter to the previous -e event",
-		"	     --trigger <trigger>: enable a trace event trigger to the previous -e event",
-		"	  -q/--quiet print only a summary at the end",
-		"	  -P/--priority o:prio|r:prio|f:prio|d:runtime:period : set scheduling parameters",
-		"		o:prio - use SCHED_OTHER with prio",
-		"		r:prio - use SCHED_RR with prio",
-		"		f:prio - use SCHED_FIFO with prio",
-		"		d:runtime[us|ms|s]:period[us|ms|s] - use SCHED_DEADLINE with runtime and period",
-		"						       in nanoseconds",
-		"	     --warm-up s: let the workload run for s seconds before collecting data",
-		"	     --trace-buffer-size kB: set the per-cpu trace buffer size in kB",
-		"	     --on-threshold <action>: define action to be executed at stop-total threshold, multiple are allowed",
-		"	     --on-end: define action to be executed at measurement end, multiple are allowed",
-		NULL,
-	};
-
-	if (params->mode == MODE_OSNOISE) {
-		tool = "osnoise";
-		mode = "top";
-		desc = "a per-cpu summary of the OS noise";
-	} else {
-		tool = "hwnoise";
-		mode = "";
-		desc = "a summary of hardware-related noise";
-	}
-
-	common_usage(tool, mode, desc, msg_start, msg_opts);
-}
-
-/*
- * osnoise_top_parse_args - allocs, parse and fill the cmd line parameters
- */
-struct common_params *osnoise_top_parse_args(int argc, char **argv)
-{
-	struct osnoise_params *params;
-	int retval;
-	int c;
-	char *trace_output = NULL;
-
-	params = calloc_fatal(1, sizeof(*params));
-
-	actions_init(&params->common.threshold_actions);
-	actions_init(&params->common.end_actions);
-
-	if (strcmp(argv[0], "hwnoise") == 0) {
-		params->mode = MODE_HWNOISE;
-		/*
-		 * Reduce CPU usage for 75% to avoid killing the system.
-		 */
-		params->runtime = 750000;
-		params->period = 1000000;
-	}
-
-	while (1) {
-		static struct option long_options[] = {
-			{"auto",		required_argument,	0, 'a'},
-			{"help",		no_argument,		0, 'h'},
-			{"period",		required_argument,	0, 'p'},
-			{"quiet",		no_argument,		0, 'q'},
-			{"runtime",		required_argument,	0, 'r'},
-			{"stop",		required_argument,	0, 's'},
-			{"stop-total",		required_argument,	0, 'S'},
-			{"threshold",		required_argument,	0, 'T'},
-			{"trace",		optional_argument,	0, 't'},
-			{"trigger",		required_argument,	0, '0'},
-			{"filter",		required_argument,	0, '1'},
-			{"warm-up",		required_argument,	0, '2'},
-			{"trace-buffer-size",	required_argument,	0, '3'},
-			{"on-threshold",	required_argument,	0, '4'},
-			{"on-end",		required_argument,	0, '5'},
-			{0, 0, 0, 0}
-		};
-
-		if (common_parse_options(argc, argv, &params->common))
-			continue;
-
-		c = getopt_auto(argc, argv, long_options);
-
-		/* Detect the end of the options. */
-		if (c == -1)
-			break;
-
-		switch (c) {
-		case 'a':
-			/* set sample stop to auto_thresh */
-			params->common.stop_us = get_llong_from_str(optarg);
-
-			/* set sample threshold to 1 */
-			params->threshold = 1;
-
-			/* set trace */
-			if (!trace_output)
-				trace_output = "osnoise_trace.txt";
-
-			break;
-		case 'h':
-		case '?':
-			osnoise_top_usage(params);
-			break;
-		case 'p':
-			params->period = get_llong_from_str(optarg);
-			if (params->period > 10000000)
-				fatal("Period longer than 10 s");
-			break;
-		case 'q':
-			params->common.quiet = 1;
-			break;
-		case 'r':
-			params->runtime = get_llong_from_str(optarg);
-			if (params->runtime < 100)
-				fatal("Runtime shorter than 100 us");
-			break;
-		case 's':
-			params->common.stop_us = get_llong_from_str(optarg);
-			break;
-		case 'S':
-			params->common.stop_total_us = get_llong_from_str(optarg);
-			break;
-		case 't':
-			trace_output = parse_optional_arg(argc, argv);
-			if (!trace_output)
-				trace_output = "osnoise_trace.txt";
-			break;
-		case 'T':
-			params->threshold = get_llong_from_str(optarg);
-			break;
-		case '0': /* trigger */
-			if (params->common.events)
-				trace_event_add_trigger(params->common.events, optarg);
-			else
-				fatal("--trigger requires a previous -e");
-			break;
-		case '1': /* filter */
-			if (params->common.events)
-				trace_event_add_filter(params->common.events, optarg);
-			else
-				fatal("--filter requires a previous -e");
-			break;
-		case '2':
-			params->common.warmup = get_llong_from_str(optarg);
-			break;
-		case '3':
-			params->common.buffer_size = get_llong_from_str(optarg);
-			break;
-		case '4':
-			retval = actions_parse(&params->common.threshold_actions, optarg,
-					       "osnoise_trace.txt");
-			if (retval)
-				fatal("Invalid action %s", optarg);
-			break;
-		case '5':
-			retval = actions_parse(&params->common.end_actions, optarg,
-					       "osnoise_trace.txt");
-			if (retval)
-				fatal("Invalid action %s", optarg);
-			break;
-		default:
-			fatal("Invalid option");
-		}
-	}
-
-	if (trace_output)
-		actions_add_trace_output(&params->common.threshold_actions, trace_output);
-
-	if (geteuid())
-		fatal("osnoise needs root permission");
-
-	return &params->common;
 }
 
 /*
@@ -473,12 +283,119 @@ out_err:
 	return -1;
 }
 
+static void account_ipi(struct osnoise_tool *tool, unsigned long long dst_cpu)
+{
+	struct osnoise_top_cpu *cpu_data;
+	struct osnoise_top_data *data;
+	unsigned long long inc = 1;
+
+	data = tool->data;
+	cpu_data = &data->cpu_data[dst_cpu];
+
+	update_sum(&cpu_data->ipi_count, &inc);
+}
+
+/*
+ * osnoise_ipi_cpu_handler - this is the handler for single CPU IPI events.
+ */
+static int
+osnoise_ipi_cpu_handler(struct trace_seq *s, struct tep_record *record,
+		     struct tep_event *event, void *context)
+{
+	struct osnoise_tool *tool;
+	unsigned long long dst_cpu;
+	struct trace_instance *trace = context;
+
+	tool = container_of(trace, struct osnoise_tool, trace);
+	tep_get_field_val(s, event, "cpu", record, &dst_cpu, 1);
+
+	account_ipi(tool, dst_cpu);
+
+	return 0;
+}
+
+/*
+ * osnoise_ipi_cpu_unfiltered_handler - this is the handler for single CPU IPI
+ *                                      events. Slightly less optimized than
+ *                                      the filtered variant.
+ */
+static int
+osnoise_ipi_cpu_unfiltered_handler(struct trace_seq *s, struct tep_record *record,
+		     struct tep_event *event, void *context)
+{
+	struct osnoise_tool *tool;
+	unsigned long long dst_cpu;
+	struct osnoise_params *params;
+	struct trace_instance *trace = context;
+
+	tool = container_of(trace, struct osnoise_tool, trace);
+	params = to_osnoise_params(tool->params);
+	tep_get_field_val(s, event, "cpu", record, &dst_cpu, 1);
+
+	if (CPU_ISSET(dst_cpu, &params->common.monitored_cpus))
+		account_ipi(tool, dst_cpu);
+
+	return 0;
+}
+
+static cpu_set_t cpumask_tmp_cpus;
+
+/*
+ * osnoise_ipi_cpumask_handler - this is the handler for broadcasted IPI events.
+ */
+static int
+osnoise_ipi_cpumask_handler(struct trace_seq *s, struct tep_record *record,
+			 struct tep_event *event, void *context)
+{
+	struct trace_instance *trace = context;
+	struct osnoise_tool *tool;
+	struct osnoise_params *params;
+	struct tep_format_field *field;
+	cpu_set_t *event_cpus;
+	int len;
+
+	tool = container_of(trace, struct osnoise_tool, trace);
+	params = to_osnoise_params(tool->params);
+
+	field = tep_find_field(event, "cpumask");
+	if (!field)
+		return 0;
+
+	event_cpus = tep_get_field_raw(s, event, "cpumask", record, &len, 1);
+	if (!event_cpus) {
+		err_msg("Failed to get cpumask field\n");
+		return 0;
+	}
+
+	/*
+	 * Even if already filtering for such an intersection, we need to compute
+	 * the intersection here as the @cpumask field may contain non-monitored
+	 * CPUs.
+	 */
+	CPU_AND(&cpumask_tmp_cpus, event_cpus, &params->common.monitored_cpus);
+
+	/*
+	 * Computing the mask weight is overkill but there is no leaner option
+	 * provided by glibc, e.g cpumask_first() or somesuch.
+	 */
+	if (CPU_COUNT(&cpumask_tmp_cpus)) {
+		for (int cpu = 0; cpu < nr_cpus; cpu++) {
+			if (CPU_ISSET(cpu, &cpumask_tmp_cpus))
+				account_ipi(tool, cpu);
+		}
+	}
+
+	return 0;
+}
+
 /*
  * osnoise_init_top - initialize a osnoise top tool with parameters
  */
 struct osnoise_tool *osnoise_init_top(struct common_params *params)
 {
+	bool ipi_filters_enabled;
 	struct osnoise_tool *tool;
+	int retval;
 
 	tool = osnoise_init_tool("osnoise_top");
 	if (!tool)
@@ -493,7 +410,46 @@ struct osnoise_tool *osnoise_init_top(struct common_params *params)
 	tep_register_event_handler(tool->trace.tep, -1, "ftrace", "osnoise",
 				   osnoise_top_handler, NULL);
 
+	if (!params->ipi)
+		goto out;
+
+	retval = tracefs_event_enable(tool->trace.inst, "ipi", "ipi_send_cpu");
+	if (retval < 0 && !errno) {
+		err_msg("Could not find ipi_send_cpu event\n");
+		goto out_err;
+	}
+
+	retval = tracefs_event_enable(tool->trace.inst, "ipi", "ipi_send_cpumask");
+	if (retval < 0 && !errno) {
+		err_msg("Could not find ipi_send_cpumask event\n");
+		goto out_err;
+	}
+
+	if (params->cpus) {
+		retval = osnoise_init_ipi_filters(tool, params, &ipi_filters_enabled);
+		if (retval < 0)
+			goto out_err;
+	}
+
+	/*
+	 * If no filtering is available and we're tracing all CPUs, we can still
+	 * use the filtered callback since stats are collected for all CPUs.
+	 */
+	tep_register_event_handler(tool->trace.tep, -1, "ipi", "ipi_send_cpu",
+				   (!params->cpus || ipi_filters_enabled) ?
+				   osnoise_ipi_cpu_handler :
+				   osnoise_ipi_cpu_unfiltered_handler,
+				   NULL);
+
+	tep_register_event_handler(tool->trace.tep, -1, "ipi", "ipi_send_cpumask",
+				   osnoise_ipi_cpumask_handler, NULL);
+
+out:
 	return tool;
+out_err:
+	osnoise_free_top_tool(tool);
+	osnoise_destroy_tool(tool);
+	return NULL;
 }
 
 struct tool_ops osnoise_top_ops = {

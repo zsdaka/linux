@@ -164,14 +164,14 @@ mlx5e_tx_get_gso_ihs(struct mlx5e_txqsq *sq, struct sk_buff *skb)
 		else
 			ihs = skb_inner_tcp_all_headers(skb);
 		stats->tso_inner_packets++;
-		stats->tso_inner_bytes += skb->len - ihs;
+		stats->tso_inner_bytes += skb->len;
 	} else {
 		if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4)
 			ihs = skb_transport_offset(skb) + sizeof(struct udphdr);
 		else
 			ihs = skb_tcp_all_headers(skb);
 		stats->tso_packets++;
-		stats->tso_bytes += skb->len - ihs;
+		stats->tso_bytes += skb->len;
 	}
 
 	return ihs;
@@ -849,7 +849,7 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 	mlx5_cqwq_update_db_record(&cq->wq);
 
 	/* ensure cq space is freed before enabling more cqes */
-	wmb();
+	dma_wmb();
 
 	sq->dma_fifo_cc = dma_fifo_cc;
 	sq->cc = sqcc;

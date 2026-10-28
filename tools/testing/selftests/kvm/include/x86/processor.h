@@ -23,7 +23,10 @@ extern bool host_cpu_is_intel;
 extern bool host_cpu_is_amd;
 extern bool host_cpu_is_hygon;
 extern bool host_cpu_is_amd_compatible;
+extern bool host_cpu_is_zhaoxin;
+extern bool host_cpu_is_intel_compatible;
 extern u64 guest_tsc_khz;
+extern struct kvm_mmu guest_mmu;
 
 #ifndef MAX_NR_CPUID_ENTRIES
 #define MAX_NR_CPUID_ENTRIES 100
@@ -38,7 +41,24 @@ extern u64 guest_tsc_khz;
 
 const char *ex_str(int vector);
 
-#define X86_EFLAGS_FIXED	 (1u << 1)
+#define X86_EFLAGS_CF		BIT(0)  /* Carry Flag */
+#define X86_EFLAGS_FIXED	BIT(1)  /* Bit 1 - always on */
+#define X86_EFLAGS_PF		BIT(2)  /* Parity Flag */
+#define X86_EFLAGS_AF		BIT(4)  /* Auxiliary carry Flag */
+#define X86_EFLAGS_ZF		BIT(6)  /* Zero Flag */
+#define X86_EFLAGS_SF		BIT(7)  /* Sign Flag */
+#define X86_EFLAGS_TF		BIT(8)  /* Trap Flag */
+#define X86_EFLAGS_IF		BIT(9)  /* Interrupt Flag */
+#define X86_EFLAGS_DF		BIT(10) /* Direction Flag */
+#define X86_EFLAGS_OF		BIT(11) /* Overflow Flag */
+#define X86_EFLAGS_IOPL		BIT(12) /* I/O Privilege Level (2 bits) */
+#define X86_EFLAGS_NT		BIT(14) /* Nested Task */
+#define X86_EFLAGS_RF		BIT(16) /* Resume Flag */
+#define X86_EFLAGS_VM		BIT(17) /* Virtual Mode */
+#define X86_EFLAGS_AC		BIT(18) /* Alignment Check/Access Control */
+#define X86_EFLAGS_VIF		BIT(19) /* Virtual Interrupt Flag */
+#define X86_EFLAGS_VIP		BIT(20) /* Virtual Interrupt Pending */
+#define X86_EFLAGS_ID		BIT(21) /* CPUID detection */
 
 #define X86_CR4_VME		(1ul << 0)
 #define X86_CR4_PVI		(1ul << 1)
@@ -191,12 +211,14 @@ struct kvm_x86_cpu_feature {
 #define	X86_FEATURE_PERFCTR_NB		KVM_X86_CPU_FEATURE(0x80000001, 0, ECX, 24)
 #define	X86_FEATURE_PERFCTR_LLC		KVM_X86_CPU_FEATURE(0x80000001, 0, ECX, 28)
 #define	X86_FEATURE_NX			KVM_X86_CPU_FEATURE(0x80000001, 0, EDX, 20)
+#define	X86_FEATURE_FXSR_OPT		KVM_X86_CPU_FEATURE(0x80000001, 0, EDX, 25)
 #define	X86_FEATURE_GBPAGES		KVM_X86_CPU_FEATURE(0x80000001, 0, EDX, 26)
 #define	X86_FEATURE_RDTSCP		KVM_X86_CPU_FEATURE(0x80000001, 0, EDX, 27)
 #define	X86_FEATURE_LM			KVM_X86_CPU_FEATURE(0x80000001, 0, EDX, 29)
 #define	X86_FEATURE_INVTSC		KVM_X86_CPU_FEATURE(0x80000007, 0, EDX, 8)
 #define	X86_FEATURE_RDPRU		KVM_X86_CPU_FEATURE(0x80000008, 0, EBX, 4)
 #define	X86_FEATURE_AMD_IBPB		KVM_X86_CPU_FEATURE(0x80000008, 0, EBX, 12)
+#define	X86_FEATURE_EFER_LMSLE_MBZ	KVM_X86_CPU_FEATURE(0x80000008, 0, EBX, 20)
 #define	X86_FEATURE_NPT			KVM_X86_CPU_FEATURE(0x8000000A, 0, EDX, 0)
 #define	X86_FEATURE_LBRV		KVM_X86_CPU_FEATURE(0x8000000A, 0, EDX, 1)
 #define	X86_FEATURE_NRIPS		KVM_X86_CPU_FEATURE(0x8000000A, 0, EDX, 3)
@@ -209,6 +231,8 @@ struct kvm_x86_cpu_feature {
 #define X86_FEATURE_SEV			KVM_X86_CPU_FEATURE(0x8000001F, 0, EAX, 1)
 #define X86_FEATURE_SEV_ES		KVM_X86_CPU_FEATURE(0x8000001F, 0, EAX, 3)
 #define X86_FEATURE_SEV_SNP		KVM_X86_CPU_FEATURE(0x8000001F, 0, EAX, 4)
+#define	X86_FEATURE_AUTOIBRS		KVM_X86_CPU_FEATURE(0x80000021, 0, EAX, 8)
+#define	X86_FEATURE_GP_ON_USER_CPUID	KVM_X86_CPU_FEATURE(0x80000021, 0, EAX, 17)
 #define	X86_FEATURE_PERFMON_V2		KVM_X86_CPU_FEATURE(0x80000022, 0, EAX, 0)
 #define	X86_FEATURE_LBR_PMC_FREEZE	KVM_X86_CPU_FEATURE(0x80000022, 0, EAX, 2)
 
@@ -378,8 +402,7 @@ static inline unsigned int x86_model(unsigned int eax)
 #define PTE_GET_PA(pte)		((pte) & PHYSICAL_PAGE_MASK)
 #define PTE_GET_PFN(pte)        (PTE_GET_PA(pte) >> PAGE_SHIFT)
 
-/* General Registers in 64-Bit Mode */
-struct gpr64_regs {
+struct guest_regs {
 	u64 rax;
 	u64 rcx;
 	u64 rdx;
@@ -396,7 +419,37 @@ struct gpr64_regs {
 	u64 r13;
 	u64 r14;
 	u64 r15;
+	u64 rflags;
 };
+
+extern struct guest_regs guest_regs;
+
+#define GUEST_REG_OFFSET(name) \
+	[off_##name] "i" (offsetof(struct guest_regs, name))
+
+#define GUEST_REGS_OFFSETS	\
+	GUEST_REG_OFFSET(rax),	\
+	GUEST_REG_OFFSET(rcx),	\
+	GUEST_REG_OFFSET(rdx),	\
+	GUEST_REG_OFFSET(rbx),	\
+	GUEST_REG_OFFSET(rsp),	\
+	GUEST_REG_OFFSET(rbp),	\
+	GUEST_REG_OFFSET(rsi),	\
+	GUEST_REG_OFFSET(rdi),	\
+	GUEST_REG_OFFSET(r8),	\
+	GUEST_REG_OFFSET(r9),	\
+	GUEST_REG_OFFSET(r10),	\
+	GUEST_REG_OFFSET(r11),	\
+	GUEST_REG_OFFSET(r12),	\
+	GUEST_REG_OFFSET(r13),	\
+	GUEST_REG_OFFSET(r14),	\
+	GUEST_REG_OFFSET(r15),	\
+	GUEST_REG_OFFSET(rflags)
+
+#define GUEST_REG(name) "guest_regs + %c[off_" #name "]"
+
+#define GUEST_SWITCH_GPR_ASM(name) \
+	"xchg %%" #name ", " GUEST_REG(name) "\n\t"
 
 struct desc64 {
 	u16 limit0;
@@ -564,6 +617,14 @@ static inline void set_cr0(u64 val)
 	__asm__ __volatile__("mov %0, %%cr0" : : "r" (val) : "memory");
 }
 
+static inline u64 get_cr2(void)
+{
+	u64 cr2;
+
+	__asm__ __volatile__("mov %%cr2, %[cr2]" : [cr2]"=r"(cr2));
+	return cr2;
+}
+
 static inline u64 get_cr3(void)
 {
 	u64 cr3;
@@ -724,6 +785,12 @@ static inline bool this_cpu_is_hygon(void)
 	return this_cpu_vendor_string_is("HygonGenuine");
 }
 
+static inline bool this_cpu_is_zhaoxin(void)
+{
+	return this_cpu_vendor_string_is("CentaurHauls") ||
+	       this_cpu_vendor_string_is("  Shanghai  ");
+}
+
 static inline u32 __this_cpu_has(u32 function, u32 index, u8 reg, u8 lo, u8 hi)
 {
 	u32 gprs[4];
@@ -859,6 +926,11 @@ static inline void write_sse_reg(int reg, const sse128_t *data)
 	}
 }
 
+static inline void invlpg(u64 addr)
+{
+	__asm__ __volatile__("invlpg (%0)" : : "r"(addr) : "memory");
+}
+
 static inline void cpu_relax(void)
 {
 	asm volatile("rep; nop" ::: "memory");
@@ -894,6 +966,11 @@ static inline void udelay(unsigned long usec)
 struct kvm_x86_state *vcpu_save_state(struct kvm_vcpu *vcpu);
 void vcpu_load_state(struct kvm_vcpu *vcpu, struct kvm_x86_state *state);
 void kvm_x86_state_cleanup(struct kvm_x86_state *state);
+
+static inline bool kvm_x86_state_is_guest_mode(struct kvm_x86_state *state)
+{
+	return state->nested.size && (state->nested.flags & KVM_STATE_NESTED_GUEST_MODE);
+}
 
 const struct kvm_msr_list *kvm_get_msr_index_list(void);
 const struct kvm_msr_list *kvm_get_feature_msr_index_list(void);
@@ -1104,7 +1181,6 @@ static inline void vcpu_set_cpuid(struct kvm_vcpu *vcpu)
 void vcpu_set_cpuid_property(struct kvm_vcpu *vcpu,
 			     struct kvm_x86_cpu_property property,
 			     u32 value);
-void vcpu_set_cpuid_maxphyaddr(struct kvm_vcpu *vcpu, u8 maxphyaddr);
 
 void vcpu_clear_cpuid_entry(struct kvm_vcpu *vcpu, u32 function);
 
@@ -1208,6 +1284,8 @@ struct idt_entry {
 void vm_install_exception_handler(struct kvm_vm *vm, int vector,
 			void (*handler)(struct ex_regs *));
 
+gva_t vm_alloc_stack(struct kvm_vm *vm, int nr_pages);
+
 /*
  * Exception fixup morphs #DE to an arbitrary magic vector so that '0' can be
  * used to signal "no expcetion".
@@ -1248,7 +1326,7 @@ void vm_install_exception_handler(struct kvm_vm *vm, int vector,
 	"lea 1f(%%rip), %%r10\n\t"				\
 	"lea 2f(%%rip), %%r11\n\t"				\
 	fep "1: " insn "\n\t"					\
-	"xor %%r9, %%r9\n\t"					\
+	"mov $0, %%r9d\n\t"					\
 	"2:\n\t"						\
 	"mov  %%r9b, %[vector]\n\t"				\
 	"mov  %%r10, %[error_code]\n\t"
@@ -1374,6 +1452,14 @@ static inline bool kvm_is_pmu_enabled(void)
 	return get_kvm_param_bool("enable_pmu");
 }
 
+static inline bool kvm_is_mediated_pmu_enabled(void)
+{
+	if (host_cpu_is_intel_compatible)
+		return get_kvm_intel_param_bool("enable_mediated_pmu");
+
+	return get_kvm_amd_param_bool("enable_mediated_pmu");
+}
+
 static inline bool kvm_is_forced_emulation_enabled(void)
 {
 	return !!get_kvm_param_integer("force_emulation_prefix");
@@ -1392,6 +1478,19 @@ static inline bool kvm_is_ignore_msrs(void)
 static inline bool kvm_is_lbrv_enabled(void)
 {
 	return !!get_kvm_amd_param_integer("lbrv");
+}
+
+/*
+ * Do NOT use this to check for nVMX or nSVM support.  Querying kvm_cpu_has()
+ * for either of X86_FEATURE_{VMX,SVM} is the idiomatic way to check for nested
+ * virtualization support.  Use this *only* to validate KVM's own enumeration.
+ */
+static inline bool kvm_is_nested_virtualization_enabled(void)
+{
+	if (host_cpu_is_intel)
+		return get_kvm_intel_param_bool("nested");
+
+	return get_kvm_amd_param_integer("nested");
 }
 
 u64 *vm_get_pte(struct kvm_vm *vm, gva_t gva);
@@ -1555,6 +1654,15 @@ u64 *tdp_get_pte(struct kvm_vm *vm, u64 l2_gpa);
 #define PFERR_GUEST_FINAL_MASK	BIT_ULL(PFERR_GUEST_FINAL_BIT)
 #define PFERR_GUEST_PAGE_MASK	BIT_ULL(PFERR_GUEST_PAGE_BIT)
 #define PFERR_IMPLICIT_ACCESS	BIT_ULL(PFERR_IMPLICIT_ACCESS_BIT)
+
+#define EPT_VIOLATION_ACC_READ		BIT(0)
+#define EPT_VIOLATION_ACC_WRITE		BIT(1)
+#define EPT_VIOLATION_ACC_INSTR		BIT(2)
+#define EPT_VIOLATION_PROT_READ		BIT(3)
+#define EPT_VIOLATION_PROT_WRITE	BIT(4)
+#define EPT_VIOLATION_PROT_EXEC		BIT(5)
+#define EPT_VIOLATION_GVA_IS_VALID	BIT(7)
+#define EPT_VIOLATION_GVA_TRANSLATED	BIT(8)
 
 bool sys_clocksource_is_based_on_tsc(void);
 

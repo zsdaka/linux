@@ -168,10 +168,10 @@ static unsigned long btrfs_compr_pool_scan(struct shrinker *sh, struct shrink_co
 	spin_unlock(&compr_pool.lock);
 
 	list_for_each_safe(tmp, next, &remove) {
-		struct page *page = list_entry(tmp, struct page, lru);
+		struct folio *folio = list_entry(tmp, struct folio, lru);
 
-		ASSERT(page_ref_count(page) == 1);
-		put_page(page);
+		ASSERT(folio_ref_count(folio) == 1);
+		folio_put(folio);
 	}
 
 	return freed;
@@ -355,21 +355,16 @@ struct compressed_bio *btrfs_alloc_compressed_write(struct btrfs_inode *inode,
 }
 
 /*
- * Add extra pages in the same compressed file extent so that we don't need to
+ * Add extra folios in the same compressed file extent so that we don't need to
  * re-read the same extent again and again.
  *
- * NOTE: this won't work well for subpage, as for subpage read, we lock the
- * full page then submit bio for each compressed/regular extents.
- *
- * This means, if we have several sectors in the same page points to the same
- * on-disk compressed data, we will re-read the same extent many times and
- * this function can only help for the next page.
+ * If in the same folio, we have several non-contiguous blocks which are pointing
+ * to the same on-disk compressed data, we will re-read the same extent many
+ * times, as this function can only help cross folio situations.
  */
-static noinline int add_ra_bio_pages(struct inode *inode,
-				     u64 compressed_end,
-				     struct compressed_bio *cb,
-				     int *memstall, unsigned long *pflags,
-				     bool direct_reclaim)
+static noinline int add_ra_bio_folios(struct inode *inode, u64 compressed_end,
+				      struct compressed_bio *cb, int *memstall,
+				      unsigned long *pflags, bool direct_reclaim)
 {
 	struct btrfs_fs_info *fs_info = inode_to_fs_info(inode);
 	pgoff_t end_index;
@@ -391,16 +386,6 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 	if (isize == 0)
 		return 0;
 
-	/*
-	 * For current subpage support, we only support 64K page size,
-	 * which means maximum compressed extent size (128K) is just 2x page
-	 * size.
-	 * This makes readahead less effective, so here disable readahead for
-	 * subpage for now, until full compressed write is supported.
-	 */
-	if (fs_info->sectorsize < PAGE_SIZE)
-		return 0;
-
 	/* For bs > ps cases, we don't support readahead for compressed folios for now. */
 	if (fs_info->block_min_order)
 		return 0;
@@ -416,7 +401,7 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 	}
 
 	while (cur < compressed_end) {
-		pgoff_t page_end;
+		u64 folio_end;
 		pgoff_t pg_index = cur >> PAGE_SHIFT;
 		gfp_t masked_constraint_gfp;
 		u32 add_size;
@@ -438,15 +423,15 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 				break;
 
 			/*
-			 * Jump to next page start as we already have page for
-			 * current offset.
+			 * Jump to the next folio as we already have a folio for
+			 * the current offset.
 			 */
 			cur += (folio_sz - offset);
 			continue;
 		}
 
 		/*
-		 * Since add_ra_bio_pages() is always speculative, suppress
+		 * Since add_ra_bio_folios() is always speculative, suppress
 		 * allocation warnings.
 		 */
 		masked_constraint_gfp = mapping_gfp_constraint(mapping, constraint_gfp);
@@ -457,8 +442,8 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 			break;
 
 		if (filemap_add_folio(mapping, folio, pg_index, cache_gfp)) {
-			/* There is already a page, skip to page end */
-			cur += folio_size(folio);
+			/* There is already a folio, skip to the folio end. */
+			cur += folio_size(folio) - offset_in_folio(folio, cur);
 			folio_put(folio);
 			continue;
 		}
@@ -475,14 +460,14 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 			break;
 		}
 
-		page_end = (pg_index << PAGE_SHIFT) + folio_size(folio) - 1;
-		btrfs_lock_extent(tree, cur, page_end, NULL);
+		folio_end = folio_next_pos(folio) - 1;
+		btrfs_lock_extent(tree, cur, folio_end, NULL);
 		read_lock(&em_tree->lock);
-		em = btrfs_lookup_extent_mapping(em_tree, cur, page_end + 1 - cur);
+		em = btrfs_lookup_extent_mapping(em_tree, cur, folio_end + 1 - cur);
 		read_unlock(&em_tree->lock);
 
 		/*
-		 * At this point, we have a locked page in the page cache for
+		 * At this point, we have a locked folio in the page cache for
 		 * these bytes in the file.  But, we have to make sure they map
 		 * to this compressed extent on disk.
 		 */
@@ -491,14 +476,14 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 		    (btrfs_extent_map_block_start(em) >> SECTOR_SHIFT) !=
 		    orig_bio->bi_iter.bi_sector) {
 			btrfs_free_extent_map(em);
-			btrfs_unlock_extent(tree, cur, page_end, NULL);
+			btrfs_unlock_extent(tree, cur, folio_end, NULL);
 			folio_unlock(folio);
 			folio_put(folio);
 			break;
 		}
-		add_size = min(btrfs_extent_map_end(em), page_end + 1) - cur;
+		add_size = min(btrfs_extent_map_end(em), folio_end + 1) - cur;
 		btrfs_free_extent_map(em);
-		btrfs_unlock_extent(tree, cur, page_end, NULL);
+		btrfs_unlock_extent(tree, cur, folio_end, NULL);
 
 		if (folio_contains(folio, end_index)) {
 			size_t zero_offset = offset_in_folio(folio, isize);
@@ -516,13 +501,7 @@ static noinline int add_ra_bio_pages(struct inode *inode,
 			folio_put(folio);
 			break;
 		}
-		/*
-		 * If it's subpage, we also need to increase its
-		 * subpage::readers number, as at endio we will decrease
-		 * subpage::readers and to unlock the page.
-		 */
-		if (fs_info->sectorsize < PAGE_SIZE)
-			btrfs_folio_set_lock(fs_info, folio, cur, add_size);
+		btrfs_folio_set_lock(fs_info, folio, cur, add_size);
 		folio_put(folio);
 		cur += add_size;
 	}
@@ -613,8 +592,8 @@ void btrfs_submit_compressed_read(struct btrfs_bio *bbio)
 	}
 	ASSERT(cb->bbio.bio.bi_iter.bi_size == compressed_len);
 
-	add_ra_bio_pages(&inode->vfs_inode, em_start + em_len, cb, &memstall,
-			 &pflags, !(bbio->bio.bi_opf & REQ_RAHEAD));
+	add_ra_bio_folios(&inode->vfs_inode, em_start + em_len, cb, &memstall,
+			  &pflags, !(bbio->bio.bi_opf & REQ_RAHEAD));
 
 	cb->len = bbio->bio.bi_iter.bi_size;
 	cb->bbio.bio.bi_iter.bi_sector = bbio->bio.bi_iter.bi_sector;
@@ -672,9 +651,9 @@ struct heuristic_ws {
 	u8 *sample;
 	u32 sample_size;
 	/* Buckets store counters for each byte value */
-	struct bucket_item *bucket;
+	struct bucket_item bucket[BUCKET_SIZE];
 	/* Sorting buffer */
-	struct bucket_item *bucket_b;
+	struct bucket_item bucket_b[BUCKET_SIZE];
 	struct list_head list;
 };
 
@@ -685,8 +664,6 @@ static void free_heuristic_ws(struct list_head *ws)
 	workspace = list_entry(ws, struct heuristic_ws, list);
 
 	kvfree(workspace->sample);
-	kfree(workspace->bucket);
-	kfree(workspace->bucket_b);
 	kfree(workspace);
 }
 
@@ -700,14 +677,6 @@ static struct list_head *alloc_heuristic_ws(struct btrfs_fs_info *fs_info)
 
 	ws->sample = kvmalloc(MAX_SAMPLE_SIZE, GFP_KERNEL);
 	if (!ws->sample)
-		goto fail;
-
-	ws->bucket = kzalloc_objs(*ws->bucket, BUCKET_SIZE);
-	if (!ws->bucket)
-		goto fail;
-
-	ws->bucket_b = kzalloc_objs(*ws->bucket_b, BUCKET_SIZE);
-	if (!ws->bucket_b)
 		goto fail;
 
 	INIT_LIST_HEAD(&ws->list);
@@ -991,7 +960,7 @@ bool btrfs_compress_level_valid(unsigned int type, int level)
 	return levels->min_level <= level && level <= levels->max_level;
 }
 
-/* Wrapper around find_get_page(), with extra error message. */
+/* Wrapper around filemap_get_folio(), with extra error message. */
 int btrfs_compress_filemap_get_folio(struct address_space *mapping, u64 start,
 				     struct folio **in_folio_ret)
 {
@@ -1192,22 +1161,6 @@ void __cold btrfs_exit_compress(void)
 }
 
 /*
- * The bvec is a single page bvec from a bio that contains folios from a filemap.
- *
- * Since the folio may be a large one, and if the bv_page is not a head page of
- * a large folio, then page->index is unreliable.
- *
- * Thus we need this helper to grab the proper file offset.
- */
-static u64 file_offset_from_bvec(const struct bio_vec *bvec)
-{
-	const struct page *page = bvec->bv_page;
-	const struct folio *folio = page_folio(page);
-
-	return (page_pgoff(folio, page) << PAGE_SHIFT) + bvec->bv_offset;
-}
-
-/*
  * Copy decompressed data from working buffer to pages.
  *
  * @buf:		The decompressed data buffer
@@ -1259,7 +1212,7 @@ int btrfs_decompress_buf2page(const char *buf, u32 buf_len,
 		 * cb->start may underflow, but subtracting that value can still
 		 * give us correct offset inside the full decompressed extent.
 		 */
-		bvec_offset = file_offset_from_bvec(&bvec) - cb->start;
+		bvec_offset = page_offset(bvec.bv_page) + bvec.bv_offset - cb->start;
 
 		/* Haven't reached the bvec range, exit */
 		if (decompressed + buf_len <= bvec_offset)
@@ -1535,10 +1488,11 @@ static bool sample_repeated_patterns(struct heuristic_ws *ws)
 static void heuristic_collect_sample(struct inode *inode, u64 start, u64 end,
 				     struct heuristic_ws *ws)
 {
-	struct page *page;
-	pgoff_t index, index_end;
-	u32 i, curr_sample_pos;
-	u8 *in_data;
+	const u32 blocksize = BTRFS_I(inode)->root->fs_info->sectorsize;
+	u64 cur = start;
+	u32 curr_sample_pos = 0;
+
+	ASSERT(IS_ALIGNED(start, blocksize) && IS_ALIGNED(end + 1, blocksize));
 
 	/*
 	 * Compression handles the input data by chunks of 128KiB
@@ -1549,38 +1503,30 @@ static void heuristic_collect_sample(struct inode *inode, u64 start, u64 end,
 	 * MAX_SAMPLE_SIZE - calculated under assumption that heuristic will
 	 * process no more than BTRFS_MAX_UNCOMPRESSED at a time.
 	 */
-	if (end - start > BTRFS_MAX_UNCOMPRESSED)
-		end = start + BTRFS_MAX_UNCOMPRESSED;
+	if (end + 1 - start > BTRFS_MAX_UNCOMPRESSED)
+		end = start + BTRFS_MAX_UNCOMPRESSED - 1;
 
-	index = start >> PAGE_SHIFT;
-	index_end = end >> PAGE_SHIFT;
+	while (cur < end) {
+		struct folio *folio;
+		void *in_data;
+		u64 next_pos;
 
-	/* Don't miss unaligned end */
-	if (!PAGE_ALIGNED(end))
-		index_end++;
+		folio = filemap_get_folio(inode->i_mapping, cur >> PAGE_SHIFT);
+		/* All folios inside the range should exist and be locked. */
+		ASSERT(!IS_ERR(folio));
+		next_pos = min_t(u64, end + 1, folio_next_pos(folio));
+		in_data = kmap_local_folio(folio, 0);
 
-	curr_sample_pos = 0;
-	while (index < index_end) {
-		page = find_get_page(inode->i_mapping, index);
-		in_data = kmap_local_page(page);
-		/* Handle case where the start is not aligned to PAGE_SIZE */
-		i = start % PAGE_SIZE;
-		while (i < PAGE_SIZE - SAMPLING_READ_SIZE) {
-			/* Don't sample any garbage from the last page */
-			if (start > end - SAMPLING_READ_SIZE)
-				break;
-			memcpy(&ws->sample[curr_sample_pos], &in_data[i],
-					SAMPLING_READ_SIZE);
-			i += SAMPLING_INTERVAL;
-			start += SAMPLING_INTERVAL;
+		for (; cur < next_pos; cur += SAMPLING_INTERVAL) {
+			memcpy(&ws->sample[curr_sample_pos],
+			       in_data + offset_in_folio(folio, cur),
+			       SAMPLING_READ_SIZE);
 			curr_sample_pos += SAMPLING_READ_SIZE;
 		}
 		kunmap_local(in_data);
-		put_page(page);
-
-		index++;
+		folio_put(folio);
+		cur = next_pos;
 	}
-
 	ws->sample_size = curr_sample_pos;
 }
 

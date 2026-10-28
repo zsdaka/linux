@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
 /*
- * Copyright (C) 2024-2025 Intel Corporation
+ * Copyright (C) 2024-2026 Intel Corporation
  */
 #ifndef __iwl_mld_h__
 #define __iwl_mld_h__
@@ -29,6 +29,7 @@
 #include "notif.h"
 #include "scan.h"
 #include "rx.h"
+#include "tx.h"
 #include "thermal.h"
 #include "low_latency.h"
 #include "constants.h"
@@ -172,7 +173,6 @@
  * @debug_max_sleep: maximum sleep time in D3 (for debug purposes)
  * @led: the led device
  * @mcc_src: the source id of the MCC, comes from the firmware
- * @bios_enable_puncturing: is puncturing enabled by bios
  * @fw_id_to_ba: maps a fw (BA) id to a corresponding Block Ack session data.
  * @num_rx_ba_sessions: tracks the number of active Rx Block Ack (BA) sessions.
  *	the driver ensures that new BA sessions are blocked once the maximum
@@ -189,7 +189,6 @@
  *	TX rate_n_flags for non-STA mgmt frames (toggles on every TX failure).
  * @set_tx_ant: stores the last TX antenna bitmask set by user space (if any)
  * @set_rx_ant: stores the last RX antenna bitmask set by user space (if any)
- * @fw_rates_ver_3: FW rates are in version 3
  * @low_latency: low-latency manager.
  * @tzone: thermal zone device's data
  * @cooling_dev: cooling device's related data
@@ -198,6 +197,7 @@
  *	being IBSS manager for that time and needing to respond to probe
  *	requests
  * @ptp_data: data of the PTP clock
+ * @tx_gp2: gp2 timestamping state for TX commands
  * @time_sync: time sync data.
  * @ftm_initiator: FTM initiator data
  * @nan_device_vif: points to the NAN device vif if exists
@@ -280,7 +280,6 @@ struct iwl_mld {
 	struct led_classdev led;
 #endif
 	enum iwl_mcc_source mcc_src;
-	bool bios_enable_puncturing;
 
 	struct iwl_mld_baid_data __rcu *fw_id_to_ba[IWL_MAX_BAID];
 	u8 num_rx_ba_sessions;
@@ -299,8 +298,6 @@ struct iwl_mld {
 	u8 set_tx_ant;
 	u8 set_rx_ant;
 
-	bool fw_rates_ver_3;
-
 	struct iwl_mld_low_latency low_latency;
 
 	bool ibss_manager;
@@ -310,6 +307,8 @@ struct iwl_mld {
 #endif
 
 	struct ptp_data ptp_data;
+
+	struct iwl_mld_tx_gp2 tx_gp2;
 
 	struct iwl_mld_time_sync_data __rcu *time_sync;
 
@@ -555,18 +554,29 @@ iwl_mld_allocate_##_type##_fw_id(struct iwl_mld *mld,					\
 	return -ENOSPC;									\
 }
 
+#define IWL_MLD_ALLOC_FN_STATIC(_type, _mac80211_type) \
+static IWL_MLD_ALLOC_FN(_type, _mac80211_type)
+
 static inline struct ieee80211_bss_conf *
 iwl_mld_fw_id_to_link_conf(struct iwl_mld *mld, u8 fw_link_id)
 {
+	struct ieee80211_bss_conf *link;
+
 	if (IWL_FW_CHECK(mld, fw_link_id >= mld->fw->ucode_capa.num_links,
 			 "Invalid fw_link_id: %d\n", fw_link_id))
 		return NULL;
 
-	return wiphy_dereference(mld->wiphy,
+	link = wiphy_dereference(mld->wiphy,
 				 mld->fw_id_to_bss_conf[fw_link_id]);
+	if (IS_ERR(link))
+		return NULL;
+
+	return link;
 }
 
 #define MSEC_TO_TU(_msec)	((_msec) * 1000 / 1024)
+
+int iwl_mld_get_systime(struct iwl_mld *mld, u32 *gp2);
 
 void iwl_mld_add_vif_debugfs(struct ieee80211_hw *hw,
 			     struct ieee80211_vif *vif);

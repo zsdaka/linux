@@ -271,7 +271,8 @@ static struct connection *__find_con(int nodeid, int r)
 {
 	struct connection *con;
 
-	hlist_for_each_entry_rcu(con, &connection_hash[r], list) {
+	hlist_for_each_entry_srcu(con, &connection_hash[r], list,
+			srcu_read_lock_held(&connections_srcu)) {
 		if (con->nodeid == nodeid)
 			return con;
 	}
@@ -426,7 +427,8 @@ static int addr_to_nodeid(struct sockaddr_storage *addr, int *nodeid,
 
 	idx = srcu_read_lock(&connections_srcu);
 	for (i = 0; i < CONN_HASH_SIZE; i++) {
-		hlist_for_each_entry_rcu(con, &connection_hash[i], list) {
+		hlist_for_each_entry_srcu(con, &connection_hash[i], list,
+				srcu_read_lock_held(&connections_srcu)) {
 			WARN_ON_ONCE(!con->addr_count);
 
 			spin_lock(&con->addrs_lock);
@@ -517,13 +519,11 @@ static void lowcomms_write_space(struct sock *sk)
 {
 	struct connection *con = sock2con(sk);
 
-	clear_bit(SOCK_NOSPACE, &con->sock->flags);
+	sk_clear_nospace(sk);
 
 	spin_lock_bh(&con->writequeue_lock);
-	if (test_and_clear_bit(CF_APP_LIMITED, &con->flags)) {
+	if (test_and_clear_bit(CF_APP_LIMITED, &con->flags))
 		con->sock->sk->sk_write_pending--;
-		clear_bit(SOCKWQ_ASYNC_NOSPACE, &con->sock->flags);
-	}
 
 	lowcomms_queue_swork(con);
 	spin_unlock_bh(&con->writequeue_lock);
@@ -1389,12 +1389,12 @@ static int send_to_sock(struct connection *con)
 	if (ret == -EAGAIN || ret == 0) {
 		lock_sock(con->sock->sk);
 		spin_lock_bh(&con->writequeue_lock);
-		if (test_bit(SOCKWQ_ASYNC_NOSPACE, &con->sock->flags) &&
+		if (test_bit(SOCK_NOSPACE, &con->sock->flags) &&
 		    !test_and_set_bit(CF_APP_LIMITED, &con->flags)) {
 			/* Notify TCP that we're limited by the
 			 * application window size.
 			 */
-			set_bit(SOCK_NOSPACE, &con->sock->sk->sk_socket->flags);
+			sk_set_nospace(con->sock->sk);
 			con->sock->sk->sk_write_pending++;
 
 			clear_bit(CF_SEND_PENDING, &con->flags);
@@ -1729,7 +1729,8 @@ void dlm_lowcomms_shutdown(void)
 
 	idx = srcu_read_lock(&connections_srcu);
 	for (i = 0; i < CONN_HASH_SIZE; i++) {
-		hlist_for_each_entry_rcu(con, &connection_hash[i], list) {
+		hlist_for_each_entry_srcu(con, &connection_hash[i], list,
+				srcu_read_lock_held(&connections_srcu)) {
 			shutdown_connection(con, true);
 			stop_connection_io(con);
 			flush_workqueue(process_workqueue);
@@ -1968,7 +1969,8 @@ void dlm_lowcomms_exit(void)
 
 	idx = srcu_read_lock(&connections_srcu);
 	for (i = 0; i < CONN_HASH_SIZE; i++) {
-		hlist_for_each_entry_rcu(con, &connection_hash[i], list) {
+		hlist_for_each_entry_srcu(con, &connection_hash[i], list,
+				srcu_read_lock_held(&connections_srcu)) {
 			spin_lock(&connections_lock);
 			hlist_del_rcu(&con->list);
 			spin_unlock(&connections_lock);
@@ -1980,4 +1982,5 @@ void dlm_lowcomms_exit(void)
 		}
 	}
 	srcu_read_unlock(&connections_srcu, idx);
+	srcu_barrier(&connections_srcu);
 }

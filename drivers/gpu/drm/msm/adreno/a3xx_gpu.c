@@ -25,6 +25,8 @@
 
 extern bool hang_debug;
 
+#define A3XX_VBIF_XIN_HALT_CTRL0_MASK	GENMASK(5, 0)
+
 static void a3xx_dump(struct msm_gpu *gpu);
 static bool a3xx_idle(struct msm_gpu *gpu);
 
@@ -266,12 +268,6 @@ static int a3xx_hw_init(struct msm_gpu *gpu)
 	/* Turn on performance counters: */
 	gpu_write(gpu, REG_A3XX_RBBM_PERFCTR_CTL, 0x01);
 
-	/* Enable the perfcntrs that we use.. */
-	for (i = 0; i < gpu->num_perfcntrs; i++) {
-		const struct msm_gpu_perfcntr *perfcntr = &gpu->perfcntrs[i];
-		gpu_write(gpu, perfcntr->select_reg, perfcntr->select_val);
-	}
-
 	gpu_write(gpu, REG_A3XX_RBBM_INT_0_MASK, A3XX_INT0_MASK);
 
 	ret = adreno_hw_init(gpu);
@@ -502,18 +498,64 @@ static u64 a3xx_gpu_busy(struct msm_gpu *gpu, unsigned long *out_sample_rate)
 	return busy_cycles;
 }
 
+static int a3xx_vbif_halt(struct msm_gpu *gpu)
+{
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	u32 mask = A3XX_VBIF_XIN_HALT_CTRL0_MASK;
+	u32 ack;
+	int ret;
+
+	/* A306(A) only have three VBIF XIN ports. */
+	if (adreno_is_a306(adreno_gpu) || adreno_is_a306a(adreno_gpu))
+		mask = GENMASK(2, 0);
+
+	gpu_write(gpu, REG_A3XX_VBIF_XIN_HALT_CTRL0, mask);
+	ret = spin_until(((ack = gpu_read(gpu, REG_A3XX_VBIF_XIN_HALT_CTRL1)) &
+			  mask) == mask);
+	gpu_write(gpu, REG_A3XX_VBIF_XIN_HALT_CTRL0, 0);
+
+	if (ret)
+		return -EBUSY;
+
+	return 0;
+}
+
+static int a3xx_pm_suspend(struct msm_gpu *gpu)
+{
+	int ret;
+
+	if (!a3xx_idle(gpu))
+		return -EBUSY;
+
+	ret = a3xx_vbif_halt(gpu);
+	if (ret)
+		return ret;
+
+	return msm_gpu_pm_suspend(gpu);
+}
+
 static u32 a3xx_get_rptr(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 {
 	ring->memptrs->rptr = gpu_read(gpu, REG_AXXX_CP_RB_RPTR);
 	return ring->memptrs->rptr;
 }
 
-static const struct msm_gpu_perfcntr perfcntrs[] = {
-	{ REG_A3XX_SP_PERFCOUNTER6_SELECT, REG_A3XX_RBBM_PERFCTR_SP_6_LO,
-			SP_ALU_ACTIVE_CYCLES, "ALUACTIVE" },
-	{ REG_A3XX_SP_PERFCOUNTER7_SELECT, REG_A3XX_RBBM_PERFCTR_SP_7_LO,
-			SP_FS_FULL_ALU_INSTRUCTIONS, "ALUFULL" },
-};
+static bool a3xx_progress(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
+{
+	struct msm_cp_state cp_state = {
+		.ib1_base = gpu_read(gpu, REG_AXXX_CP_IB1_BASE),
+		.ib2_base = gpu_read(gpu, REG_AXXX_CP_IB2_BASE),
+		.ib1_rem  = gpu_read(gpu, REG_AXXX_CP_IB1_BUFSZ),
+		.ib2_rem  = gpu_read(gpu, REG_AXXX_CP_IB2_BUFSZ),
+	};
+	bool progress;
+
+	progress = !!memcmp(&cp_state, &ring->last_cp_state, sizeof(cp_state));
+
+	ring->last_cp_state = cp_state;
+
+	return progress;
+}
 
 static struct msm_gpu *a3xx_gpu_init(struct drm_device *dev)
 {
@@ -541,9 +583,6 @@ static struct msm_gpu *a3xx_gpu_init(struct drm_device *dev)
 
 	adreno_gpu = &a3xx_gpu->base;
 	gpu = &adreno_gpu->base;
-
-	gpu->perfcntrs = perfcntrs;
-	gpu->num_perfcntrs = ARRAY_SIZE(perfcntrs);
 
 	adreno_gpu->registers = a3xx_registers;
 
@@ -597,7 +636,7 @@ const struct adreno_gpu_funcs a3xx_gpu_funcs = {
 		.get_param = adreno_get_param,
 		.set_param = adreno_set_param,
 		.hw_init = a3xx_hw_init,
-		.pm_suspend = msm_gpu_pm_suspend,
+		.pm_suspend = a3xx_pm_suspend,
 		.pm_resume = msm_gpu_pm_resume,
 		.recover = a3xx_recover,
 		.submit = a3xx_submit,
@@ -612,6 +651,7 @@ const struct adreno_gpu_funcs a3xx_gpu_funcs = {
 		.gpu_state_put = adreno_gpu_state_put,
 		.create_vm = adreno_create_vm,
 		.get_rptr = a3xx_get_rptr,
+		.progress = a3xx_progress,
 	},
 	.init = a3xx_gpu_init,
 };

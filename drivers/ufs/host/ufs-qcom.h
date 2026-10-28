@@ -268,6 +268,17 @@ enum {
  */
 #define NUM_TX_R1W1 13
 
+/* bit definitions for UFS_AH8_CFG register */
+#define CC_UFS_SYS_CLK_REQ_EN          BIT(2)
+#define CC_UFS_ICE_CORE_CLK_REQ_EN     BIT(3)
+#define CC_UFS_UNIPRO_CORE_CLK_REQ_EN  BIT(4)
+#define CC_UFS_AUXCLK_REQ_EN           BIT(5)
+
+#define UFS_HW_CLK_CTRL_EN	(CC_UFS_SYS_CLK_REQ_EN |\
+				CC_UFS_ICE_CORE_CLK_REQ_EN |\
+				CC_UFS_UNIPRO_CORE_CLK_REQ_EN |\
+				CC_UFS_AUXCLK_REQ_EN)
+
 static inline void
 ufs_qcom_get_controller_revision(struct ufs_hba *hba,
 				 u8 *major, u16 *minor, u16 *step)
@@ -319,8 +330,9 @@ struct ufs_qcom_host {
 	struct phy *generic_phy;
 	struct ufs_hba *hba;
 	struct ufs_pa_layer_attr dev_req_params;
-	struct clk_bulk_data *clks;
-	u32 num_clks;
+	struct clk *tx_lane0_sync_clk;
+	struct clk *rx_lane0_sync_clk;
+	struct clk *rx_lane1_sync_clk;
 	bool is_lane_clks_enabled;
 
 	struct icc_path *icc_ddr;
@@ -350,6 +362,7 @@ struct ufs_qcom_host {
 	bool esi_enabled;
 
 	u32 saved_tx_eq_g1_setting;
+	u32 boot_spare_cfg;
 };
 
 struct ufs_qcom_drvdata {

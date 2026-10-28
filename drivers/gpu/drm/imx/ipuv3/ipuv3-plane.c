@@ -14,6 +14,7 @@
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_panic_helper.h>
 #include <drm/drm_print.h>
 
 #include <video/imx-ipu-v3.h>
@@ -297,21 +298,18 @@ void ipu_plane_disable_deferred(struct drm_plane *plane)
 	}
 }
 
-static void ipu_plane_state_reset(struct drm_plane *plane)
+static struct drm_plane_state *ipu_plane_state_create_state(struct drm_plane *plane)
 {
 	struct ipu_plane_state *ipu_state;
 
-	if (plane->state) {
-		ipu_state = to_ipu_plane_state(plane->state);
-		__drm_atomic_helper_plane_destroy_state(plane->state);
-		kfree(ipu_state);
-		plane->state = NULL;
-	}
-
 	ipu_state = kzalloc_obj(*ipu_state);
 
-	if (ipu_state)
-		__drm_atomic_helper_plane_reset(plane, &ipu_state->base);
+	if (!ipu_state)
+		return ERR_PTR(-ENOMEM);
+
+	__drm_atomic_helper_plane_state_init(&ipu_state->base, plane);
+
+	return &ipu_state->base;
 }
 
 static struct drm_plane_state *
@@ -358,14 +356,15 @@ static bool ipu_plane_format_mod_supported(struct drm_plane *plane,
 static const struct drm_plane_funcs ipu_plane_funcs = {
 	.update_plane	= drm_atomic_helper_update_plane,
 	.disable_plane	= drm_atomic_helper_disable_plane,
-	.reset		= ipu_plane_state_reset,
+	.atomic_create_state = ipu_plane_state_create_state,
 	.atomic_duplicate_state	= ipu_plane_duplicate_state,
 	.atomic_destroy_state	= ipu_plane_destroy_state,
 	.format_mod_supported = ipu_plane_format_mod_supported,
+	DRM_PANIC_PLANE_FUNCS,
 };
 
 static int ipu_plane_atomic_check(struct drm_plane *plane,
-				  struct drm_atomic_state *state)
+				  struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state,
 									   plane);
@@ -527,7 +526,7 @@ static int ipu_plane_atomic_check(struct drm_plane *plane,
 }
 
 static void ipu_plane_atomic_disable(struct drm_plane *plane,
-				     struct drm_atomic_state *state)
+				     struct drm_atomic_commit *state)
 {
 	struct ipu_plane *ipu_plane = to_ipu_plane(plane);
 
@@ -572,7 +571,7 @@ static void ipu_calculate_bursts(u32 width, u32 cpp, u32 stride,
 }
 
 static void ipu_plane_atomic_update(struct drm_plane *plane,
-				    struct drm_atomic_state *state)
+				    struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state,
 									   plane);
@@ -804,7 +803,7 @@ bool ipu_plane_atomic_update_pending(struct drm_plane *plane)
 	return false;
 }
 int ipu_planes_assign_pre(struct drm_device *dev,
-			  struct drm_atomic_state *state)
+			  struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *old_crtc_state, *crtc_state;
 	struct drm_plane_state *plane_state;

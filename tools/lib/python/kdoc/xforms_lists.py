@@ -29,6 +29,7 @@ class CTransforms:
         (CMatch("__aligned"), ""),
         (CMatch("__counted_by"), ""),
         (CMatch("__counted_by_(le|be)"), ""),
+        (CMatch("__counted_by_ptr"), ""),
         (CMatch("__guarded_by"), ""),
         (CMatch("__pt_guarded_by"), ""),
         (CMatch("__packed"), ""),
@@ -44,24 +45,16 @@ class CTransforms:
         (CMatch("DECLARE_HASHTABLE"), r"unsigned long \1[1 << ((\2) - 1)]"),
         (CMatch("DECLARE_KFIFO"), r"\2 *\1"),
         (CMatch("DECLARE_KFIFO_PTR"), r"\2 *\1"),
+        (CMatch("DECLARE_PIDS"), r"struct pid *\1[(\2) + 1]"),
         (CMatch("(?:__)?DECLARE_FLEX_ARRAY"), r"\1 \2[]"),
         (CMatch("DEFINE_DMA_UNMAP_ADDR"), r"dma_addr_t \1"),
         (CMatch("DEFINE_DMA_UNMAP_LEN"), r"__u32 \1"),
         (CMatch("VIRTIO_DECLARE_FEATURES"), r"union { u64 \1; u64 \1_array[VIRTIO_FEATURES_U64S]; }"),
-        (CMatch("__cond_acquires"), ""),
-        (CMatch("__cond_releases"), ""),
-        (CMatch("__acquires"), ""),
-        (CMatch("__releases"), ""),
-        (CMatch("__must_hold"), ""),
-        (CMatch("__must_not_hold"), ""),
-        (CMatch("__must_hold_shared"), ""),
-        (CMatch("__cond_acquires_shared"), ""),
-        (CMatch("__acquires_shared"), ""),
-        (CMatch("__releases_shared"), ""),
+        (CMatch("__SYSFS_FUNCTION_ALTERNATIVE"), r"union { \1+ }"),
         (CMatch("__attribute__"), ""),
 
         #
-        # Macro __struct_group() creates an union with an anonymous
+        # Macro __struct_group() creates a union with an anonymous
         # and a non-anonymous struct, depending on the parameters. We only
         # need one of those at kernel-doc, as we won't be documenting the same
         # members twice.
@@ -70,6 +63,7 @@ class CTransforms:
         (CMatch("struct_group_attr"), r"struct { \3+ };"),
         (CMatch("struct_group_tagged"), r"struct { \3+ };"),
         (CMatch("__struct_group"), r"struct { \4+ };"),
+        (CMatch("context_lock_struct"), r"struct \1"),
     ]
 
     #: Transforms for function prototypes.
@@ -93,13 +87,27 @@ class CTransforms:
         (CMatch("__weak"), ""),
         (CMatch("__sched"), ""),
         (CMatch("__always_unused"), ""),
+        (CMatch("__maybe_unused"), ""),
         (CMatch("__printf"), ""),
         (CMatch("__(?:re)?alloc_size"), ""),
         (CMatch("__diagnose_as"), ""),
         (CMatch("DECL_BUCKET_PARAMS"), r"\1, \2"),
+        (CMatch("DEFINE_IDTENTRY_IRQ"), r"static void \1(struct pt_regs *regs, u32 vector)"),
+        (CMatch("__cond_acquires"), ""),
+        (CMatch("__cond_releases"), ""),
+        (CMatch("__acquires"), ""),
+        (CMatch("__releases"), ""),
+        (CMatch("__must_hold"), ""),
+        (CMatch("__must_not_hold"), ""),
+        (CMatch("__must_hold_shared"), ""),
+        (CMatch("__cond_acquires_shared"), ""),
+        (CMatch("__acquires_shared"), ""),
+        (CMatch("__releases_shared"), ""),
         (CMatch("__no_context_analysis"), ""),
         (CMatch("__attribute_const__"), ""),
         (CMatch("__attribute__"), ""),
+        (CMatch("STATIC_IFN_KUNIT"), ""),
+        (CMatch("INLINE_IFN_KUNIT"), ""),
 
         #
         # HACK: this is similar to process_export() hack. It is meant to
@@ -116,6 +124,7 @@ class CTransforms:
         (CMatch("__guarded_by"), ""),
         (CMatch("__pt_guarded_by"), ""),
         (CMatch("LIST_HEAD"), r"struct list_head \1"),
+        (CMatch("DECLARE_PER_CPU"), r"\1 \2[PER_CPU]; }"),
 
         (KernRe(r"(?://.*)$"), ""),
         (KernRe(r"(?:/\*.*\*/)"), ""),

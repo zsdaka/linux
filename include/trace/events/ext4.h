@@ -107,6 +107,26 @@ TRACE_DEFINE_ENUM(EXT4_FC_REASON_VERITY);
 TRACE_DEFINE_ENUM(EXT4_FC_REASON_MOVE_EXT);
 TRACE_DEFINE_ENUM(EXT4_FC_REASON_MAX);
 
+#undef EM
+#undef EMe
+#define EM(a)	TRACE_DEFINE_ENUM(EXT4_FC_SNAP_ERR_##a);
+#define EMe(a)	TRACE_DEFINE_ENUM(EXT4_FC_SNAP_ERR_##a);
+
+#define TRACE_SNAP_ERR						\
+	EM(NONE)						\
+	EM(ES_MISS)						\
+	EM(ES_DELAYED)						\
+	EM(ES_OTHER)						\
+	EM(INODES_CAP)						\
+	EM(RANGES_CAP)						\
+	EM(NOMEM)						\
+	EMe(INODE_LOC)
+
+TRACE_SNAP_ERR
+
+#undef EM
+#undef EMe
+
 #define show_fc_reason(reason)						\
 	__print_symbolic(reason,					\
 		{ EXT4_FC_REASON_XATTR,		"XATTR"},		\
@@ -2818,6 +2838,47 @@ TRACE_EVENT(ext4_fc_commit_stop,
 		  __entry->num_fc_ineligible, __entry->nblks_agg, __entry->tid)
 );
 
+#define EM(a)	{ EXT4_FC_SNAP_ERR_##a, #a },
+#define EMe(a)	{ EXT4_FC_SNAP_ERR_##a, #a }
+
+TRACE_EVENT(ext4_fc_lock_updates,
+	    TP_PROTO(struct super_block *sb, tid_t commit_tid, u64 locked_ns,
+		     unsigned int nr_inodes, unsigned int nr_ranges, int err,
+		     int snap_err),
+
+	TP_ARGS(sb, commit_tid, locked_ns, nr_inodes, nr_ranges, err, snap_err),
+
+	TP_STRUCT__entry(/* entry */
+		__field(dev_t, dev)
+		__field(tid_t, tid)
+		__field(u64, locked_ns)
+		__field(unsigned int, nr_inodes)
+		__field(unsigned int, nr_ranges)
+		__field(int, err)
+		__field(int, snap_err)
+	),
+
+	TP_fast_assign(/* assign */
+		__entry->dev = sb->s_dev;
+		__entry->tid = commit_tid;
+		__entry->locked_ns = locked_ns;
+		__entry->nr_inodes = nr_inodes;
+		__entry->nr_ranges = nr_ranges;
+		__entry->err = err;
+		__entry->snap_err = snap_err;
+	),
+
+	TP_printk("dev %d,%d tid %u locked_ns %llu nr_inodes %u nr_ranges %u err %d snap_err %s",
+		  MAJOR(__entry->dev), MINOR(__entry->dev), __entry->tid,
+		  __entry->locked_ns, __entry->nr_inodes, __entry->nr_ranges,
+		  __entry->err, __print_symbolic(__entry->snap_err,
+						 TRACE_SNAP_ERR))
+);
+
+#undef EM
+#undef EMe
+#undef TRACE_SNAP_ERR
+
 #define FC_REASON_NAME_STAT(reason)					\
 	show_fc_reason(reason),						\
 	__entry->fc_ineligible_rc[reason]
@@ -3094,6 +3155,215 @@ TRACE_EVENT(ext4_move_extent_exit,
 		  __entry->donor_ino,  __entry->donor_lblk,
 		  __entry->m_len, __entry->move_len, __entry->move_type,
 		  __entry->ret)
+);
+
+DECLARE_EVENT_CLASS(ext4_set_iomap_class,
+	TP_PROTO(struct inode *inode, struct ext4_map_blocks *map,
+		 loff_t offset, loff_t length, unsigned int flags),
+	TP_ARGS(inode, map, offset, length, flags),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(u64, ino)
+		__field(ext4_lblk_t, m_lblk)
+		__field(ext4_fsblk_t, pblk)
+		__field(unsigned int, m_len)
+		__field(unsigned int, m_flags)
+		__field(u64, m_seq)
+		__field(loff_t, offset)
+		__field(loff_t, length)
+		__field(unsigned int, iomap_flags)
+	),
+	TP_fast_assign(
+		__entry->dev		= inode->i_sb->s_dev;
+		__entry->ino		= inode->i_ino;
+		__entry->m_lblk		= map->m_lblk;
+		__entry->pblk		= map->m_pblk;
+		__entry->m_len		= map->m_len;
+		__entry->m_flags	= map->m_flags;
+		__entry->m_seq		= map->m_seq;
+		__entry->offset		= offset;
+		__entry->length		= length;
+		__entry->iomap_flags	= flags;
+
+	),
+	TP_printk("dev %d:%d ino %llu m_lblk %u pblk %llu m_len %u m_flags %s m_seq %llu orig_off 0x%llx orig_len 0x%llx iomap_flags 0x%x",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->ino, __entry->m_lblk, __entry->pblk, __entry->m_len,
+		  show_mflags(__entry->m_flags), __entry->m_seq,
+		  __entry->offset, __entry->length, __entry->iomap_flags)
+)
+
+#define DEFINE_SET_IOMAP_EVENT(name) \
+DEFINE_EVENT(ext4_set_iomap_class, name, \
+	TP_PROTO(struct inode *inode, struct ext4_map_blocks *map, \
+		 loff_t offset, loff_t length, unsigned int flags), \
+	TP_ARGS(inode, map, offset, length, flags))
+
+DEFINE_SET_IOMAP_EVENT(ext4_iomap_buffered_read_begin);
+DEFINE_SET_IOMAP_EVENT(ext4_iomap_buffered_write_begin);
+DEFINE_SET_IOMAP_EVENT(ext4_iomap_map_writeback_range);
+DEFINE_SET_IOMAP_EVENT(ext4_iomap_zero_begin);
+
+DECLARE_EVENT_CLASS(ext4_iomap_disksize_pending,
+	TP_PROTO(struct inode *inode),
+	TP_ARGS(inode),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(u64, ino)
+		__field(loff_t, i_disksize)
+	),
+	TP_fast_assign(
+		__entry->dev = inode->i_sb->s_dev;
+		__entry->ino = inode->i_ino;
+		__entry->i_disksize = READ_ONCE(EXT4_I(inode)->i_disksize);
+	),
+	TP_printk("dev %d:%d ino %llu i_disksize %lld",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->ino, __entry->i_disksize)
+);
+
+DEFINE_EVENT(ext4_iomap_disksize_pending, ext4_iomap_mark_disksize_pending,
+	TP_PROTO(struct inode *inode),
+	TP_ARGS(inode)
+);
+
+DEFINE_EVENT(ext4_iomap_disksize_pending, ext4_iomap_clear_disksize_pending,
+	TP_PROTO(struct inode *inode),
+	TP_ARGS(inode)
+);
+
+DEFINE_EVENT(ext4_iomap_disksize_pending, ext4_iomap_wait_disksize_pending,
+	TP_PROTO(struct inode *inode),
+	TP_ARGS(inode)
+);
+
+/* disksize pending I/O tracepoints for iomap Buffered I/O path */
+DECLARE_EVENT_CLASS(ext4_iomap_wb_disksize_pending,
+	TP_PROTO(struct inode *inode, loff_t io_offset, size_t io_size),
+	TP_ARGS(inode, io_offset, io_size),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(u64, ino)
+		__field(loff_t, io_offset)
+		__field(size_t, io_size)
+		__field(loff_t, i_size)
+		__field(loff_t, i_disksize)
+	),
+	TP_fast_assign(
+		__entry->dev = inode->i_sb->s_dev;
+		__entry->ino = inode->i_ino;
+		__entry->io_offset = io_offset;
+		__entry->io_size = io_size;
+		__entry->i_size = i_size_read(inode);
+		__entry->i_disksize = READ_ONCE(EXT4_I(inode)->i_disksize);
+	),
+	TP_printk("dev %d:%d ino %llu io_offset %lld io_size %zu i_size %lld i_disksize %lld",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->ino, __entry->io_offset, __entry->io_size,
+		  __entry->i_size, __entry->i_disksize)
+);
+
+DEFINE_EVENT(ext4_iomap_wb_disksize_pending,
+	ext4_iomap_wb_disksize_pending_submit,
+	TP_PROTO(struct inode *inode, loff_t io_offset, size_t io_size),
+	TP_ARGS(inode, io_offset, io_size)
+);
+
+DEFINE_EVENT(ext4_iomap_wb_disksize_pending,
+	ext4_iomap_wb_disksize_pending_wait,
+	TP_PROTO(struct inode *inode, loff_t io_offset, size_t io_size),
+	TP_ARGS(inode, io_offset, io_size)
+);
+
+TRACE_EVENT(ext4_iomap_wb_disksize_pending_complete,
+	TP_PROTO(struct inode *inode, loff_t io_offset, size_t io_size,
+		 int ret),
+	TP_ARGS(inode, io_offset, io_size, ret),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(u64, ino)
+		__field(loff_t, io_offset)
+		__field(size_t, io_size)
+		__field(loff_t, i_size)
+		__field(loff_t, i_disksize)
+		__field(int, ret)
+	),
+	TP_fast_assign(
+		__entry->dev = inode->i_sb->s_dev;
+		__entry->ino = inode->i_ino;
+		__entry->io_offset = io_offset;
+		__entry->io_size = io_size;
+		__entry->i_size = i_size_read(inode);
+		__entry->i_disksize = READ_ONCE(EXT4_I(inode)->i_disksize);
+		__entry->ret = ret;
+	),
+	TP_printk("dev %d:%d ino %llu io_offset %lld io_size %zu ret %d i_size %lld i_disksize %lld",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->ino, __entry->io_offset, __entry->io_size,
+		  __entry->ret, __entry->i_size, __entry->i_disksize)
+);
+
+/* i_disksize update tracepoint */
+TRACE_EVENT(ext4_iomap_wb_update_disksize,
+	TP_PROTO(struct inode *inode, loff_t end, loff_t i_size,
+		 loff_t i_disksize, loff_t new_disksize,
+		 bool is_disksize_grow),
+	TP_ARGS(inode, end, i_size, i_disksize, new_disksize,
+		is_disksize_grow),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(u64, ino)
+		__field(loff_t, end)
+		__field(loff_t, i_size)
+		__field(loff_t, i_disksize)
+		__field(loff_t, new_disksize)
+		__field(bool, is_disksize_grow)
+	),
+	TP_fast_assign(
+		__entry->dev = inode->i_sb->s_dev;
+		__entry->ino = inode->i_ino;
+		__entry->end = end;
+		__entry->i_size = i_size;
+		__entry->i_disksize = i_disksize;
+		__entry->new_disksize = new_disksize;
+		__entry->is_disksize_grow = is_disksize_grow;
+	),
+	TP_printk("dev %d:%d ino %llu end %lld i_size %lld i_disksize %lld new_disksize %lld is_disksize_grow %d",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->ino, __entry->end, __entry->i_size,
+		  __entry->i_disksize, __entry->new_disksize,
+		  __entry->is_disksize_grow)
+);
+
+/* Block zero EOF tracepoint */
+TRACE_EVENT(ext4_block_zero_eof,
+	TP_PROTO(struct inode *inode, loff_t from, loff_t length,
+		 bool did_zero, bool zero_written),
+	TP_ARGS(inode, from, length, did_zero, zero_written),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(u64, ino)
+		__field(loff_t, from)
+		__field(loff_t, length)
+		__field(loff_t, i_size)
+		__field(loff_t, i_disksize)
+		__field(bool, did_zero)
+		__field(bool, zero_written)
+	),
+	TP_fast_assign(
+		__entry->dev = inode->i_sb->s_dev;
+		__entry->ino = inode->i_ino;
+		__entry->from = from;
+		__entry->length = length;
+		__entry->i_size = inode->i_size;
+		__entry->i_disksize = READ_ONCE(EXT4_I(inode)->i_disksize);
+		__entry->did_zero = did_zero;
+		__entry->zero_written = zero_written;
+	),
+	TP_printk("dev %d:%d ino %llu zero EOF from %lld length %lld i_size %lld i_disksize %lld did_zero %d zero_written %d",
+		  MAJOR(__entry->dev), MINOR(__entry->dev), __entry->ino,
+		  __entry->from, __entry->length, __entry->i_size,
+		  __entry->i_disksize, __entry->did_zero, __entry->zero_written)
 );
 
 #endif /* _TRACE_EXT4_H */

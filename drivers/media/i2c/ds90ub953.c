@@ -426,6 +426,7 @@ static int ub953_set_routing(struct v4l2_subdev *sd,
 
 
 static int ub953_set_fmt(struct v4l2_subdev *sd,
+			 const struct v4l2_subdev_client_info *ci,
 			 struct v4l2_subdev_state *state,
 			 struct v4l2_subdev_format *format)
 {
@@ -1347,9 +1348,9 @@ static const struct ub953_hw_data ds90ub971_hw = {
 };
 
 static const struct i2c_device_id ub953_id[] = {
-	{ "ds90ub953-q1", (kernel_ulong_t)&ds90ub953_hw },
-	{ "ds90ub971-q1", (kernel_ulong_t)&ds90ub971_hw },
-	{}
+	{ .name = "ds90ub953-q1", .driver_data = (kernel_ulong_t)&ds90ub953_hw },
+	{ .name = "ds90ub971-q1", .driver_data = (kernel_ulong_t)&ds90ub971_hw },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, ub953_id);
 

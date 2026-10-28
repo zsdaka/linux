@@ -1529,14 +1529,14 @@ MODULE_DEVICE_TABLE(of, mip4_of_match);
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id mip4_acpi_match[] = {
-	{ "MLFS0000", 0},
-	{ },
+	{ .id = "MLFS0000" },
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, mip4_acpi_match);
 #endif
 
 static const struct i2c_device_id mip4_i2c_ids[] = {
-	{ MIP4_DEVICE_NAME },
+	{ .name = MIP4_DEVICE_NAME },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, mip4_i2c_ids);

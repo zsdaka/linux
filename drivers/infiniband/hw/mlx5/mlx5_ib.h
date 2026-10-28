@@ -24,6 +24,7 @@
 #include <rdma/mlx5_user_ioctl_cmds.h>
 #include <rdma/mlx5_user_ioctl_verbs.h>
 
+#include <linux/mlx5/data_direct.h>
 #include "srq.h"
 #include "qp.h"
 #include "macsec.h"
@@ -331,6 +332,10 @@ struct mlx5_ib_flow_db {
 #define MLX5_IB_QPT_DCT		IB_QPT_RESERVED4
 #define MLX5_IB_WR_UMR		IB_WR_RESERVED1
 
+/*
+ * A valid pdn is required when flags include MLX5_IB_UPD_XLT_ENABLE,
+ * MLX5_IB_UPD_XLT_PD or MLX5_IB_UPD_XLT_ACCESS.
+ */
 #define MLX5_IB_UPD_XLT_ZAP	      BIT(0)
 #define MLX5_IB_UPD_XLT_ENABLE	      BIT(1)
 #define MLX5_IB_UPD_XLT_ATOMIC	      BIT(2)
@@ -536,6 +541,7 @@ struct mlx5_ib_qp {
 	struct list_head	cq_recv_list;
 	struct list_head	cq_send_list;
 	struct mlx5_rate_limit	rl;
+	struct mlx5_rate_limit	rl_desired;
 	u32                     underlay_qpn;
 	u32			flags_en;
 	/*
@@ -774,13 +780,6 @@ struct umr_common {
 struct mlx5_ib_port_resources {
 	struct mlx5_ib_gsi_qp *gsi;
 	struct work_struct pkey_change_work;
-};
-
-struct mlx5_data_direct_resources {
-	u32 pdn;
-	u32 mkey;
-	u32 mkey_ro;
-	u8 mkey_ro_valid :1;
 };
 
 struct mlx5_ib_resources {
@@ -1092,8 +1091,9 @@ struct mlx5_macsec {
 struct mlx5_ib_dev {
 	struct ib_device		ib_dev;
 	struct mlx5_core_dev		*mdev;
-	struct mlx5_data_direct_dev	*data_direct_dev;
-	/* protect accessing data_direct_dev */
+	/* Protects data_direct_mr_list and serializes mr
+	 * registration/deregistration with data direct device unbind.
+	 */
 	struct mutex			data_direct_lock;
 	struct notifier_block		mdev_events;
 	struct notifier_block		sys_error_events;
@@ -1126,6 +1126,7 @@ struct mlx5_ib_dev {
 	spinlock_t		reset_flow_resource_lock;
 	struct list_head	qp_list;
 	struct list_head data_direct_mr_list;
+	struct notifier_block data_direct_nb;
 	/* Array with num_ports elements */
 	struct mlx5_ib_port	*port;
 	struct mlx5_sq_bfreg	bfreg;
@@ -1150,7 +1151,6 @@ struct mlx5_ib_dev {
 	u16 pkey_table_len;
 	u8 lag_ports;
 	struct mlx5_special_mkeys mkeys;
-	struct mlx5_data_direct_resources ddr;
 
 #ifdef CONFIG_MLX5_MACSEC
 	struct mlx5_macsec macsec;
@@ -1259,8 +1259,9 @@ to_mmmap(struct rdma_user_mmap_entry *rdma_entry)
 
 int mlx5_ib_dev_res_cq_init(struct mlx5_ib_dev *dev);
 int mlx5_ib_dev_res_srq_init(struct mlx5_ib_dev *dev);
-int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
-			struct mlx5_db *db);
+int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context,
+			const struct uverbs_attr_bundle *attrs, u16 attr_id,
+			unsigned long virt, struct mlx5_db *db);
 void mlx5_ib_db_unmap_user(struct mlx5_ib_ucontext *context, struct mlx5_db *db);
 void __mlx5_ib_cq_clean(struct mlx5_ib_cq *cq, u32 qpn, struct mlx5_ib_srq *srq);
 void mlx5_ib_cq_clean(struct mlx5_ib_cq *cq, u32 qpn, struct mlx5_ib_srq *srq);
@@ -1395,9 +1396,6 @@ int mlx5_ib_destroy_rwq_ind_table(struct ib_rwq_ind_table *wq_ind_table);
 struct ib_mr *mlx5_ib_reg_dm_mr(struct ib_pd *pd, struct ib_dm *dm,
 				struct ib_dm_mr_attr *attr,
 				struct uverbs_attr_bundle *attrs);
-void mlx5_ib_data_direct_bind(struct mlx5_ib_dev *ibdev,
-			      struct mlx5_data_direct_dev *dev);
-void mlx5_ib_data_direct_unbind(struct mlx5_ib_dev *ibdev);
 void mlx5_ib_revoke_data_direct_mrs(struct mlx5_ib_dev *dev);
 
 #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
@@ -1413,8 +1411,8 @@ int mlx5_odp_populate_xlt(void *xlt, size_t idx, size_t nentries,
 int mlx5_ib_advise_mr_prefetch(struct ib_pd *pd,
 			       enum ib_uverbs_advise_mr_advice advice,
 			       u32 flags, struct ib_sge *sg_list, u32 num_sge);
-int mlx5_ib_init_odp_mr(struct mlx5_ib_mr *mr);
-int mlx5_ib_init_dmabuf_mr(struct mlx5_ib_mr *mr);
+int mlx5_ib_init_odp_mr(struct mlx5_ib_mr *mr, struct ib_pd *pd);
+int mlx5_ib_init_dmabuf_mr(struct mlx5_ib_mr *mr, struct ib_pd *pd);
 #else /* CONFIG_INFINIBAND_ON_DEMAND_PAGING */
 static inline int mlx5_ib_odp_init_one(struct mlx5_ib_dev *ibdev) { return 0; }
 static inline int mlx5r_odp_create_eq(struct mlx5_ib_dev *dev,
@@ -1442,11 +1440,11 @@ mlx5_ib_advise_mr_prefetch(struct ib_pd *pd,
 {
 	return -EOPNOTSUPP;
 }
-static inline int mlx5_ib_init_odp_mr(struct mlx5_ib_mr *mr)
+static inline int mlx5_ib_init_odp_mr(struct mlx5_ib_mr *mr, struct ib_pd *pd)
 {
 	return -EOPNOTSUPP;
 }
-static inline int mlx5_ib_init_dmabuf_mr(struct mlx5_ib_mr *mr)
+static inline int mlx5_ib_init_dmabuf_mr(struct mlx5_ib_mr *mr, struct ib_pd *pd)
 {
 	return -EOPNOTSUPP;
 }
@@ -1510,6 +1508,8 @@ extern const struct uapi_definition mlx5_ib_flow_defs[];
 extern const struct uapi_definition mlx5_ib_qos_defs[];
 extern const struct uapi_definition mlx5_ib_std_types_defs[];
 extern const struct uapi_definition mlx5_ib_create_cq_defs[];
+extern const struct uapi_definition mlx5_ib_create_qp_defs[];
+extern const struct uapi_definition mlx5_ib_create_srq_defs[];
 
 static inline int is_qp1(enum ib_qp_type qp_type)
 {

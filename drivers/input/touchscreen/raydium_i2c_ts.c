@@ -1219,16 +1219,16 @@ static DEFINE_SIMPLE_DEV_PM_OPS(raydium_i2c_pm_ops,
 				raydium_i2c_suspend, raydium_i2c_resume);
 
 static const struct i2c_device_id raydium_i2c_id[] = {
-	{ "raydium_i2c" },
-	{ "rm32380" },
+	{ .name = "raydium_i2c" },
+	{ .name = "rm32380" },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(i2c, raydium_i2c_id);
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id raydium_acpi_id[] = {
-	{ "RAYD0001", 0 },
-	{ /* sentinel */ }
+	{ .id = "RAYD0001" },
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, raydium_acpi_id);
 #endif

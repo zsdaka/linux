@@ -1414,7 +1414,7 @@ static int intel_gpio_probe(struct intel_pinctrl *pctrl, int irq)
 			       IRQF_SHARED | IRQF_NO_THREAD,
 			       dev_name(pctrl->dev), pctrl);
 	if (ret)
-		return dev_err_probe(pctrl->dev, ret, "failed to request interrupt\n");
+		return ret;
 
 	/* Setup IRQ chip */
 	girq = &pctrl->chip.irq;
@@ -1556,13 +1556,13 @@ static int intel_pinctrl_probe_pwm(struct intel_pinctrl *pctrl,
 				   struct intel_community *community,
 				   unsigned short capability_offset)
 {
-	void __iomem *base = community->regs + capability_offset + 4;
 	static const struct pwm_lpss_boardinfo info = {
 		.clk_rate = 19200000,
 		.npwm = 1,
 		.base_unit_bits = 22,
 	};
 	struct pwm_chip *chip;
+	void __iomem *base;
 
 	if (!(community->features & PINCTRL_FEATURE_PWM))
 		return 0;
@@ -1570,6 +1570,7 @@ static int intel_pinctrl_probe_pwm(struct intel_pinctrl *pctrl,
 	if (!IS_REACHABLE(CONFIG_PWM_LPSS))
 		return 0;
 
+	base = community->regs + capability_offset + 4;
 	chip = devm_pwm_lpss_probe(pctrl->dev, base, &info);
 	return PTR_ERR_OR_ZERO(chip);
 }
@@ -1701,35 +1702,42 @@ int intel_pinctrl_probe(struct platform_device *pdev,
 }
 EXPORT_SYMBOL_NS_GPL(intel_pinctrl_probe, "PINCTRL_INTEL");
 
+static const struct intel_pinctrl_soc_data *
+intel_pinctrl_get_soc_data_by_hid(const struct platform_device *pdev)
+{
+	const struct intel_pinctrl_soc_data *data;
+	const struct device *dev = &pdev->dev;
+	const struct platform_device_id *id;
+
+	data = device_get_match_data(dev);
+	if (data)
+		return data;
+
+	id = platform_get_device_id(pdev);
+	if (!id)
+		return ERR_PTR(-ENODEV);
+
+	data = (const struct intel_pinctrl_soc_data *)id->driver_data;
+	return data ?: ERR_PTR(-ENODATA);
+}
+
 int intel_pinctrl_probe_by_hid(struct platform_device *pdev)
 {
 	const struct intel_pinctrl_soc_data *data;
 
-	data = device_get_match_data(&pdev->dev);
-	if (!data)
-		return -ENODATA;
-
-	return intel_pinctrl_probe(pdev, data);
-}
-EXPORT_SYMBOL_NS_GPL(intel_pinctrl_probe_by_hid, "PINCTRL_INTEL");
-
-int intel_pinctrl_probe_by_uid(struct platform_device *pdev)
-{
-	const struct intel_pinctrl_soc_data *data;
-
-	data = intel_pinctrl_get_soc_data(pdev);
+	data = intel_pinctrl_get_soc_data_by_hid(pdev);
 	if (IS_ERR(data))
 		return PTR_ERR(data);
 
 	return intel_pinctrl_probe(pdev, data);
 }
-EXPORT_SYMBOL_NS_GPL(intel_pinctrl_probe_by_uid, "PINCTRL_INTEL");
+EXPORT_SYMBOL_NS_GPL(intel_pinctrl_probe_by_hid, "PINCTRL_INTEL");
 
-const struct intel_pinctrl_soc_data *intel_pinctrl_get_soc_data(struct platform_device *pdev)
+const struct intel_pinctrl_soc_data *intel_pinctrl_get_soc_data(const struct platform_device *pdev)
 {
 	const struct intel_pinctrl_soc_data * const *table;
 	const struct intel_pinctrl_soc_data *data;
-	struct device *dev = &pdev->dev;
+	const struct device *dev = &pdev->dev;
 
 	table = device_get_match_data(dev);
 	if (table) {
@@ -1755,6 +1763,18 @@ const struct intel_pinctrl_soc_data *intel_pinctrl_get_soc_data(struct platform_
 	return data ?: ERR_PTR(-ENODATA);
 }
 EXPORT_SYMBOL_NS_GPL(intel_pinctrl_get_soc_data, "PINCTRL_INTEL");
+
+int intel_pinctrl_probe_by_uid(struct platform_device *pdev)
+{
+	const struct intel_pinctrl_soc_data *data;
+
+	data = intel_pinctrl_get_soc_data(pdev);
+	if (IS_ERR(data))
+		return PTR_ERR(data);
+
+	return intel_pinctrl_probe(pdev, data);
+}
+EXPORT_SYMBOL_NS_GPL(intel_pinctrl_probe_by_uid, "PINCTRL_INTEL");
 
 static bool __intel_gpio_is_direct_irq(u32 value)
 {

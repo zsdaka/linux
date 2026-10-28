@@ -395,7 +395,8 @@ static int ih_v7_0_irq_init(struct amdgpu_device *adev)
 
 	pci_set_master(adev->pdev);
 
-	if (amdgpu_ip_version(adev, OSSSYS_HWIP, 0) == IP_VERSION(7, 1, 0)) {
+	if (!(adev->flags & AMD_IS_APU) ||
+	    amdgpu_ip_version(adev, OSSSYS_HWIP, 0) == IP_VERSION(7, 1, 0)) {
 		/* Allocate the doorbell for IH Retry CAM */
 		adev->irq.retry_cam_doorbell_index = (adev->doorbell_index.ih + 2) << 1;
 		WREG32_SOC15(OSSSYS, 0, regIH_DOORBELL_RETRY_CAM,
@@ -419,6 +420,12 @@ static int ih_v7_0_irq_init(struct amdgpu_device *adev)
 
 	if (adev->irq.ih_soft.ring_size)
 		adev->irq.ih_soft.enabled = true;
+
+	if (adev->irq.ih_psp.ring_size)
+		adev->irq.ih_psp.enabled = true;
+
+	if (adev->irq.ih_ualink.ring_size)
+		adev->irq.ih_ualink.enabled = true;
 
 	return 0;
 }
@@ -457,6 +464,10 @@ static u32 ih_v7_0_get_wptr(struct amdgpu_device *adev,
 	struct amdgpu_ih_regs *ih_regs;
 
 	wptr = le32_to_cpu(*ih->wptr_cpu);
+
+	if (ih == &adev->irq.ih_soft)
+		goto out;
+
 	ih_regs = &ih->ih_regs;
 
 	if (!REG_GET_FIELD(wptr, IH_RB_WPTR, RB_OVERFLOW))
@@ -527,6 +538,9 @@ static void ih_v7_0_set_rptr(struct amdgpu_device *adev,
 {
 	struct amdgpu_ih_regs *ih_regs;
 
+	if (ih == &adev->irq.ih_soft)
+		return;
+
 	if (ih->use_doorbell) {
 		/* XXX check if swapping is necessary on BE */
 		*ih->rptr_cpu = ih->rptr;
@@ -589,7 +603,6 @@ static int ih_v7_0_sw_init(struct amdgpu_ip_block *ip_block)
 	int r;
 	struct amdgpu_device *adev = ip_block->adev;
 	bool use_bus_addr;
-	unsigned int sw_ring_size;
 
 	r = amdgpu_irq_add_id(adev, SOC21_IH_CLIENTID_IH, 0,
 			      &adev->irq.self_irq);
@@ -621,9 +634,16 @@ static int ih_v7_0_sw_init(struct amdgpu_ip_block *ip_block)
 	/* initialize ih control register offset */
 	ih_v7_0_init_register_offset(adev);
 
-	sw_ring_size = (amdgpu_ip_version(adev, OSSSYS_HWIP, 0) == IP_VERSION(7, 1, 0)) ?
-			IH_SW_RING_SIZE : PAGE_SIZE;
-	r = amdgpu_ih_ring_init(adev, &adev->irq.ih_soft, sw_ring_size, true);
+	r = amdgpu_ih_ring_init(adev, &adev->irq.ih_soft, IH_SW_RING_SIZE, true);
+	if (r)
+		return r;
+
+	r = amdgpu_ih_ring_init(adev, &adev->irq.ih_psp, IH_PSP_RING_SIZE, true);
+	if (r)
+		return r;
+
+	dev_dbg(adev->dev, "ualink init ih_ualink\n");
+	r = amdgpu_ih_ring_init(adev, &adev->irq.ih_ualink, IH_UALINK_RING_SIZE, true);
 	if (r)
 		return r;
 
@@ -655,7 +675,11 @@ static int ih_v7_0_hw_init(struct amdgpu_ip_block *ip_block)
 
 static int ih_v7_0_hw_fini(struct amdgpu_ip_block *ip_block)
 {
-	ih_v7_0_irq_disable(ip_block->adev);
+	struct amdgpu_device *adev = ip_block->adev;
+
+	ih_v7_0_irq_disable(adev);
+
+	cancel_work_sync(&adev->irq.ih_psp_work);
 
 	return 0;
 }
@@ -670,22 +694,10 @@ static int ih_v7_0_resume(struct amdgpu_ip_block *ip_block)
 	return ih_v7_0_hw_init(ip_block);
 }
 
-static bool ih_v7_0_is_idle(struct amdgpu_ip_block *ip_block)
-{
-	/* todo */
-	return true;
-}
-
 static int ih_v7_0_wait_for_idle(struct amdgpu_ip_block *ip_block)
 {
 	/* todo */
 	return -ETIMEDOUT;
-}
-
-static int ih_v7_0_soft_reset(struct amdgpu_ip_block *ip_block)
-{
-	/* todo */
-	return 0;
 }
 
 static void ih_v7_0_update_clockgating_state(struct amdgpu_device *adev,
@@ -798,6 +810,43 @@ static void ih_v7_0_get_clockgating_state(struct amdgpu_ip_block *ip_block, u64 
 	return;
 }
 
+/*
+ * ih_v7_0_node_id_to_die_name - Decode IH cookie node_id to a die name string
+ *
+ * Currently, only applies to IH v7_1. For other IH versions returns NULL.
+ *
+ * IH v7_1 node_id encoding:
+ * node_id[N:3] = MID index
+ * node_id[2:0] = sub-slot: 0=MID, 1=AID, 2-5=AID.XCD, 6-7=RSV
+ */
+static const char *ih_v7_0_node_id_to_die_name(struct amdgpu_device *adev,
+					       unsigned int node_id,
+					       char *buf, size_t size)
+{
+	int mid_id, sub_slot;
+
+	/* Node ID to die name decoding is only defined for IH v7_1 currenlty. */
+	if (amdgpu_ip_version(adev, OSSSYS_HWIP, 0) != IP_VERSION(7, 1, 0))
+		return NULL;
+
+	mid_id = node_id >> 3;
+	sub_slot = node_id & 0x7;
+
+	if (mid_id > 1)
+		return "UNKNOWN";
+
+	if (sub_slot == 0)
+		snprintf(buf, size, "MID%d", mid_id);
+	else if (sub_slot == 1)
+		snprintf(buf, size, "AID%d", mid_id);
+	else if (sub_slot <= 5)
+		snprintf(buf, size, "AID%d.XCD%d", mid_id, sub_slot - 2);
+	else
+		snprintf(buf, size, "RSV");
+
+	return buf;
+}
+
 static const struct amd_ip_funcs ih_v7_0_ip_funcs = {
 	.name = "ih_v7_0",
 	.early_init = ih_v7_0_early_init,
@@ -807,9 +856,7 @@ static const struct amd_ip_funcs ih_v7_0_ip_funcs = {
 	.hw_fini = ih_v7_0_hw_fini,
 	.suspend = ih_v7_0_suspend,
 	.resume = ih_v7_0_resume,
-	.is_idle = ih_v7_0_is_idle,
 	.wait_for_idle = ih_v7_0_wait_for_idle,
-	.soft_reset = ih_v7_0_soft_reset,
 	.set_clockgating_state = ih_v7_0_set_clockgating_state,
 	.set_powergating_state = ih_v7_0_set_powergating_state,
 	.get_clockgating_state = ih_v7_0_get_clockgating_state,
@@ -819,7 +866,8 @@ static const struct amdgpu_ih_funcs ih_v7_0_funcs = {
 	.get_wptr = ih_v7_0_get_wptr,
 	.decode_iv = amdgpu_ih_decode_iv_helper,
 	.decode_iv_ts = amdgpu_ih_decode_iv_ts_helper,
-	.set_rptr = ih_v7_0_set_rptr
+	.set_rptr = ih_v7_0_set_rptr,
+	.node_id_to_die_name = ih_v7_0_node_id_to_die_name,
 };
 
 static void ih_v7_0_set_interrupt_funcs(struct amdgpu_device *adev)

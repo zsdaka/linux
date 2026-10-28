@@ -1222,11 +1222,6 @@ static int rt5616_probe(struct snd_soc_component *component)
 {
 	struct rt5616_priv *rt5616 = snd_soc_component_get_drvdata(component);
 
-	/* Check if MCLK provided */
-	rt5616->mclk = devm_clk_get_optional(component->dev, "mclk");
-	if (IS_ERR(rt5616->mclk))
-		return PTR_ERR(rt5616->mclk);
-
 	rt5616->component = component;
 
 	return 0;
@@ -1248,8 +1243,7 @@ static int rt5616_resume(struct snd_soc_component *component)
 	struct rt5616_priv *rt5616 = snd_soc_component_get_drvdata(component);
 
 	regcache_cache_only(rt5616->regmap, false);
-	regcache_sync(rt5616->regmap);
-	return 0;
+	return regcache_sync(rt5616->regmap);
 }
 #else
 #define rt5616_suspend NULL
@@ -1260,11 +1254,21 @@ static int rt5616_resume(struct snd_soc_component *component)
 #define RT5616_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE | \
 			SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S8)
 
+static const u64 rt5616_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF;
+
 static const struct snd_soc_dai_ops rt5616_aif_dai_ops = {
 	.hw_params = rt5616_hw_params,
 	.set_fmt = rt5616_set_dai_fmt,
 	.set_sysclk = rt5616_set_dai_sysclk,
 	.set_pll = rt5616_set_dai_pll,
+	.auto_selectable_formats = &rt5616_selectable_formats,
+	.num_auto_selectable_formats = 1,
 };
 
 static struct snd_soc_dai_driver rt5616_dai[] = {
@@ -1321,7 +1325,7 @@ static const struct regmap_config rt5616_regmap = {
 };
 
 static const struct i2c_device_id rt5616_i2c_id[] = {
-	{ "rt5616" },
+	{ .name = "rt5616" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, rt5616_i2c_id);
@@ -1346,6 +1350,11 @@ static int rt5616_i2c_probe(struct i2c_client *i2c)
 		return -ENOMEM;
 
 	i2c_set_clientdata(i2c, rt5616);
+
+	/* Check if MCLK provided */
+	rt5616->mclk = devm_clk_get_optional(&i2c->dev, "mclk");
+	if (IS_ERR(rt5616->mclk))
+		return PTR_ERR(rt5616->mclk);
 
 	rt5616->regmap = devm_regmap_init_i2c(i2c, &rt5616_regmap);
 	if (IS_ERR(rt5616->regmap)) {
@@ -1386,9 +1395,6 @@ static int rt5616_i2c_probe(struct i2c_client *i2c)
 				      rt5616_dai, ARRAY_SIZE(rt5616_dai));
 }
 
-static void rt5616_i2c_remove(struct i2c_client *i2c)
-{}
-
 static void rt5616_i2c_shutdown(struct i2c_client *client)
 {
 	struct rt5616_priv *rt5616 = i2c_get_clientdata(client);
@@ -1403,7 +1409,6 @@ static struct i2c_driver rt5616_i2c_driver = {
 		.of_match_table = of_match_ptr(rt5616_of_match),
 	},
 	.probe = rt5616_i2c_probe,
-	.remove = rt5616_i2c_remove,
 	.shutdown = rt5616_i2c_shutdown,
 	.id_table = rt5616_i2c_id,
 };

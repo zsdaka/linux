@@ -943,8 +943,9 @@ xfs_trans_commit(
  * xfs_trans_commit().
  */
 void
-xfs_trans_cancel(
-	struct xfs_trans	*tp)
+xfs_trans_cancel_error(
+	struct xfs_trans	*tp,
+	int			error)
 {
 	struct xfs_mount	*mp = tp->t_mountp;
 	struct xlog		*log = mp->m_log;
@@ -971,7 +972,8 @@ xfs_trans_cancel(
 	 * here.
 	 */
 	if (dirty && !xfs_is_shutdown(mp)) {
-		XFS_ERROR_REPORT("xfs_trans_cancel", XFS_ERRLEVEL_LOW, mp);
+		XFS_ERROR_REPORT("xfs_trans_cancel", XFS_ERRLEVEL_LOW,
+				 error, mp);
 		xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
 	}
 #ifdef DEBUG
@@ -1029,6 +1031,15 @@ xfs_trans_roll(
 	 * duplicate transaction that gets returned.
 	 */
 	error = __xfs_trans_commit(tp, true);
+
+	tp = *tpp;
+	/*
+	 * __xfs_trans_commit cleared the NOFS flag by calling into
+	 * xfs_trans_free.  Set it again here before doing memory
+	 * allocations.
+	 */
+	xfs_trans_set_context(tp);
+
 	if (error)
 		return error;
 
@@ -1040,13 +1051,6 @@ xfs_trans_roll(
 	 * either nothing be locked across this call, or that anything that is
 	 * locked be logged in the prior and the next transactions.
 	 */
-	tp = *tpp;
-	/*
-	 * __xfs_trans_commit cleared the NOFS flag by calling into
-	 * xfs_trans_free.  Set it again here before doing memory
-	 * allocations.
-	 */
-	xfs_trans_set_context(tp);
 	error = xfs_log_regrant(tp->t_mountp, tp->t_ticket);
 	if (error)
 		return error;
@@ -1164,7 +1168,7 @@ xfs_trans_reserve_more_inode(
 	if (error)
 		return error;
 
-	if (!XFS_IS_QUOTA_ON(mp) || xfs_is_quota_inode(&mp->m_sb, ip->i_ino))
+	if (!XFS_IS_QUOTA_ON(mp) || xfs_is_quota_inode(&mp->m_sb, I_INO(ip)))
 		return 0;
 
 	if (tp->t_flags & XFS_TRANS_RESERVE)

@@ -66,7 +66,6 @@ enum btrfs_reserve_flush_enum {
 	 * Can be interrupted by a fatal signal.
 	 */
 	BTRFS_RESERVE_FLUSH_DATA,
-	BTRFS_RESERVE_FLUSH_FREE_SPACE_INODE,
 	BTRFS_RESERVE_FLUSH_ALL,
 
 	/*
@@ -76,6 +75,14 @@ enum btrfs_reserve_flush_enum {
 	 * Can be interrupted by a fatal signal.
 	 */
 	BTRFS_RESERVE_FLUSH_ALL_STEAL,
+
+	/*
+	 * This is for relocation on zoned filesystems only. We need to use
+	 * priority flushing for this, because otherwise we can deadlock on
+	 * waiting for a ticket, that cannot be granted, because we cannot do
+	 * any allocations.
+	 */
+	BTRFS_RESERVE_FLUSH_ZONED_RELOCATION,
 
 	/*
 	 * This is for btrfs_use_block_rsv only.  We have exhausted our block

@@ -20,6 +20,7 @@
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
 #include <linux/types.h>
+#include <linux/futex_types.h>
 #include <linux/rseq_types.h>
 #include <linux/bitmap.h>
 
@@ -107,7 +108,7 @@ struct page {
 			};
 			/**
 			 * @private: Mapping-private opaque data.
-			 * Usually used for buffer_heads if PagePrivate.
+			 * Usually used for buffer_heads.
 			 * Used for swp_entry_t if swapcache flag set.
 			 * Indicates order in the buddy system if PageBuddy
 			 * or on pcp_llist.
@@ -367,6 +368,8 @@ typedef unsigned short mm_id_t;
  *    dax_associate_entry.
  * @private: Filesystem per-folio data (see folio_attach_private()).
  * @swap: Used for swp_entry_t if folio_test_swapcache().
+ * @migrate_info: Stores migration state (anon_vma pointer and
+ *    FOLIO_WAS_* markers).
  * @_mapcount: Do not access this member directly.  Use folio_mapcount() to
  *    find out how many times this folio is mapped by userspace.
  * @_refcount: Do not access this member directly.  Use folio_ref_count()
@@ -426,6 +429,7 @@ struct folio {
 			union {
 				void *private;
 				swp_entry_t swap;
+				unsigned long migrate_info;
 			};
 			atomic_t _mapcount;
 			atomic_t _refcount;
@@ -671,7 +675,7 @@ static inline void ptdesc_pmd_pts_init(struct ptdesc *ptdesc)
 #define STRUCT_PAGE_MAX_SHIFT	(order_base_2(sizeof(struct page)))
 
 /*
- * page_private can be used on tail pages.  However, PagePrivate is only
+ * page_private can be used on tail pages.  However, it is only
  * checked by the VM on the head page.  So page_private on the tail pages
  * should be used for data that's ancillary to the head page (eg attaching
  * buffer heads to tail pages after attaching buffer heads to the head page)
@@ -755,7 +759,7 @@ static inline struct anon_vma_name *anon_vma_name_alloc(const char *name)
 /*
  * While __vma_enter_locked() is working to ensure are no read-locks held on a
  * VMA (either while acquiring a VMA write lock or marking a VMA detached) we
- * set the VM_REFCNT_EXCLUDE_READERS_FLAG in vma->vm_refcnt to indiciate to
+ * set the VM_REFCNT_EXCLUDE_READERS_FLAG in vma->vm_refcnt to indicate to
  * vma_start_read() that the reference count should be left alone.
  *
  * See the comment describing vm_refcnt in vm_area_struct for details as to
@@ -811,11 +815,45 @@ struct pfnmap_track_ctx {
 
 /* What action should be taken after an .mmap_prepare call is complete? */
 enum mmap_action_type {
-	MMAP_NOTHING,		/* Mapping is complete, no further action. */
-	MMAP_REMAP_PFN,		/* Remap PFN range. */
-	MMAP_IO_REMAP_PFN,	/* I/O remap PFN range. */
-	MMAP_SIMPLE_IO_REMAP,	/* I/O remap with guardrails. */
-	MMAP_MAP_KERNEL_PAGES,	/* Map kernel page range from array. */
+	MMAP_NOTHING,
+	MMAP_REMAP_PFN,
+	MMAP_IO_REMAP_PFN,
+	MMAP_SIMPLE_IO_REMAP,		/* I/O remap with guardrails. */
+	MMAP_KERNEL_PAGES,		/* Map kernel page range from array. */
+	MMAP_DISCONTIG_KERNEL_PAGES,	/* Map kernel discontig page range. */
+};
+
+enum discontig_kernel_page_action {
+	DISCONTIG_KERNEL_PAGE_ABORT,
+	DISCONTIG_KERNEL_PAGE_MAP_PAGES,	/* Array of individual pages. */
+	DISCONTIG_KERNEL_PAGE_MAP_CONTIG_PAGES,	/* 1..N contiguous pages. */
+};
+
+struct discontig_kernel_page_state {
+	/* Map state. */
+	const unsigned long start;	/* Start address of VMA. */
+	const unsigned long end;	/* End address of VMA. */
+	unsigned long addr;		/* The current address to be mapped. */
+	pgoff_t pgoff;			/* The current pgoff to be mapped. */
+	unsigned long nr_pages_mapped;	/* The number of pages mapped. */
+	unsigned long nr_pages_remain;	/* The number of pages remaining. */
+
+	/* User-defined state. */
+	void *vm_private_data;		/* VMA private data. */
+	void *private;			/* Mapping private data. */
+
+	/* Users should not touch these, use discontig_kernel_map_*() helpers. */
+	enum discontig_kernel_page_action action;
+	union {
+		struct page *__page;
+		struct page **__page_arr;
+	};
+	unsigned long __nr_pages;
+};
+
+struct discontig_kernel_page_ops {
+	int (*init)(void *vm_private_data, void **private);
+	int (*get)(struct discontig_kernel_page_state *state);
 };
 
 /*
@@ -840,27 +878,18 @@ struct mmap_action {
 			unsigned long nr_pages;
 			pgoff_t pgoff;
 		} map_kernel;
+		struct {
+			void *init_private;
+			const struct discontig_kernel_page_ops *ops;
+		} map_kernel_discontig;
 	};
 	enum mmap_action_type type;
 
 	/*
-	 * If specified, this hook is invoked after the selected action has been
-	 * successfully completed. Note that the VMA write lock still held.
-	 *
-	 * The absolute minimum ought to be done here.
-	 *
-	 * Returns 0 on success, or an error code.
+	 * If non-zero, replace errors that arise from mmap actions with this
+	 * value instead. Only valid error codes may be specified.
 	 */
-	int (*success_hook)(const struct vm_area_struct *vma);
-
-	/*
-	 * If specified, this hook is invoked when an error occurred when
-	 * attempting the selected action.
-	 *
-	 * The hook can return an error code in order to filter the error, but
-	 * it is not valid to clear the error here.
-	 */
-	int (*error_hook)(int err);
+	int error_override;
 
 	/*
 	 * This should be set in rare instances where the operation required
@@ -959,23 +988,31 @@ struct vm_area_struct {
 		vma_flags_t flags;
 	};
 
-#ifdef CONFIG_PER_VMA_LOCK
 	/*
 	 * Can only be written (using WRITE_ONCE()) while holding both:
 	 *  - mmap_lock (in write mode)
 	 *  - vm_refcnt bit at VM_REFCNT_EXCLUDE_READERS_FLAG is set
+	 * The one exception is __mm_reset_vma_seqcounts(), which stores zero
+	 * (an even value, which can never indicate a write lock) under the
+	 * mmap write lock alone once the mm seqcount has wrapped, so a reader
+	 * holding only vm_refcnt may observe the value change from odd to zero.
 	 * Can be read reliably while holding one of:
 	 *  - mmap_lock (in read or write mode)
-	 *  - vm_refcnt bit at VM_REFCNT_EXCLUDE_READERS_BIT is set or vm_refcnt > 1
+	 *  - vm_refcnt bit at VM_REFCNT_EXCLUDE_READERS_BIT is set
 	 * Can be read unreliably (using READ_ONCE()) for pessimistic bailout
 	 * while holding nothing (except RCU to keep the VMA struct allocated).
 	 *
-	 * This sequence counter is explicitly allowed to overflow; sequence
-	 * counter reuse can only lead to occasional unnecessary use of the
-	 * slowpath.
+	 * Assigned the (odd) mm seqcount on write lock and not updated on
+	 * unlock, so a stale value would alias the mm seqcount again 2^31 write
+	 * lock/unlock cycles later. The reset described above prevents this.
 	 */
 	unsigned int vm_lock_seq;
-#endif
+
+	/*
+	 * Low 32-bits of anonymous page offset.
+	 * See vma_start_anon_pgoff() comment for details.
+	 */
+	unsigned int __vm_anon_pgoff_lo;
 	/*
 	 * A file's MAP_PRIVATE vma can be in both i_mmap tree and anon_vma
 	 * list, after a COW of one of the file pages.	A MAP_SHARED vma
@@ -1007,7 +1044,6 @@ struct vm_area_struct {
 #ifdef CONFIG_NUMA_BALANCING
 	struct vma_numab_state *numab_state;	/* NUMA Balancing state */
 #endif
-#ifdef CONFIG_PER_VMA_LOCK
 	/*
 	 * Used to keep track of firstly, whether the VMA is attached, secondly,
 	 * if attached, how many read locks are taken, and thirdly, if the
@@ -1050,6 +1086,12 @@ struct vm_area_struct {
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 	struct lockdep_map vmlock_dep_map;
 #endif
+#ifdef CONFIG_64BIT
+	/*
+	 * High 32-bits of anonymous page offset.
+	 * See vma_start_anon_pgoff() comment for details.
+	 */
+	unsigned int __vm_anon_pgoff_hi;
 #endif
 	/*
 	 * For areas with an address space and backing store,
@@ -1222,6 +1264,8 @@ struct mm_struct {
 		/* MM CID related storage */
 		struct mm_mm_cid mm_cid;
 
+		/* sched_cache related statistics */
+		struct sched_cache_group *sched_cache_grp;
 #ifdef CONFIG_MMU
 		atomic_long_t pgtables_bytes;	/* size of all page tables */
 #endif
@@ -1249,7 +1293,6 @@ struct mm_struct {
 					  * init_mm.mmlist, and are protected
 					  * by mmlist_lock
 					  */
-#ifdef CONFIG_PER_VMA_LOCK
 		struct rcuwait vma_writer_wait;
 		/*
 		 * This field has lock-like semantics, meaning it is sometimes
@@ -1269,17 +1312,8 @@ struct mm_struct {
 		 * mmap_lock.
 		 */
 		seqcount_t mm_lock_seq;
-#endif
-#ifdef CONFIG_FUTEX_PRIVATE_HASH
-		struct mutex			futex_hash_lock;
-		struct futex_private_hash	__rcu *futex_phash;
-		struct futex_private_hash	*futex_phash_new;
-		/* futex-ref */
-		unsigned long			futex_batches;
-		struct rcu_head			futex_rcu;
-		atomic_long_t			futex_atomic;
-		unsigned int			__percpu *futex_ref;
-#endif
+
+		struct futex_mm_data	futex;
 
 		unsigned long hiwater_rss; /* High-watermark of RSS usage */
 		unsigned long hiwater_vm;  /* High-water virtual memory usage */
@@ -1342,7 +1376,6 @@ struct mm_struct {
 		 */
 		struct task_struct __rcu *owner;
 #endif
-		struct user_namespace *user_ns;
 
 		/* store ref to file /proc/<pid>/exe symlink points to */
 		struct file __rcu *exe_file;
@@ -1628,6 +1661,31 @@ static inline unsigned int mm_cid_size(void)
 # define MM_CID_STATIC_SIZE	0
 #endif /* CONFIG_SCHED_MM_CID */
 
+#ifdef CONFIG_SCHED_CACHE
+int mm_init_sched(struct mm_struct *mm,
+		  struct sched_cache_time __percpu *pcpu_sched);
+void mm_destroy_sched(struct mm_struct *mm);
+
+static inline int mm_alloc_sched_noprof(struct mm_struct *mm)
+{
+	struct sched_cache_time __percpu *pcpu_sched =
+		alloc_percpu_noprof(struct sched_cache_time);
+
+	if (!pcpu_sched)
+		return -ENOMEM;
+
+	return mm_init_sched(mm, pcpu_sched);
+}
+
+#define mm_alloc_sched(...)	alloc_hooks(mm_alloc_sched_noprof(__VA_ARGS__))
+
+#else /* !CONFIG_SCHED_CACHE */
+
+static inline int mm_alloc_sched(struct mm_struct *mm) { return 0; }
+static inline void mm_destroy_sched(struct mm_struct *mm) { }
+
+#endif /* CONFIG_SCHED_CACHE */
+
 struct mmu_gather;
 extern void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm);
 extern void tlb_gather_mmu_fullmm(struct mmu_gather *tlb, struct mm_struct *mm);
@@ -1693,20 +1751,20 @@ enum vm_fault_reason {
 			VM_FAULT_SIGSEGV | VM_FAULT_HWPOISON |	\
 			VM_FAULT_HWPOISON_LARGE | VM_FAULT_FALLBACK)
 
-#define VM_FAULT_RESULT_TRACE \
-	{ VM_FAULT_OOM,                 "OOM" },	\
-	{ VM_FAULT_SIGBUS,              "SIGBUS" },	\
-	{ VM_FAULT_MAJOR,               "MAJOR" },	\
-	{ VM_FAULT_HWPOISON,            "HWPOISON" },	\
-	{ VM_FAULT_HWPOISON_LARGE,      "HWPOISON_LARGE" },	\
-	{ VM_FAULT_SIGSEGV,             "SIGSEGV" },	\
-	{ VM_FAULT_NOPAGE,              "NOPAGE" },	\
-	{ VM_FAULT_LOCKED,              "LOCKED" },	\
-	{ VM_FAULT_RETRY,               "RETRY" },	\
-	{ VM_FAULT_FALLBACK,            "FALLBACK" },	\
-	{ VM_FAULT_DONE_COW,            "DONE_COW" },	\
-	{ VM_FAULT_NEEDDSYNC,           "NEEDDSYNC" },	\
-	{ VM_FAULT_COMPLETED,           "COMPLETED" }
+#define VM_FAULT_RESULT_TRACE						\
+	{ (__force u32)VM_FAULT_OOM,                 "OOM" },		\
+	{ (__force u32)VM_FAULT_SIGBUS,              "SIGBUS" },	\
+	{ (__force u32)VM_FAULT_MAJOR,               "MAJOR" },		\
+	{ (__force u32)VM_FAULT_HWPOISON,            "HWPOISON" },	\
+	{ (__force u32)VM_FAULT_HWPOISON_LARGE,      "HWPOISON_LARGE" }, \
+	{ (__force u32)VM_FAULT_SIGSEGV,             "SIGSEGV" },	\
+	{ (__force u32)VM_FAULT_NOPAGE,              "NOPAGE" },	\
+	{ (__force u32)VM_FAULT_LOCKED,              "LOCKED" },	\
+	{ (__force u32)VM_FAULT_RETRY,               "RETRY" },		\
+	{ (__force u32)VM_FAULT_FALLBACK,            "FALLBACK" },	\
+	{ (__force u32)VM_FAULT_DONE_COW,            "DONE_COW" },	\
+	{ (__force u32)VM_FAULT_NEEDDSYNC,           "NEEDDSYNC" },	\
+	{ (__force u32)VM_FAULT_COMPLETED,           "COMPLETED" }
 
 struct vm_special_mapping {
 	const char *name;	/* The name, e.g. "[vdso]". */
@@ -1907,11 +1965,11 @@ enum {
 /* mm flags */
 
 /*
- * The first two bits represent core dump modes for set-user-ID,
- * the modes are SUID_DUMP_* defined in linux/sched/coredump.h
+ * Bits 0 and 1 were dumpability; that moved to task->exec_state.  Reserve
+ * the bits so MMF_DUMP_FILTER_* positions stay stable for the
+ * /proc/<pid>/coredump_filter ABI.
  */
 #define MMF_DUMPABLE_BITS 2
-#define MMF_DUMPABLE_MASK (BIT(MMF_DUMPABLE_BITS) - 1)
 /* coredump filter bits */
 #define MMF_DUMP_ANON_PRIVATE	2
 #define MMF_DUMP_ANON_SHARED	3
@@ -1955,7 +2013,7 @@ enum {
 /*
  * MMF_HAS_PINNED: Whether this mm has pinned any pages.  This can be either
  * replaced in the future by mm.pinned_vm when it becomes stable, or grow into
- * a counter on its own. We're aggresive on this bit for now: even if the
+ * a counter on its own. We're aggressive on this bit for now: even if the
  * pinned pages were unpinned later on, we'll still keep this bit set for the
  * lifecycle of this mm, just for simplicity.
  */
@@ -1972,7 +2030,7 @@ enum {
 #define MMF_TOPDOWN		31	/* mm searches top down by default */
 #define MMF_TOPDOWN_MASK	BIT(MMF_TOPDOWN)
 
-#define MMF_INIT_LEGACY_MASK	(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK |\
+#define MMF_INIT_LEGACY_MASK	(MMF_DUMP_FILTER_MASK |\
 				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK |\
 				 MMF_VM_MERGE_ANY_MASK | MMF_TOPDOWN_MASK)
 

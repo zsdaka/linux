@@ -13,6 +13,49 @@
 #include "hal.h"
 #include "hal_tx.h"
 
+/*
+ * Convert an encrypted EAPOL frame from native-WiFi format to
+ * the layout expected by the firmware RAW encrypt pipeline:
+ *
+ *   [802.11 hdr][IV (zeroed)][LLC/SNAP][EAPOL payload][ICV (zeroed)]
+ *
+ * mac80211 delivers the frame as [802.11 hdr][LLC/SNAP][EAPOL payload].
+ * The MAC header length is read from the unmodified skb and is safe because
+ * ieee80211_hdrlen() only inspects the 2-byte frame_control field.
+ * pskb_expand_head() is used to grow both head (for the IV) and tail
+ * (for the ICV) in a single call and allocation.
+ */
+static int
+ath12k_wifi7_dp_tx_encap_eapol(struct sk_buff *skb,
+			       struct hal_tx_info *ti,
+			       struct ath12k_skb_cb *skb_cb)
+{
+	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+	enum hal_encrypt_type enc_type =
+				ath12k_dp_tx_get_encrypt_type(skb_cb->cipher);
+	u16 mac_hdr_len = ieee80211_hdrlen(hdr->frame_control);
+	u8 iv_len = ath12k_dp_tx_crypto_iv_len(enc_type);
+	u8 icv_len = ath12k_dp_tx_crypto_icv_len(enc_type);
+
+	if (pskb_expand_head(skb, iv_len, icv_len, GFP_ATOMIC))
+		return -ENOMEM;
+
+	if (iv_len) {
+		skb_push(skb, iv_len);
+		memmove(skb->data, skb->data + iv_len, mac_hdr_len);
+		memset(skb->data + mac_hdr_len, 0, iv_len);
+	}
+
+	if (icv_len)
+		memset(skb_put(skb, icv_len), 0, icv_len);
+
+	ti->flags0 |= u32_encode_bits(1, HAL_TCL_DATA_CMD_INFO2_TO_FW);
+	ti->encap_type = HAL_TCL_ENCAP_TYPE_RAW;
+	ti->encrypt_type = enc_type;
+
+	return 0;
+}
+
 static void
 ath12k_wifi7_hal_tx_cmd_ext_desc_setup(struct ath12k_base *ab,
 				       struct hal_tx_msdu_ext_desc *tcl_ext_cmd,
@@ -20,7 +63,7 @@ ath12k_wifi7_hal_tx_cmd_ext_desc_setup(struct ath12k_base *ab,
 {
 	tcl_ext_cmd->info0 = le32_encode_bits(ti->paddr,
 					      HAL_TX_MSDU_EXT_INFO0_BUF_PTR_LO);
-	tcl_ext_cmd->info1 = le32_encode_bits(0x0,
+	tcl_ext_cmd->info1 = le32_encode_bits((u64)ti->paddr >> HAL_ADDR_MSB_REG_SHIFT,
 					      HAL_TX_MSDU_EXT_INFO1_BUF_PTR_HI) |
 			       le32_encode_bits(ti->data_len,
 						HAL_TX_MSDU_EXT_INFO1_BUF_LEN);
@@ -57,10 +100,12 @@ static int ath12k_wifi7_dp_prepare_htt_metadata(struct sk_buff *skb)
 	return 0;
 }
 
+#define ATH12K_AST_HASH_MASK	0xF
+
 /* TODO: Remove the export once this file is built with wifi7 ko */
 int ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev, struct ath12k_link_vif *arvif,
-		       struct sk_buff *skb, bool gsn_valid, int mcbc_gsn,
-		       bool is_mcast)
+		       struct ath12k_link_sta *arsta, struct sk_buff *skb,
+		       bool gsn_valid, int mcbc_gsn, bool is_mcast)
 {
 	struct ath12k_dp *dp = dp_pdev->dp;
 	struct ath12k_hal *hal = dp->hal;
@@ -78,6 +123,7 @@ int ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev, struct ath12k_link_vif *a
 	struct ath12k_dp_vif *dp_vif = &ahvif->dp_vif;
 	struct ath12k_dp_link_vif *dp_link_vif;
 	struct dp_tx_ring *tx_ring;
+	struct ethhdr *eth = NULL;
 	u8 pool_id;
 	u8 hal_ring_id;
 	int ret;
@@ -88,6 +134,7 @@ int ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev, struct ath12k_link_vif *a
 	u32 iova_mask = dp->hw_params->iova_mask;
 	bool is_diff_encap = false;
 	bool is_null_frame = false;
+	bool eapol_encap_done = false;
 
 	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags))
 		return -ESHUTDOWN;
@@ -95,6 +142,9 @@ int ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev, struct ath12k_link_vif *a
 	if (!(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
 	    !ieee80211_is_data(hdr->frame_control))
 		return -EOPNOTSUPP;
+
+	if (skb_cb->flags & ATH12K_SKB_HW_80211_ENCAP)
+		eth = (struct ethhdr *)skb->data;
 
 	pool_id = skb_get_queue_mapping(skb) & (ATH12K_HW_MAX_QUEUES - 1);
 
@@ -117,13 +167,28 @@ tcl_ring_sel:
 	tx_ring = &dp->tx_ring[ti.ring_id];
 
 	tx_desc = ath12k_dp_tx_assign_buffer(dp, pool_id);
-	if (!tx_desc)
+	if (!tx_desc) {
+		dp->device_stats.tx_err.txbuf_na[pool_id]++;
 		return -ENOMEM;
+	}
 
 	dp_link_vif = ath12k_dp_vif_to_dp_link_vif(&ahvif->dp_vif, arvif->link_id);
 
 	ti.bank_id = dp_link_vif->bank_id;
 	ti.meta_data_flags = dp_link_vif->tcl_metadata;
+	ti.bss_ast_hash = dp_link_vif->ast_hash;
+	ti.bss_ast_idx = dp_link_vif->ast_idx;
+
+	if (eth && is_multicast_ether_addr(eth->h_dest) && arsta) {
+		ti.meta_data_flags = arsta->tcl_metadata;
+		ti.bss_ast_hash = arsta->ast_hash & ATH12K_AST_HASH_MASK;
+		ti.bss_ast_idx = arsta->ast_idx;
+		ti.lookup_override = true;
+	} else if (!eth && ieee80211_has_a4(hdr->frame_control) &&
+		   is_multicast_ether_addr(hdr->addr3) && arsta) {
+		ti.meta_data_flags = arsta->tcl_metadata;
+		ti.flags0 |= u32_encode_bits(1, HAL_TCL_DATA_CMD_INFO2_TO_FW);
+	}
 
 	if (dp_vif->tx_encap_type == HAL_TCL_ENCAP_TYPE_RAW &&
 	    test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ab->dev_flags)) {
@@ -140,7 +205,7 @@ tcl_ring_sel:
 		msdu_ext_desc = true;
 	}
 
-	if (gsn_valid) {
+	if (gsn_valid && !ti.lookup_override) {
 		/* Reset and Initialize meta_data_flags with Global Sequence
 		 * Number (GSN) info.
 		 */
@@ -148,6 +213,14 @@ tcl_ring_sel:
 			u32_encode_bits(HTT_TCL_META_DATA_TYPE_GLOBAL_SEQ_NUM,
 					HTT_TCL_META_DATA_TYPE) |
 			u32_encode_bits(mcbc_gsn, HTT_TCL_META_DATA_GLOBAL_SEQ_NUM);
+
+		/*
+		 * Since NAWDS enabled for this vdev firmware expects
+		 * this flag to be set for sending 3-address multicast frame.
+		 */
+		ti.meta_data_flags |=
+			u32_encode_bits(arvif->nawds_enabled,
+					HTT_TCL_META_DATA_GLOBAL_SEQ_HOST_INSPECTED);
 	}
 
 	ti.encap_type = ath12k_dp_tx_get_encap_type(ab, skb);
@@ -158,11 +231,13 @@ tcl_ring_sel:
 	ti.lmac_id = dp_link_vif->lmac_id;
 
 	ti.vdev_id = dp_link_vif->vdev_id;
-	if (gsn_valid)
-		ti.vdev_id += HTT_TX_MLO_MCAST_HOST_REINJECT_BASE_VDEV_ID;
 
-	ti.bss_ast_hash = dp_link_vif->ast_hash;
-	ti.bss_ast_idx = dp_link_vif->ast_idx;
+	if (gsn_valid && !ti.lookup_override)
+		ti.vdev_id += HTT_TX_MLO_MCAST_HOST_REINJECT_BASE_VDEV_ID;
+	else if (arvif->nawds_enabled && is_mcast && !ti.lookup_override)
+		ti.meta_data_flags |=
+			u32_encode_bits(1, HTT_TCL_META_DATA_HOST_INSPECTED_MISSION);
+
 	ti.dscp_tid_tbl_idx = 0;
 
 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
@@ -182,9 +257,27 @@ tcl_ring_sel:
 	case HAL_TCL_ENCAP_TYPE_NATIVE_WIFI:
 		is_null_frame = ieee80211_is_nullfunc(hdr->frame_control);
 		if (ahvif->vif->offload_flags & IEEE80211_OFFLOAD_ENCAP_ENABLED) {
-			if (skb->protocol == cpu_to_be16(ETH_P_PAE) || is_null_frame)
+			if ((skb->protocol == cpu_to_be16(ETH_P_PAE) &&
+			     !(skb_cb->flags & ATH12K_SKB_CIPHER_SET)) || is_null_frame)
 				is_diff_encap = true;
 
+			if (skb->protocol == cpu_to_be16(ETH_P_PAE) &&
+			    (skb_cb->flags & ATH12K_SKB_CIPHER_SET)) {
+				if (!eapol_encap_done) {
+					ret = ath12k_wifi7_dp_tx_encap_eapol(skb, &ti,
+									     skb_cb);
+					if (ret)
+						goto fail_remove_tx_buf;
+					hdr = (void *)skb->data;
+					eapol_encap_done = true;
+				} else {
+					ti.flags0 |= u32_encode_bits(1,
+							HAL_TCL_DATA_CMD_INFO2_TO_FW);
+					ti.encap_type = HAL_TCL_ENCAP_TYPE_RAW;
+					ti.encrypt_type =
+						ath12k_dp_tx_get_encrypt_type(skb_cb->cipher);
+				}
+			}
 			/* Firmware expects msdu ext descriptor for nwifi/raw packets
 			 * received in ETH mode. Without this, observed tx fail for
 			 * Multicast packets in ETH mode.
@@ -222,10 +315,15 @@ tcl_ring_sel:
 			goto map;
 		}
 
-		/* hdr is pointing to a wrong place after alignment,
-		 * so refresh it for later use.
+		/*
+		 * The payload may have been shifted or even the entire buffer may have
+		 * been reallocated for alignment. In that case, hdr, eth and skb_cb
+		 * are stale pointers. Refresh them now for later dereference.
 		 */
 		hdr = (void *)skb->data;
+		if (eth)
+			eth = (struct ethhdr *)skb->data;
+		skb_cb = ATH12K_SKB_CB(skb);
 	}
 map:
 	ti.paddr = dma_map_single(dp->dev, skb->data, skb->len, DMA_TO_DEVICE);
@@ -358,15 +456,17 @@ skip_htt_meta:
 	return 0;
 
 fail_unmap_dma_ext:
-	if (skb_cb->paddr_ext_desc)
+	if (skb_cb->paddr_ext_desc) {
 		dma_unmap_single(dp->dev, skb_cb->paddr_ext_desc,
 				 skb_ext_desc->len,
 				 DMA_TO_DEVICE);
+		skb_cb->paddr_ext_desc = 0;
+	}
 fail_free_ext_skb:
 	kfree_skb(skb_ext_desc);
 
 fail_unmap_dma:
-	dma_unmap_single(dp->dev, ti.paddr, ti.data_len, DMA_TO_DEVICE);
+	dma_unmap_single(dp->dev, skb_cb->paddr, skb->len, DMA_TO_DEVICE);
 
 fail_remove_tx_buf:
 	ath12k_dp_tx_release_txbuf(dp, tx_desc, pool_id);
@@ -484,18 +584,19 @@ ath12k_dp_tx_process_htt_tx_complete(struct ath12k_dp *dp, void *desc,
 {
 	struct htt_tx_wbm_completion *status_desc;
 	struct ath12k_dp_htt_wbm_tx_status ts = {};
-	enum hal_wbm_htt_tx_comp_status wbm_status;
+	enum hal_wbm_htt_tx_comp_status htt_status;
 	u16 peer_id;
 
 	status_desc = desc;
 
-	wbm_status = le32_get_bits(status_desc->info0,
+	htt_status = le32_get_bits(status_desc->info0,
 				   HTT_TX_WBM_COMP_INFO0_STATUS);
-	dp->device_stats.fw_tx_status[wbm_status]++;
+	if (likely(htt_status < MAX_FW_TX_STATUS))
+		dp->device_stats.fw_tx_status[htt_status]++;
 
-	switch (wbm_status) {
+	switch (htt_status) {
 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_OK:
-		ts.acked = (wbm_status == HAL_WBM_REL_HTT_TX_COMP_STATUS_OK);
+		ts.acked = true;
 		ts.ack_rssi = le32_get_bits(status_desc->info2,
 					    HTT_TX_WBM_COMP_INFO2_ACK_RSSI);
 
@@ -517,7 +618,7 @@ ath12k_dp_tx_process_htt_tx_complete(struct ath12k_dp *dp, void *desc,
 		 */
 		break;
 	default:
-		ath12k_warn(dp->ab, "Unknown htt wbm tx status %d\n", wbm_status);
+		ath12k_warn(dp->ab, "Unknown htt tx status %d\n", htt_status);
 		break;
 	}
 }
@@ -831,12 +932,14 @@ void ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id)
 	u64 desc_va;
 	enum hal_wbm_rel_src_module buf_rel_source;
 	enum hal_wbm_tqm_rel_reason rel_status;
+	u32 ring_size;
 
 	spin_lock_bh(&status_ring->lock);
 
+	ring_size = ath12k_dp_tx_comp_ring_size(&ab->profile_param->dp_params);
 	ath12k_hal_srng_access_begin(ab, status_ring);
 
-	while (ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_head) !=
+	while (ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_head) !=
 	       tx_ring->tx_status_tail) {
 		desc = ath12k_hal_srng_dst_get_next_entry(ab, status_ring);
 		if (!desc)
@@ -845,11 +948,11 @@ void ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id)
 		memcpy(&tx_ring->tx_status[tx_ring->tx_status_head],
 		       desc, sizeof(*desc));
 		tx_ring->tx_status_head =
-			ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_head);
+			ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_head);
 	}
 
 	if (ath12k_hal_srng_dst_peek(ab, status_ring) &&
-	    (ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_head) ==
+	    (ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_head) ==
 	     tx_ring->tx_status_tail)) {
 		/* TODO: Process pending tx_status messages when kfifo_is_full() */
 		ath12k_warn(ab, "Unable to process some of the tx_status ring desc because status_fifo is full\n");
@@ -859,13 +962,13 @@ void ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id)
 
 	spin_unlock_bh(&status_ring->lock);
 
-	while (ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_tail) !=
+	while (ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_tail) !=
 	       tx_ring->tx_status_head) {
 		struct hal_wbm_completion_ring_tx *tx_status;
 		u32 desc_id;
 
 		tx_ring->tx_status_tail =
-			ATH12K_TX_COMPL_NEXT(ab, tx_ring->tx_status_tail);
+			ATH12K_TX_COMPL_NEXT(ring_size, tx_ring->tx_status_tail);
 		tx_status = &tx_ring->tx_status[tx_ring->tx_status_tail];
 		ath12k_wifi7_dp_tx_status_parse(dp, tx_status, &ts);
 
@@ -893,11 +996,17 @@ void ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id)
 		/* Find the HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE value */
 		buf_rel_source = le32_get_bits(tx_status->info0,
 					       HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE);
-		dp->device_stats.tx_wbm_rel_source[buf_rel_source]++;
+		if (likely(buf_rel_source < HAL_WBM_REL_SRC_MODULE_MAX))
+			dp->device_stats.tx_wbm_rel_source[buf_rel_source]++;
+		else
+			WARN_ON_ONCE(1);
 
 		rel_status = le32_get_bits(tx_status->info0,
 					   HAL_WBM_COMPL_TX_INFO0_TQM_RELEASE_REASON);
-		dp->device_stats.tqm_rel_reason[rel_status]++;
+		if (likely(rel_status < MAX_TQM_RELEASE_REASON))
+			dp->device_stats.tqm_rel_reason[rel_status]++;
+		else
+			WARN_ON_ONCE(1);
 
 		/* Release descriptor as soon as extracting necessary info
 		 * to reduce contention

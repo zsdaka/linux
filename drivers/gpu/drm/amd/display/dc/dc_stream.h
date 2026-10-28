@@ -64,35 +64,6 @@ struct dc_stream_status {
 	bool fpo_in_use;
 };
 
-enum hubp_dmdata_mode {
-	DMDATA_SW_MODE,
-	DMDATA_HW_MODE
-};
-
-struct dc_dmdata_attributes {
-	/* Specifies whether dynamic meta data will be updated by software
-	 * or has to be fetched by hardware (DMA mode)
-	 */
-	enum hubp_dmdata_mode dmdata_mode;
-	/* Specifies if current dynamic meta data is to be used only for the current frame */
-	bool dmdata_repeat;
-	/* Specifies the size of Dynamic Metadata surface in byte.  Size of 0 means no Dynamic metadata is fetched */
-	uint32_t dmdata_size;
-	/* Specifies if a new dynamic meta data should be fetched for an upcoming frame */
-	bool dmdata_updated;
-	/* If hardware mode is used, the base address where DMDATA surface is located */
-	PHYSICAL_ADDRESS_LOC address;
-	/* Specifies whether QOS level will be provided by TTU or it will come from DMDATA_QOS_LEVEL */
-	bool dmdata_qos_mode;
-	/* If qos_mode = 1, this is the QOS value to be used: */
-	uint32_t dmdata_qos_level;
-	/* Specifies the value in unit of REFCLK cycles to be added to the
-	 * current time to produce the Amortized deadline for Dynamic Metadata chunk request
-	 */
-	uint32_t dmdata_dl_delta;
-	/* An unbounded array of uint32s, represents software dmdata to be loaded */
-	uint32_t *dmdata_sw_data;
-};
 
 struct dc_writeback_info {
 	bool wb_enabled;
@@ -146,10 +117,48 @@ union stream_update_flags {
 		uint32_t fams_changed : 1;
 		uint32_t scaler_sharpener : 1;
 		uint32_t sharpening_required : 1;
+		uint32_t cursor_attr : 1;
+		uint32_t cursor_pos : 1;
+		uint32_t periodic_interrupt : 1;
+		uint32_t info_frame : 1;
+		uint32_t dmdata : 1;
+		uint32_t dither : 1;
+		uint32_t func_shaper : 1;
+		uint32_t lut3d_func : 1;
+		uint32_t reserved : 11; /* adjust when adding new flags */
 	} bits;
 
 	uint32_t raw;
 };
+
+static inline void stream_update_flags_clear(union stream_update_flags *flags)
+{
+	flags->raw = 0;
+}
+
+static inline void stream_update_flags_set_full(union stream_update_flags *flags)
+{
+	stream_update_flags_clear(flags);
+	flags->bits.scaling = 1;
+	flags->bits.out_tf = 1;
+	flags->bits.out_csc = 1;
+	flags->bits.abm_level = 1;
+	flags->bits.dpms_off = 1;
+	flags->bits.gamut_remap = 1;
+	flags->bits.wb_update = 1;
+	flags->bits.dsc_changed = 1;
+	flags->bits.mst_bw = 1;
+	flags->bits.crtc_timing_adjust = 1;
+	flags->bits.fams_changed = 1;
+	flags->bits.scaler_sharpener = 1;
+	flags->bits.sharpening_required = 1;
+	flags->bits.cursor_attr = 1;
+	flags->bits.cursor_pos = 1;
+	flags->bits.periodic_interrupt = 1;
+	flags->bits.info_frame = 1;
+	flags->bits.dmdata = 1;
+	flags->bits.dither = 1;
+}
 
 struct test_pattern {
 	enum dp_test_pattern type;
@@ -179,8 +188,8 @@ struct luminance_data {
 	int luminance_millinits[LUMINANCE_DATA_TABLE_SIZE];
 	int flicker_criteria_milli_nits_GAMING;
 	int flicker_criteria_milli_nits_STATIC;
-	int nominal_refresh_rate;
-	int dm_max_decrease_from_nominal;
+	unsigned int nominal_refresh_rate;
+	unsigned int dm_max_decrease_from_nominal;
 };
 
 enum dc_drr_trigger_mode {
@@ -323,7 +332,10 @@ struct dc_stream_state {
 
 	enum dc_drr_trigger_mode drr_trigger_mode;
 
+
+	enum dc_blending_linearity blending_linearity;
 	struct dc_update_scratch_space *update_scratch;
+	bool firmware_controlled_hdr_info_packet;
 };
 
 #define ABM_LEVEL_IMMEDIATE_DISABLE 255
@@ -374,6 +386,8 @@ struct dc_stream_update {
 	bool *scaler_sharpener_update;
 	bool *sharpening_required;
 
+	enum dc_blending_linearity *blending_linearity;
+
 	enum dc_drr_trigger_mode *drr_trigger_mode;
 };
 
@@ -401,32 +415,8 @@ bool dc_update_planes_and_stream(struct dc *dc,
 		struct dc_stream_state *dc_stream,
 		struct dc_stream_update *stream_update);
 
-struct dc_update_scratch_space;
+struct dc_state_update;
 
-size_t dc_update_scratch_space_size(void);
-
-struct dc_update_scratch_space *dc_update_planes_and_stream_init(
-		struct dc *dc,
-		struct dc_surface_update *surface_updates,
-		int surface_count,
-		struct dc_stream_state *dc_stream,
-		struct dc_stream_update *stream_update
-);
-
-// Locked, false is failed
-bool dc_update_planes_and_stream_prepare(
-		struct dc_update_scratch_space *scratch
-);
-
-// Unlocked
-void dc_update_planes_and_stream_execute(
-		const struct dc_update_scratch_space *scratch
-);
-
-// Locked, true if call again
-bool dc_update_planes_and_stream_cleanup(
-		struct dc_update_scratch_space *scratch
-);
 
 /*
  * Set up surface attributes and associate to a stream
@@ -511,11 +501,15 @@ void dc_enable_stereo(
 /* Triggers multi-stream synchronization. */
 void dc_trigger_sync(struct dc *dc, struct dc_state *context);
 
-struct surface_update_descriptor dc_check_update_surfaces_for_stream(
+/* Shim: packs args into dc_state_update and calls dc_check_state_update(). */
+struct dc_update_descriptor dc_check_update_surfaces_for_stream(
 		const struct dc_check_config *check_config,
 		struct dc_surface_update *updates,
 		int surface_count,
 		struct dc_stream_update *stream_update);
+
+struct dc_link *dc_stream_get_link(
+	const struct dc_stream_state *dc_stream);
 
 /**
  * Create a new default stream for the requested sink
@@ -619,17 +613,6 @@ bool dc_stream_set_gamut_remap(struct dc *dc,
 
 bool dc_stream_program_csc_matrix(struct dc *dc,
 				  struct dc_stream_state *stream);
-
-struct dc_rmcm_3dlut *dc_stream_get_3dlut_for_stream(
-	const struct dc *dc,
-	const struct dc_stream_state *stream,
-	bool allocate_one);
-
-void dc_stream_release_3dlut_for_stream(
-	const struct dc *dc,
-	const struct dc_stream_state *stream);
-
-void dc_stream_init_rmcm_3dlut(struct dc *dc);
 
 struct pipe_ctx *dc_stream_get_pipe_ctx(struct dc_stream_state *stream);
 

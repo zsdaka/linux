@@ -542,8 +542,7 @@ static int max_tcpci_probe(struct i2c_client *client)
 					(IRQF_TRIGGER_LOW | IRQF_ONESHOT), dev_name(chip->dev),
 					chip);
 	if (ret < 0)
-		return dev_err_probe(&client->dev, ret,
-				     "IRQ initialization failed\n");
+		return ret;
 
 	ret = devm_device_init_wakeup(chip->dev);
 	if (ret)
@@ -579,7 +578,7 @@ static int max_tcpci_suspend(struct device *dev)
 static SIMPLE_DEV_PM_OPS(max_tcpci_pm_ops, max_tcpci_suspend, max_tcpci_resume);
 
 static const struct i2c_device_id max_tcpci_id[] = {
-	{ "maxtcpc" },
+	{ .name = "maxtcpc" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, max_tcpci_id);

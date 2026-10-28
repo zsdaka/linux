@@ -32,7 +32,6 @@
 #include <drm/drm_print.h>
 
 #include "drm_crtc_internal.h"
-#include "drm_internal.h"
 
 /**
  * DOC: overview
@@ -200,13 +199,6 @@ int drm_mode_create_dumb(struct drm_device *dev,
 	if (!dev->driver->dumb_create)
 		return -ENOSYS;
 	if (!args->width || !args->height || !args->bpp)
-		return -EINVAL;
-
-	/* Reject unreasonable inputs early.  Dumb buffers are for software
-	 * rendering; nothing legitimate needs more than 8192x8192 at 32bpp.
-	 * This prevents overflows in downstream alignment helpers.
-	 */
-	if (args->width >= 8192 || args->height >= 8192 || args->bpp > 32)
 		return -EINVAL;
 
 	/* overflow checks for 32bit size calculations */

@@ -20,7 +20,7 @@
  *    managed alongside the master keys in the filesystem-level keyring)
  */
 
-#include <crypto/aes.h>
+#include <crypto/aes-ecb.h>
 #include <crypto/utils.h>
 #include <keys/user-type.h>
 #include <linux/hashtable.h>
@@ -147,13 +147,19 @@ find_or_insert_direct_key(struct fscrypt_direct_key *to_insert,
 		if (memcmp(ci->ci_policy.v1.master_key_descriptor,
 			   dk->dk_descriptor, FSCRYPT_KEY_DESCRIPTOR_SIZE) != 0)
 			continue;
+		/* The sb is used at eviction time, so it must be the same. */
+		if (ci->ci_inode->i_sb != dk->dk_sb)
+			continue;
 		if (ci->ci_mode != dk->dk_mode)
 			continue;
 		if (!fscrypt_is_key_prepared(&dk->dk_key, ci))
 			continue;
 		if (crypto_memneq(raw_key, dk->dk_raw, ci->ci_mode->keysize))
 			continue;
-		/* using existing tfm with same (descriptor, mode, raw_key) */
+		/*
+		 * Use an existing prepared key with the same (descriptor, sb,
+		 * mode, inlinecrypt, raw_key) combination.
+		 */
 		refcount_inc(&dk->dk_refcount);
 		spin_unlock(&fscrypt_direct_keys_lock);
 		free_direct_key(to_insert);
@@ -240,12 +246,11 @@ static int setup_v1_file_key_derived(struct fscrypt_inode_info *ci,
 
 	static_assert(FSCRYPT_FILE_NONCE_SIZE == AES_KEYSIZE_128);
 	aes_prepareenckey(&aes, ci->ci_nonce, FSCRYPT_FILE_NONCE_SIZE);
-	for (unsigned int i = 0; i < derived_keysize; i += AES_BLOCK_SIZE)
-		aes_encrypt(&aes, &derived_key[i], &raw_master_key[i]);
+	aes_ecb_encrypt(derived_key, raw_master_key, derived_keysize, &aes);
 
 	err = fscrypt_set_per_file_enc_key(ci, derived_key);
 
-	memzero_explicit(derived_key, derived_keysize);
+	memzero_explicit(derived_key, sizeof(derived_key));
 	/* No need to zeroize 'aes', as its key is not secret. */
 	return err;
 }

@@ -7,7 +7,6 @@
 // Auther: Gyuhwa Park <gyuhwa.park@irondevice.com>
 //         Kiseok Jo <kiseok.jo@irondevice.com>
 
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/kernel.h>
@@ -1413,12 +1412,25 @@ static int sma1303_dai_set_tdm_slot(struct snd_soc_dai *dai,
 	return 0;
 }
 
+static const u64 sma1303_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_RIGHT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_IF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_IF;
+
 static const struct snd_soc_dai_ops sma1303_dai_ops_amp = {
 	.set_sysclk = sma1303_dai_set_sysclk_amp,
 	.set_fmt = sma1303_dai_set_fmt_amp,
 	.hw_params = sma1303_dai_hw_params_amp,
 	.mute_stream = sma1303_dai_mute,
 	.set_tdm_slot = sma1303_dai_set_tdm_slot,
+	.auto_selectable_formats = &sma1303_selectable_formats,
+	.num_auto_selectable_formats = 1,
 };
 
 #define SMA1303_RATES SNDRV_PCM_RATE_8000_192000
@@ -1778,12 +1790,14 @@ static void sma1303_i2c_remove(struct i2c_client *client)
 	struct sma1303_priv *sma1303 =
 		(struct sma1303_priv *) i2c_get_clientdata(client);
 
+	if (sma1303->attr_grp)
+		sysfs_remove_group(sma1303->kobj, sma1303->attr_grp);
 	cancel_delayed_work_sync(&sma1303->check_fault_work);
 }
 
 static const struct i2c_device_id sma1303_i2c_id[] = {
-	{"sma1303"},
-	{}
+	{ .name = "sma1303" },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, sma1303_i2c_id);
 

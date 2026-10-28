@@ -804,7 +804,7 @@ static void dce112_resource_destruct(struct dce110_resource_pool *pool)
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_ddc; i++) {
 		if (pool->base.engines[i] != NULL)
 			dce110_engine_destroy(&pool->base.engines[i]);
 		if (pool->base.hw_i2cs[i] != NULL) {
@@ -845,30 +845,6 @@ static void dce112_resource_destruct(struct dce110_resource_pool *pool)
 
 	if (pool->base.irqs != NULL) {
 		dal_irq_service_destroy(&pool->base.irqs);
-	}
-}
-
-static struct clock_source *find_matching_pll(
-		struct resource_context *res_ctx,
-		const struct resource_pool *pool,
-		const struct dc_stream_state *const stream)
-{
-	(void)res_ctx;
-	switch (stream->link->link_enc->transmitter) {
-	case TRANSMITTER_UNIPHY_A:
-		return pool->clock_sources[DCE112_CLK_SRC_PLL0];
-	case TRANSMITTER_UNIPHY_B:
-		return pool->clock_sources[DCE112_CLK_SRC_PLL1];
-	case TRANSMITTER_UNIPHY_C:
-		return pool->clock_sources[DCE112_CLK_SRC_PLL2];
-	case TRANSMITTER_UNIPHY_D:
-		return pool->clock_sources[DCE112_CLK_SRC_PLL3];
-	case TRANSMITTER_UNIPHY_E:
-		return pool->clock_sources[DCE112_CLK_SRC_PLL4];
-	case TRANSMITTER_UNIPHY_F:
-		return pool->clock_sources[DCE112_CLK_SRC_PLL5];
-	default:
-		return NULL;
 	}
 }
 
@@ -961,41 +937,6 @@ enum dc_status dce112_validate_bandwidth(
 			context->bw_ctx.bw.dce.blackout_recovery_time_us);
 	}
 	return result ? DC_OK : DC_FAIL_BANDWIDTH_VALIDATE;
-}
-
-enum dc_status resource_map_phy_clock_resources(
-		const struct dc *dc,
-		struct dc_state *context,
-		struct dc_stream_state *stream)
-{
-
-	/* acquire new resources */
-	struct pipe_ctx *pipe_ctx = resource_get_otg_master_for_stream(
-			&context->res_ctx, stream);
-
-	if (!pipe_ctx)
-		return DC_ERROR_UNEXPECTED;
-
-	if (dc_is_dp_signal(pipe_ctx->stream->signal)
-		|| dc_is_virtual_signal(pipe_ctx->stream->signal))
-		pipe_ctx->clock_source =
-				dc->res_pool->dp_clock_source;
-	else {
-		if (stream && stream->link && stream->link->link_enc)
-			pipe_ctx->clock_source = find_matching_pll(
-				&context->res_ctx, dc->res_pool,
-				stream);
-	}
-
-	if (pipe_ctx->clock_source == NULL)
-		return DC_NO_CLOCK_SOURCE_RESOURCE;
-
-	resource_reference_clock_source(
-		&context->res_ctx,
-		dc->res_pool,
-		pipe_ctx->clock_source);
-
-	return DC_OK;
 }
 
 static bool dce112_validate_surface_sets(
@@ -1382,7 +1323,7 @@ static bool dce112_resource_construct(
 		}
 	}
 
-	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+	for (i = 0; i < (unsigned int)pool->base.res_cap->num_ddc; i++) {
 		pool->base.engines[i] = dce112_aux_engine_create(ctx, i);
 		if (pool->base.engines[i] == NULL) {
 			BREAK_TO_DEBUGGER();

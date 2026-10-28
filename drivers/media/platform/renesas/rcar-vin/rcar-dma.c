@@ -678,7 +678,7 @@ void rvin_crop_scale_comp(struct rvin_dev *vin)
 
 	/*
 	 * VNIS_REG has four lowest bits always 0, i.e. the stride has to be
-	 * aligned to 16 bytes. This is done in rvin_format_bytesperline().
+	 * aligned to 16 pixels. This is done in rvin_format_bytesperline().
 	 */
 
 	fmt = rvin_format_from_pixel(vin, vin->format.pixelformat);
@@ -1494,7 +1494,6 @@ int rvin_dma_register(struct rvin_dev *vin, int irq)
 	q->ops = &rvin_qops;
 	q->mem_ops = &vb2_dma_contig_memops;
 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	q->min_queued_buffers = 4;
 	q->dev = vin->dev;
 
 	ret = vb2_queue_init(q);

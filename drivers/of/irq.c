@@ -563,7 +563,9 @@ const struct cpumask *of_irq_get_affinity(struct device_node *dev, int index)
 	of_phandle_args_to_fwspec(oirq.np, oirq.args, oirq.args_count,
 				  &fwspec);
 
-	if (irq_populate_fwspec_info(&fwspec, &info))
+	rc = irq_populate_fwspec_info(&fwspec, &info);
+	of_node_put(oirq.np);
+	if (rc)
 		return NULL;
 
 	return info.affinity;
@@ -752,6 +754,8 @@ void __init of_irq_init(const struct of_device_id *matches)
 
 	list_for_each_entry_safe(desc, temp_desc, &intc_parent_list, list) {
 		list_del(&desc->list);
+		of_node_put(desc->interrupt_parent);
+		of_node_put(desc->dev);
 		kfree(desc);
 	}
 err:
@@ -763,47 +767,43 @@ err:
 	}
 }
 
-static int of_check_msi_parent(struct device_node *dev_node, struct device_node **msi_node)
+static int of_check_msi_parent(struct device_node *dev_node, struct device_node **msi_node,
+			       struct of_phandle_args *msi_spec)
 {
-	struct of_phandle_args msi_spec;
 	int ret;
 
 	/*
 	 * An msi-parent phandle with a missing or == 0 #msi-cells
 	 * property identifies a 1:1 ID translation mapping.
 	 *
-	 * Set the msi controller node if the firmware matches this
-	 * condition.
+	 * @msi_spec keeps a reference to the target node whenever the
+	 * phandle parses, -EINVAL included, and the caller releases it.
 	 */
 	ret = of_parse_phandle_with_optional_args(dev_node, "msi-parent", "#msi-cells",
-						  0, &msi_spec);
+						  0, msi_spec);
 	if (ret)
 		return ret;
 
-	if ((*msi_node && *msi_node != msi_spec.np) || msi_spec.args_count != 0)
-		ret = -EINVAL;
+	if ((*msi_node && *msi_node != msi_spec->np) || msi_spec->args_count != 0)
+		return -EINVAL;
 
-	if (!ret) {
-		/* Return with a node reference held */
-		*msi_node = msi_spec.np;
-		return 0;
-	}
-	of_node_put(msi_spec.np);
-
-	return ret;
+	return 0;
 }
 
 /**
  * of_msi_xlate - map a MSI ID and find relevant MSI controller node
  * @dev: device for which the mapping is to be done.
- * @msi_np: Pointer to target MSI controller node
+ * @msi_np: Pointer to target MSI controller node, or NULL if the caller
+ *           only needs the translated ID without receiving the controller node.
+ *           If non-NULL and pointing to a non-NULL node, only entries targeting
+ *           that node will be matched. If non-NULL and pointing to NULL, it will
+ *           receive the first matching target node with a reference held.
  * @id_in: Device ID.
  *
  * Walk up the device hierarchy looking for devices with a "msi-map"
- * or "msi-parent" property. If found, apply the mapping to @id_in.
- * If @msi_np points to a non-NULL device node pointer, only entries targeting
- * that node will be matched; if it points to a NULL value, it will receive the
- * device node of the first matching target phandle, with a reference held.
+ * or "msi-parent" property. If found, apply the mapping to @id_in. With
+ * @msi_np non-NULL, a device declaring an msi-parent ends the walk, usable
+ * or not.
  *
  * Returns: The mapped MSI id.
  */
@@ -817,11 +817,33 @@ u32 of_msi_xlate(struct device *dev, struct device_node **msi_np, u32 id_in)
 	 * "msi-map" or an "msi-parent" property.
 	 */
 	for (parent_dev = dev; parent_dev; parent_dev = parent_dev->parent) {
-		if (!of_map_id(parent_dev->of_node, id_in, "msi-map",
-				"msi-map-mask", msi_np, &id_out))
+		struct of_phandle_args msi_spec = {};
+		int ret;
+
+		if (!of_map_msi_id(parent_dev->of_node, id_in, msi_np, &msi_spec)) {
+			if (msi_spec.np) {
+				/* msi-map matched: use the translated ID and target node */
+				if (msi_spec.args_count > 0)
+					id_out = msi_spec.args[0];
+				if (msi_np && !*msi_np)
+					*msi_np = of_node_get(msi_spec.np);
+				of_node_put(msi_spec.np);
+			}
+			/* msi-map present but no match → stop walking */
 			break;
-		if (!of_check_msi_parent(parent_dev->of_node, msi_np))
+		}
+		/* -ENODEV: msi-map absent → check for msi-parent */
+		if (!msi_np)
+			continue;
+
+		ret = of_check_msi_parent(parent_dev->of_node, msi_np, &msi_spec);
+		if (msi_spec.np) {
+			/* A declared msi-parent names the controller, usable or not */
+			if (!ret && !*msi_np)
+				*msi_np = of_node_get(msi_spec.np);
+			of_node_put(msi_spec.np);
 			break;
+		}
 	}
 	return id_out;
 }
@@ -842,9 +864,12 @@ struct irq_domain *of_msi_map_get_device_domain(struct device *dev, u32 id,
 						u32 bus_token)
 {
 	struct device_node *np = NULL;
+	struct irq_domain *d;
 
 	of_msi_xlate(dev, &np, id);
-	return irq_find_matching_host(np, bus_token);
+	d = irq_find_matching_host(np, bus_token);
+	of_node_put(np);
+	return d;
 }
 
 /**

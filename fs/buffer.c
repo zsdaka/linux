@@ -54,9 +54,6 @@
 
 #include "internal.h"
 
-static void submit_bh_wbc(blk_opf_t opf, struct buffer_head *bh,
-			  enum rw_hint hint, struct writeback_control *wbc);
-
 #define BH_ENTRY(list) list_entry((list), struct buffer_head, b_assoc_buffers)
 
 inline void touch_buffer(struct buffer_head *bh)
@@ -74,9 +71,7 @@ EXPORT_SYMBOL(__lock_buffer);
 
 void unlock_buffer(struct buffer_head *bh)
 {
-	clear_bit_unlock(BH_Lock, &bh->b_state);
-	smp_mb__after_atomic();
-	wake_up_bit(&bh->b_state, BH_Lock);
+	clear_and_wake_up_bit(BH_Lock, &bh->b_state);
 }
 EXPORT_SYMBOL(unlock_buffer);
 
@@ -132,15 +127,43 @@ static void buffer_io_error(struct buffer_head *bh, char *msg)
 			bh->b_bdev, (unsigned long long)bh->b_blocknr, msg);
 }
 
-/*
- * End-of-IO handler helper function which does not touch the bh after
- * unlocking it.
- * Note: unlock_buffer() sort-of does touch the bh after unlocking it, but
- * a race there is benign: unlock_buffer() only use the bh's address for
- * hashing after unlocking the buffer, so it doesn't actually touch the bh
- * itself.
+/**
+ * bio_endio_bh - Discard the bio used to submit a buffer.
+ * @bio: The bio.
+ * @bhp: Where to return the buffer_head.
+ *
+ * Call this in your bio_end_io handler to retrieve the buffer_head
+ * submitted in bh_submit().  If you did not call bh_submit(), do not
+ * call this function; it will return garbage.
+ *
+ * This function consumes the bio refcount which will probably free the
+ * bio.
+ *
+ * Return: True if the I/O succeeded.
  */
-static void __end_buffer_read_notouch(struct buffer_head *bh, int uptodate)
+bool bio_endio_bh(struct bio *bio, struct buffer_head **bhp)
+{
+	bool success = bio->bi_status == BLK_STS_OK;
+	struct buffer_head *bh = bio->bi_private;
+
+	if (unlikely(bio_flagged(bio, BIO_QUIET)))
+		set_bit(BH_Quiet, &bh->b_state);
+	bio_put(bio);
+
+	*bhp = bh;
+	return success;
+}
+EXPORT_SYMBOL(bio_endio_bh);
+
+/**
+ * end_buffer_read_sync - Handle buffer reads finishing
+ * @bh: The buffer.
+ * @uptodate: True if the read was successful.
+ *
+ * If a buffer is read through a mechanism that isn't bh_submit(), you
+ * can call this function to finish the read.
+ */
+void end_buffer_read_sync(struct buffer_head *bh, int uptodate)
 {
 	if (uptodate) {
 		set_buffer_uptodate(bh);
@@ -150,31 +173,44 @@ static void __end_buffer_read_notouch(struct buffer_head *bh, int uptodate)
 	}
 	unlock_buffer(bh);
 }
-
-/*
- * Default synchronous end-of-IO handler..  Just mark it up-to-date and
- * unlock the buffer.
- */
-void end_buffer_read_sync(struct buffer_head *bh, int uptodate)
-{
-	put_bh(bh);
-	__end_buffer_read_notouch(bh, uptodate);
-}
 EXPORT_SYMBOL(end_buffer_read_sync);
 
-void end_buffer_write_sync(struct buffer_head *bh, int uptodate)
+/**
+ * bh_end_read - I/O end handler for reads
+ * @bio: The bio being completed.
+ *
+ * Pass this function to bh_submit() if you're reading into the buffer,
+ * unless you need your own special I/O end handler.
+ */
+void bh_end_read(struct bio *bio)
 {
-	if (uptodate) {
-		set_buffer_uptodate(bh);
+	struct buffer_head *bh;
+	bool uptodate = bio_endio_bh(bio, &bh);
+	end_buffer_read_sync(bh, uptodate);
+}
+EXPORT_SYMBOL(bh_end_read);
+
+/**
+ * bh_end_write - I/O end handler for writes
+ * @bio: The bio being completed.
+ *
+ * Pass this function to bh_submit() if you're writing from the buffer,
+ * unless you need your own special I/O end handler.
+ */
+void bh_end_write(struct bio *bio)
+{
+	struct buffer_head *bh;
+	bool success = bio_endio_bh(bio, &bh);
+
+	if (success) {
+		clear_buffer_write_io_error(bh);
 	} else {
 		buffer_io_error(bh, ", lost sync page write");
 		mark_buffer_write_io_error(bh);
-		clear_buffer_uptodate(bh);
 	}
 	unlock_buffer(bh);
-	put_bh(bh);
 }
-EXPORT_SYMBOL(end_buffer_write_sync);
+EXPORT_SYMBOL(bh_end_write);
 
 static struct buffer_head *
 __find_get_block_slow(struct block_device *bdev, sector_t block, bool atomic)
@@ -228,7 +264,7 @@ __find_get_block_slow(struct block_device *bdev, sector_t block, bool atomic)
 		bh = bh->b_this_page;
 	} while (bh != head);
 
-	/* we might be here because some of the buffers on this page are
+	/* we might be here because some of the buffers on this folio are
 	 * not mapped.  This is due to various races between
 	 * file io on the block device and getblk.  It gets dealt with
 	 * elsewhere, don't buffer_error if we had some unmapped buffers
@@ -274,7 +310,7 @@ static void end_buffer_async_read(struct buffer_head *bh, int uptodate)
 	/*
 	 * Be _very_ careful from here on. Bad things can happen if
 	 * two buffer heads end IO at almost the same time and both
-	 * decide that the page is now completely done.
+	 * decide that the folio is now completely done.
 	 */
 	first = folio_buffers(folio);
 	spin_lock_irqsave(&first->b_uptodate_lock, flags);
@@ -299,7 +335,7 @@ still_busy:
 	spin_unlock_irqrestore(&first->b_uptodate_lock, flags);
 }
 
-struct postprocess_bh_ctx {
+struct verify_bh_ctx {
 	struct work_struct work;
 	struct buffer_head *bh;
 	struct fsverity_info *vi;
@@ -307,8 +343,8 @@ struct postprocess_bh_ctx {
 
 static void verify_bh(struct work_struct *work)
 {
-	struct postprocess_bh_ctx *ctx =
-		container_of(work, struct postprocess_bh_ctx, work);
+	struct verify_bh_ctx *ctx =
+		container_of(work, struct verify_bh_ctx, work);
 	struct buffer_head *bh = ctx->bh;
 	bool valid;
 
@@ -318,70 +354,50 @@ static void verify_bh(struct work_struct *work)
 	kfree(ctx);
 }
 
-static void decrypt_bh(struct work_struct *work)
-{
-	struct postprocess_bh_ctx *ctx =
-		container_of(work, struct postprocess_bh_ctx, work);
-	struct buffer_head *bh = ctx->bh;
-	int err;
-
-	err = fscrypt_decrypt_pagecache_blocks(bh->b_folio, bh->b_size,
-					       bh_offset(bh));
-	if (err == 0 && ctx->vi) {
-		/*
-		 * We use different work queues for decryption and for verity
-		 * because verity may require reading metadata pages that need
-		 * decryption, and we shouldn't recurse to the same workqueue.
-		 */
-		INIT_WORK(&ctx->work, verify_bh);
-		fsverity_enqueue_verify_work(&ctx->work);
-		return;
-	}
-	end_buffer_async_read(bh, err == 0);
-	kfree(ctx);
-}
-
 /*
- * I/O completion handler for block_read_full_folio() - pages
+ * I/O completion handler for block_read_full_folio() - folios
  * which come unlocked at the end of I/O.
  */
-static void end_buffer_async_read_io(struct buffer_head *bh, int uptodate)
+static void bh_end_async_read(struct bio *bio)
 {
+	struct buffer_head *bh;
+	bool uptodate = bio_endio_bh(bio, &bh);
 	struct inode *inode = bh->b_folio->mapping->host;
-	bool decrypt = fscrypt_inode_uses_fs_layer_crypto(inode);
 	struct fsverity_info *vi = NULL;
 
 	/* needed by ext4 */
 	if (bh->b_folio->index < DIV_ROUND_UP(inode->i_size, PAGE_SIZE))
 		vi = fsverity_get_info(inode);
 
-	/* Decrypt (with fscrypt) and/or verify (with fsverity) if needed. */
-	if (uptodate && (decrypt || vi)) {
-		struct postprocess_bh_ctx *ctx = kmalloc_obj(*ctx, GFP_ATOMIC);
+	/* Verify (with fsverity) if needed. */
+	if (vi && uptodate) {
+		struct verify_bh_ctx *ctx = kmalloc_obj(*ctx, GFP_ATOMIC);
 
 		if (ctx) {
 			ctx->bh = bh;
 			ctx->vi = vi;
-			if (decrypt) {
-				INIT_WORK(&ctx->work, decrypt_bh);
-				fscrypt_enqueue_decrypt_work(&ctx->work);
-			} else {
-				INIT_WORK(&ctx->work, verify_bh);
-				fsverity_enqueue_verify_work(&ctx->work);
-			}
+			INIT_WORK(&ctx->work, verify_bh);
+			fsverity_enqueue_verify_work(&ctx->work);
 			return;
 		}
-		uptodate = 0;
+		uptodate = false;
 	}
 	end_buffer_async_read(bh, uptodate);
 }
 
-/*
- * Completion handler for block_write_full_folio() - folios which are unlocked
- * during I/O, and which have the writeback flag cleared upon I/O completion.
+/**
+ * bh_end_async_write - I/O end handler for async folio writes
+ * @bio: The bio being completed.
+ *
+ * Pass this function to bh_submit() if you're doing the equivalent of
+ * block_write_full_folio().  That is, the folio is unlocked, and will
+ * have its writeback flag cleared once all async write buffers have
+ * completed.
  */
-static void end_buffer_async_write(struct buffer_head *bh, int uptodate)
+void bh_end_async_write(struct bio *bio)
 {
+	struct buffer_head *bh;
+	bool success = bio_endio_bh(bio, &bh);
 	unsigned long flags;
 	struct buffer_head *first;
 	struct buffer_head *tmp;
@@ -390,12 +406,11 @@ static void end_buffer_async_write(struct buffer_head *bh, int uptodate)
 	BUG_ON(!buffer_async_write(bh));
 
 	folio = bh->b_folio;
-	if (uptodate) {
-		set_buffer_uptodate(bh);
+	if (success) {
+		clear_buffer_write_io_error(bh);
 	} else {
 		buffer_io_error(bh, ", lost async page write");
 		mark_buffer_write_io_error(bh);
-		clear_buffer_uptodate(bh);
 	}
 
 	first = folio_buffers(folio);
@@ -418,46 +433,7 @@ static void end_buffer_async_write(struct buffer_head *bh, int uptodate)
 still_busy:
 	spin_unlock_irqrestore(&first->b_uptodate_lock, flags);
 }
-
-/*
- * If a page's buffers are under async readin (end_buffer_async_read
- * completion) then there is a possibility that another thread of
- * control could lock one of the buffers after it has completed
- * but while some of the other buffers have not completed.  This
- * locked buffer would confuse end_buffer_async_read() into not unlocking
- * the page.  So the absence of BH_Async_Read tells end_buffer_async_read()
- * that this buffer is not under async I/O.
- *
- * The page comes unlocked when it has no locked buffer_async buffers
- * left.
- *
- * PageLocked prevents anyone starting new async I/O reads any of
- * the buffers.
- *
- * PageWriteback is used to prevent simultaneous writeout of the same
- * page.
- *
- * PageLocked prevents anyone from starting writeback of a page which is
- * under read I/O (PageWriteback is only ever set against a locked page).
- */
-static void mark_buffer_async_read(struct buffer_head *bh)
-{
-	bh->b_end_io = end_buffer_async_read_io;
-	set_buffer_async_read(bh);
-}
-
-static void mark_buffer_async_write_endio(struct buffer_head *bh,
-					  bh_end_io_t *handler)
-{
-	bh->b_end_io = handler;
-	set_buffer_async_write(bh);
-}
-
-void mark_buffer_async_write(struct buffer_head *bh)
-{
-	mark_buffer_async_write_endio(bh, end_buffer_async_write);
-}
-EXPORT_SYMBOL(mark_buffer_async_write);
+EXPORT_SYMBOL(bh_end_async_write);
 
 
 /*
@@ -542,8 +518,8 @@ EXPORT_SYMBOL_GPL(mmb_has_buffers);
  *
  * Do this in two main stages: first we copy dirty buffers to a
  * temporary inode list, queueing the writes as we go. Then we clean
- * up, waiting for those writes to complete. mark_buffer_dirty_inode()
- * doesn't touch b_assoc_buffers list if b_mmb is not NULL so we are sure the
+ * up, waiting for those writes to complete. mmb_mark_buffer_dirty()
+ * doesn't touch b_assoc_buffers list if b_mmb is set so we are sure the
  * buffer stays on our list until IO completes (at which point it can be
  * reaped).
  */
@@ -564,7 +540,7 @@ int mmb_sync(struct mapping_metadata_bhs *mmb)
 		bh = BH_ENTRY(mmb->list.next);
 		WARN_ON_ONCE(bh->b_mmb != mmb);
 		__remove_assoc_queue(mmb, bh);
-		/* Avoid race with mark_buffer_dirty_inode() which does
+		/* Avoid race with mmb_mark_buffer_dirty() which does
 		 * a lockless check and we rely on seeing the dirty bit */
 		smp_mb();
 		if (buffer_dirty(bh) || buffer_locked(bh)) {
@@ -602,7 +578,7 @@ int mmb_sync(struct mapping_metadata_bhs *mmb)
 		bh = BH_ENTRY(tmp.prev);
 		get_bh(bh);
 		__remove_assoc_queue(mmb, bh);
-		/* Avoid race with mark_buffer_dirty_inode() which does
+		/* Avoid race with mmb_mark_buffer_dirty() which does
 		 * a lockless check and we rely on seeing the dirty bit */
 		smp_mb();
 		if (buffer_dirty(bh)) {
@@ -611,7 +587,7 @@ int mmb_sync(struct mapping_metadata_bhs *mmb)
 		}
 		spin_unlock(&mmb->lock);
 		wait_on_buffer(bh);
-		if (!buffer_uptodate(bh))
+		if (buffer_write_io_error(bh))
 			err = -EIO;
 		brelse(bh);
 		spin_lock(&mmb->lock);
@@ -620,79 +596,6 @@ int mmb_sync(struct mapping_metadata_bhs *mmb)
 	return err;
 }
 EXPORT_SYMBOL(mmb_sync);
-
-/**
- * mmb_fsync_noflush - fsync implementation for simple filesystems with
- * 		       metadata buffers list
- *
- * @file:	file to synchronize
- * @mmb:	list of metadata bhs to flush
- * @start:	start offset in bytes
- * @end:	end offset in bytes (inclusive)
- * @datasync:	only synchronize essential metadata if true
- *
- * This is an implementation of the fsync method for simple filesystems which
- * track all non-inode metadata in the buffers list hanging off the @mmb
- * structure.
- */
-int mmb_fsync_noflush(struct file *file, struct mapping_metadata_bhs *mmb,
-		      loff_t start, loff_t end, bool datasync)
-{
-	struct inode *inode = file->f_mapping->host;
-	int err;
-	int ret = 0;
-
-	err = file_write_and_wait_range(file, start, end);
-	if (err)
-		return err;
-
-	if (mmb)
-		ret = mmb_sync(mmb);
-	if (!(inode_state_read_once(inode) & I_DIRTY_ALL))
-		goto out;
-	if (datasync && !(inode_state_read_once(inode) & I_DIRTY_DATASYNC))
-		goto out;
-
-	err = sync_inode_metadata(inode, 1);
-	if (ret == 0)
-		ret = err;
-
-out:
-	/* check and advance again to catch errors after syncing out buffers */
-	err = file_check_and_advance_wb_err(file);
-	if (ret == 0)
-		ret = err;
-	return ret;
-}
-EXPORT_SYMBOL(mmb_fsync_noflush);
-
-/**
- * mmb_fsync - fsync implementation for simple filesystems with metadata
- * 	       buffers list
- *
- * @file:	file to synchronize
- * @mmb:	list of metadata bhs to flush
- * @start:	start offset in bytes
- * @end:	end offset in bytes (inclusive)
- * @datasync:	only synchronize essential metadata if true
- *
- * This is an implementation of the fsync method for simple filesystems which
- * track all non-inode metadata in the buffers list hanging off the @mmb
- * structure. This also makes sure that a device cache flush operation is
- * called at the end.
- */
-int mmb_fsync(struct file *file, struct mapping_metadata_bhs *mmb,
-	      loff_t start, loff_t end, bool datasync)
-{
-	struct inode *inode = file->f_mapping->host;
-	int ret;
-
-	ret = mmb_fsync_noflush(file, mmb, start, end, datasync);
-	if (!ret)
-		ret = blkdev_issue_flush(inode->i_sb->s_bdev);
-	return ret;
-}
-EXPORT_SYMBOL(mmb_fsync);
 
 /*
  * Called when we've recently written block `bblock', and it is known that
@@ -713,6 +616,14 @@ void write_boundary_block(struct block_device *bdev,
 	}
 }
 
+/**
+ * mmb_mark_buffer_dirty - Mark a metadata buffer dirty.
+ * @bh: The buffer to mark dirty.
+ * @mmb: The list of buffers to add the buffer to.
+ *
+ * Mark the buffer dirty and add it to the list if it is not already on
+ * a list.
+ */
 void mmb_mark_buffer_dirty(struct buffer_head *bh,
 			   struct mapping_metadata_bhs *mmb)
 {
@@ -781,7 +692,7 @@ bool block_dirty_folio(struct address_space *mapping, struct folio *folio)
 		} while (bh != head);
 	}
 	/*
-	 * Lock out page's memcg migration to keep PageDirty
+	 * Lock out folio's memcg migration to keep folio dirty flag
 	 * synchronized with per-memcg dirty page counters.
 	 */
 	newly_dirty = !folio_test_set_dirty(folio);
@@ -868,14 +779,6 @@ no_grow:
 }
 EXPORT_SYMBOL_GPL(folio_alloc_buffers);
 
-struct buffer_head *alloc_page_buffers(struct page *page, unsigned long size)
-{
-	gfp_t gfp = GFP_NOFS | __GFP_ACCOUNT;
-
-	return folio_alloc_buffers(page_folio(page), size, gfp);
-}
-EXPORT_SYMBOL_GPL(alloc_page_buffers);
-
 static inline void link_dev_buffers(struct folio *folio,
 		struct buffer_head *head)
 {
@@ -916,7 +819,6 @@ static sector_t folio_init_buffers(struct folio *folio,
 
 	do {
 		if (!buffer_mapped(bh)) {
-			bh->b_end_io = NULL;
 			bh->b_private = NULL;
 			bh->b_bdev = bdev;
 			bh->b_blocknr = block;
@@ -1048,23 +950,23 @@ __getblk_slow(struct block_device *bdev, sector_t block,
 }
 
 /*
- * The relationship between dirty buffers and dirty pages:
+ * The relationship between dirty buffers and dirty folios:
  *
- * Whenever a page has any dirty buffers, the page's dirty bit is set, and
- * the page is tagged dirty in the page cache.
+ * Whenever a folio has any dirty buffers, the folio's dirty flag is set, and
+ * the folio is tagged dirty in the page cache.
  *
  * At all times, the dirtiness of the buffers represents the dirtiness of
- * subsections of the page.  If the page has buffers, the page dirty bit is
+ * subsections of the folio.  If the folio has buffers, the folio dirty flag is
  * merely a hint about the true dirty state.
  *
- * When a page is set dirty in its entirety, all its buffers are marked dirty
- * (if the page has buffers).
+ * When a folio is set dirty in its entirety, all its buffers are marked dirty
+ * (if the folio has buffers).
  *
- * When a buffer is marked dirty, its page is dirtied, but the page's other
+ * When a buffer is marked dirty, its folio is dirtied, but the folio's other
  * buffers are not.
  *
  * Also.  When blockdev buffers are explicitly read with bread(), they
- * individually become uptodate.  But their backing page remains not
+ * individually become uptodate.  But their backing folio remains not
  * uptodate - even if all of its buffers are uptodate.  A subsequent
  * block_read_full_folio() against that folio will discover all the uptodate
  * buffers, will set the folio uptodate and will perform no I/O.
@@ -1075,7 +977,7 @@ __getblk_slow(struct block_device *bdev, sector_t block,
  * @bh: the buffer_head to mark dirty
  *
  * mark_buffer_dirty() will set the dirty bit against the buffer, then set
- * its backing page dirty, then tag the page as dirty in the page cache
+ * its backing folio dirty, then tag the folio as dirty in the page cache
  * and then attach the address_space's inode to its superblock's dirty
  * inode list.
  *
@@ -1117,12 +1019,18 @@ EXPORT_SYMBOL(mark_buffer_dirty);
 
 void mark_buffer_write_io_error(struct buffer_head *bh)
 {
+	struct mapping_metadata_bhs *mmb;
+
 	set_buffer_write_io_error(bh);
 	/* FIXME: do we need to set this in both places? */
 	if (bh->b_folio && bh->b_folio->mapping)
 		mapping_set_error(bh->b_folio->mapping, -EIO);
-	if (bh->b_mmb)
-		mapping_set_error(bh->b_mmb->mapping, -EIO);
+	/* Protect us from mmb & inode getting freed while we work on it */
+	rcu_read_lock();
+	mmb = READ_ONCE(bh->b_mmb);
+	if (mmb)
+		mapping_set_error(mmb->mapping, -EIO);
+	rcu_read_unlock();
 }
 EXPORT_SYMBOL(mark_buffer_write_io_error);
 
@@ -1152,10 +1060,96 @@ EXPORT_SYMBOL(__brelse);
 void __bforget(struct buffer_head *bh)
 {
 	clear_buffer_dirty(bh);
+	clear_buffer_write_io_error(bh);
 	remove_assoc_queue(bh);
 	__brelse(bh);
 }
 EXPORT_SYMBOL(__bforget);
+
+static void buffer_set_crypto_ctx(struct bio *bio, const struct buffer_head *bh,
+				  gfp_t gfp_mask)
+{
+	const struct address_space *mapping;
+
+	/*
+	 * The ext4 journal (jbd2) can submit a buffer_head it directly created
+	 * for memory that is not in the page cache at all.  fscrypt doesn't
+	 * care about these.
+	 */
+	if (!bh->b_folio)
+		return;
+	mapping = bh->b_folio->mapping;
+	if (!mapping)
+		return;
+	fscrypt_set_bio_crypt_ctx(bio, mapping->host,
+			folio_pos(bh->b_folio) + bh_offset(bh), gfp_mask);
+}
+
+static void __bh_submit(struct buffer_head *bh, blk_opf_t opf,
+		enum rw_hint write_hint, struct writeback_control *wbc,
+		bio_end_io_t end_bio)
+{
+	struct bio *bio;
+
+	BUG_ON(!buffer_locked(bh));
+	BUG_ON(!buffer_mapped(bh));
+	BUG_ON(buffer_delay(bh));
+	BUG_ON(buffer_unwritten(bh));
+
+	set_buffer_req(bh);
+
+	if (buffer_meta(bh))
+		opf |= REQ_META;
+	if (buffer_prio(bh))
+		opf |= REQ_PRIO;
+
+	bio = bio_alloc(bh->b_bdev, 1, opf, GFP_NOIO);
+
+	if (bh->b_folio && folio_test_dropbehind(bh->b_folio) &&
+	    op_is_write(opf))
+		bio_set_flag(bio, BIO_COMPLETE_IN_TASK);
+
+	if (IS_ENABLED(CONFIG_FS_ENCRYPTION))
+		buffer_set_crypto_ctx(bio, bh, GFP_NOIO);
+
+	bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+	bio->bi_write_hint = write_hint;
+
+	if (bh->b_folio)
+		bio_add_folio_nofail(bio, bh->b_folio, bh->b_size,
+				     bh_offset(bh));
+	else
+		bio_add_virt_nofail(bio, bh->b_data, bh->b_size);
+
+	bio->bi_end_io = end_bio;
+	bio->bi_private = bh;
+
+	/* Take care of bh's that straddle the end of the device */
+	guard_bio_eod(bio);
+
+	if (wbc) {
+		wbc_init_bio(wbc, bio);
+		if (bh->b_folio)
+			wbc_account_cgroup_owner(wbc, bh->b_folio, bh->b_size);
+	}
+
+	blk_crypto_submit_bio(bio);
+}
+
+/**
+ * bh_submit - Start I/O against a buffer head
+ * @bh: The buffer head to perform I/O on.
+ * @opf: Operation and flags for bio.
+ * @end_io: The routine to call when I/O has completed.
+ *
+ * If you need to do I/O on an individual bh (instead of allowing the
+ * page cache to do I/O on the folio that it is in), call this function.
+ */
+void bh_submit(struct buffer_head *bh, blk_opf_t opf, bio_end_io_t end_io)
+{
+	__bh_submit(bh, opf, WRITE_LIFE_NOT_SET, NULL, end_io);
+}
+EXPORT_SYMBOL(bh_submit);
 
 static struct buffer_head *__bread_slow(struct buffer_head *bh)
 {
@@ -1164,9 +1158,7 @@ static struct buffer_head *__bread_slow(struct buffer_head *bh)
 		unlock_buffer(bh);
 		return bh;
 	} else {
-		get_bh(bh);
-		bh->b_end_io = end_buffer_read_sync;
-		submit_bh(REQ_OP_READ, bh);
+		bh_submit(bh, REQ_OP_READ, bh_end_read);
 		wait_on_buffer(bh);
 		if (buffer_uptodate(bh))
 			return bh;
@@ -1228,7 +1220,7 @@ static void bh_lru_install(struct buffer_head *bh)
 
 	/*
 	 * the refcount of buffer_head in bh_lru prevents dropping the
-	 * attached page(i.e., try_to_free_buffers) so it could cause
+	 * attached folio (i.e., try_to_free_buffers) so it could cause
 	 * failing page migration.
 	 * Skip putting upcoming bh into bh_lru until migration is done.
 	 */
@@ -1292,7 +1284,7 @@ lookup_bh_lru(struct block_device *bdev, sector_t block, unsigned size)
  * Perform a pagecache lookup for the matching buffer.  If it's there, refresh
  * it in the LRU and mark it as accessed.  If it is not present then return
  * NULL. Atomic context callers may also return NULL if the buffer is being
- * migrated; similarly the page is not marked accessed either.
+ * migrated; similarly the folio is not marked accessed either.
  */
 static struct buffer_head *
 find_get_block_common(struct block_device *bdev, sector_t block,
@@ -1301,7 +1293,7 @@ find_get_block_common(struct block_device *bdev, sector_t block,
 	struct buffer_head *bh = lookup_bh_lru(bdev, block, size);
 
 	if (bh == NULL) {
-		/* __find_get_block_slow will mark the page accessed */
+		/* __find_get_block_slow will mark the folio accessed */
 		bh = __find_get_block_slow(bdev, block, atomic);
 		if (bh)
 			bh_lru_install(bh);
@@ -1487,15 +1479,14 @@ void folio_set_bh(struct buffer_head *bh, struct folio *folio,
 }
 EXPORT_SYMBOL(folio_set_bh);
 
-/*
- * Called when truncating a buffer on a page completely.
- */
-
 /* Bits that are cleared during an invalidate */
 #define BUFFER_FLAGS_DISCARD \
 	(1 << BH_Mapped | 1 << BH_New | 1 << BH_Req | \
-	 1 << BH_Delay | 1 << BH_Unwritten)
+	 1 << BH_Delay | 1 << BH_Unwritten | 1 << BH_Write_EIO)
 
+/*
+ * Called when truncating a buffer on a folio completely.
+ */
 static void discard_buffer(struct buffer_head * bh)
 {
 	unsigned long b_state;
@@ -1623,9 +1614,7 @@ EXPORT_SYMBOL(create_empty_buffers);
  * moment when something will explicitly mark the buffer dirty (hopefully that
  * will not happen until we will free that block ;-) We don't even need to mark
  * it not-uptodate - nobody can expect anything from a newly allocated buffer
- * anyway. We used to use unmap_buffer() for such invalidation, but that was
- * wrong. We definitely don't want to mark the alias unmapped, for example - it
- * would confuse anyone who might pick it with bread() afterwards...
+ * anyway.
  *
  * Also..  Note that bforget() doesn't lock the buffer.  So there can be
  * writeout I/O going on against recently-freed buffers.  We don't wait on that
@@ -1661,7 +1650,7 @@ void clean_bdev_aliases(struct block_device *bdev, sector_t block, sector_t len)
 			/* Recheck when the folio is locked which pins bhs */
 			head = folio_buffers(folio);
 			if (!head)
-				goto unlock_page;
+				goto unlock_folio;
 			bh = head;
 			do {
 				if (!buffer_mapped(bh) || (bh->b_blocknr < block))
@@ -1674,7 +1663,7 @@ void clean_bdev_aliases(struct block_device *bdev, sector_t block, sector_t len)
 next:
 				bh = bh->b_this_page;
 			} while (bh != head);
-unlock_page:
+unlock_folio:
 			folio_unlock(folio);
 		}
 		folio_batch_release(&fbatch);
@@ -1716,15 +1705,15 @@ static struct buffer_head *folio_create_buffers(struct folio *folio,
 
 /*
  * While block_write_full_folio is writing back the dirty buffers under
- * the page lock, whoever dirtied the buffers may decide to clean them
+ * the folio lock, whoever dirtied the buffers may decide to clean them
  * again at any time.  We handle that by only looking at the buffer
  * state inside lock_buffer().
  *
  * If block_write_full_folio() is called for regular writeback
- * (wbc->sync_mode == WB_SYNC_NONE) then it will redirty a page which has a
- * locked buffer.   This only can happen if someone has written the buffer
- * directly, with submit_bh().  At the address_space level PageWriteback
- * prevents this contention from occurring.
+ * (wbc->sync_mode == WB_SYNC_NONE) then it will redirty a folio which
+ * has a locked buffer.   This can only happen if someone has written
+ * the buffer directly, with bh_submit().  At the address_space level
+ * the folio writeback flag prevents this contention from occurring.
  *
  * If block_write_full_folio() is called with wbc->sync_mode ==
  * WB_SYNC_ALL, the writes are posted using REQ_SYNC; this
@@ -1810,8 +1799,7 @@ int __block_write_full_folio(struct inode *inode, struct folio *folio,
 			continue;
 		}
 		if (test_clear_buffer_dirty(bh)) {
-			mark_buffer_async_write_endio(bh,
-				end_buffer_async_write);
+			set_buffer_async_write(bh);
 		} else {
 			unlock_buffer(bh);
 		}
@@ -1827,8 +1815,9 @@ int __block_write_full_folio(struct inode *inode, struct folio *folio,
 	do {
 		struct buffer_head *next = bh->b_this_page;
 		if (buffer_async_write(bh)) {
-			submit_bh_wbc(REQ_OP_WRITE | write_flags, bh,
-				      inode->i_write_hint, wbc);
+			__bh_submit(bh, REQ_OP_WRITE | write_flags,
+					inode->i_write_hint, wbc,
+					bh_end_async_write);
 			nr_underway++;
 		}
 		bh = next;
@@ -1841,7 +1830,7 @@ done:
 		/*
 		 * The folio was marked dirty, but the buffers were
 		 * clean.  Someone wrote them back by hand with
-		 * write_dirty_buffer/submit_bh.  A rare case.
+		 * write_dirty_buffer/bh_submit.  A rare case.
 		 */
 		folio_end_writeback(folio);
 
@@ -1865,8 +1854,7 @@ recover:
 		if (buffer_mapped(bh) && buffer_dirty(bh) &&
 		    !buffer_delay(bh)) {
 			lock_buffer(bh);
-			mark_buffer_async_write_endio(bh,
-				end_buffer_async_write);
+			set_buffer_async_write(bh);
 		} else {
 			/*
 			 * The buffer may have been set dirty during
@@ -1882,8 +1870,9 @@ recover:
 		struct buffer_head *next = bh->b_this_page;
 		if (buffer_async_write(bh)) {
 			clear_buffer_dirty(bh);
-			submit_bh_wbc(REQ_OP_WRITE | write_flags, bh,
-				      inode->i_write_hint, wbc);
+			__bh_submit(bh, REQ_OP_WRITE | write_flags,
+					inode->i_write_hint, wbc,
+					bh_end_async_write);
 			nr_underway++;
 		}
 		bh = next;
@@ -2096,6 +2085,7 @@ void block_commit_write(struct folio *folio, size_t from, size_t to)
 {
 	size_t block_start, block_end;
 	bool partial = false;
+	bool uptodate = folio_test_uptodate(folio);
 	unsigned blocksize;
 	struct buffer_head *bh, *head;
 
@@ -2118,6 +2108,8 @@ void block_commit_write(struct folio *folio, size_t from, size_t to)
 			clear_buffer_new(bh);
 
 		block_start = block_end;
+		if (uptodate && block_start >= to)
+			break;
 		bh = bh->b_this_page;
 	} while (bh != head);
 
@@ -2222,9 +2214,9 @@ int generic_write_end(const struct kiocb *iocb, struct address_space *mapping,
 	if (old_size < pos)
 		pagecache_isize_extended(inode, old_size, pos);
 	/*
-	 * Don't mark the inode dirty under page lock. First, it unnecessarily
-	 * makes the holding time of page lock longer. Second, it forces lock
-	 * ordering of page lock and transaction start for journaling
+	 * Don't mark the inode dirty under folio lock. First, it unnecessarily
+	 * makes the holding time of folio lock longer. Second, it forces lock
+	 * ordering of folio lock and transaction start for journaling
 	 * filesystems.
 	 */
 	if (i_size_changed)
@@ -2339,9 +2331,33 @@ int block_read_full_folio(struct folio *folio, get_block_t *get_block)
 			continue;
 		}
 
-		mark_buffer_async_read(bh);
+		/*
+		 * If a folio's buffers are under async readin
+		 * (end_buffer_async_read completion) then there is a
+		 * possibility that another thread of control could lock
+		 * one of the buffers after it has completed but while
+		 * some of the other buffers have not completed.  This
+		 * locked buffer would confuse end_buffer_async_read()
+		 * into not unlocking the folio.  So the absence of
+		 * BH_Async_Read tells end_buffer_async_read() that this
+		 * buffer is not under async I/O.
+		 *
+		 * The folio is unlocked when it has no locked
+		 * buffer_async buffers left.
+		 *
+		 * The folio lock prevents anyone starting new async
+		 * I/O reads into any of the buffers.
+		 *
+		 * The writeback flag is used to prevent simultaneous
+		 * writeout of the same folio.
+		 *
+		 * The folio lock prevents anyone from starting writeback
+		 * of a folio which is under read I/O (the writeback
+		 * flag is only ever set on a locked folio).
+		 */
+		set_buffer_async_read(bh);
 		if (prev)
-			submit_bh(REQ_OP_READ, prev);
+			bh_submit(prev, REQ_OP_READ, bh_end_async_read);
 		prev = bh;
 	} while (iblock++, (bh = bh->b_this_page) != head);
 
@@ -2355,7 +2371,7 @@ int block_read_full_folio(struct folio *folio, get_block_t *get_block)
 	 * in this folio.
 	 */
 	if (prev)
-		submit_bh(REQ_OP_READ, prev);
+		bh_submit(prev, REQ_OP_READ, bh_end_async_read);
 	else
 		folio_end_read(folio, !page_error);
 
@@ -2436,7 +2452,7 @@ static int cont_expand_zero(const struct kiocb *iocb,
 		}
 	}
 
-	/* page covers the boundary, find the boundary offset */
+	/* folio crosses the boundary, find the boundary offset */
 	if (index == curidx) {
 		zerofrom = curpos & ~PAGE_MASK;
 		/* if we will expand the thing last block will be filled */
@@ -2494,18 +2510,18 @@ EXPORT_SYMBOL(cont_write_begin);
 
 /*
  * block_page_mkwrite() is not allowed to change the file size as it gets
- * called from a page fault handler when a page is first dirtied. Hence we must
- * be careful to check for EOF conditions here. We set the page up correctly
- * for a written page which means we get ENOSPC checking when writing into
+ * called from a page fault handler when a folio is first dirtied. Hence we must
+ * be careful to check for EOF conditions here. We set the folio up correctly
+ * for a written folio which means we get ENOSPC checking when writing into
  * holes and correct delalloc and unwritten extent mapping on filesystems that
  * support these features.
  *
  * We are not allowed to take the i_rwsem here so we have to play games to
- * protect against truncate races as the page could now be beyond EOF.  Because
- * truncate writes the inode size before removing pages, once we have the
- * page lock we can determine safely if the page is beyond EOF. If it is not
- * beyond EOF, then the page is guaranteed safe against truncation until we
- * unlock the page.
+ * protect against truncate races as the folio could now be beyond EOF.  Because
+ * truncate writes the inode size before removing folios, once we have the
+ * folio lock we can determine safely if the folio is beyond EOF. If it is not
+ * beyond EOF, then the folio is guaranteed safe against truncation until we
+ * unlock the folio.
  *
  * Direct callers of this function should protect against filesystem freezing
  * using sb_start_pagefault() - sb_end_pagefault() functions.
@@ -2523,7 +2539,7 @@ int block_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
 	size = i_size_read(inode);
 	if ((folio->mapping != inode->i_mapping) ||
 	    (folio_pos(folio) >= size)) {
-		/* We overload EFAULT to mean page got truncated */
+		/* We overload EFAULT to mean folio got truncated */
 		ret = -EFAULT;
 		goto out_unlock;
 	}
@@ -2663,86 +2679,6 @@ sector_t generic_block_bmap(struct address_space *mapping, sector_t block,
 }
 EXPORT_SYMBOL(generic_block_bmap);
 
-static void end_bio_bh_io_sync(struct bio *bio)
-{
-	struct buffer_head *bh = bio->bi_private;
-
-	if (unlikely(bio_flagged(bio, BIO_QUIET)))
-		set_bit(BH_Quiet, &bh->b_state);
-
-	bh->b_end_io(bh, !bio->bi_status);
-	bio_put(bio);
-}
-
-static void buffer_set_crypto_ctx(struct bio *bio, const struct buffer_head *bh,
-				  gfp_t gfp_mask)
-{
-	const struct address_space *mapping = folio_mapping(bh->b_folio);
-
-	/*
-	 * The ext4 journal (jbd2) can submit a buffer_head it directly created
-	 * for a non-pagecache page.  fscrypt doesn't care about these.
-	 */
-	if (!mapping)
-		return;
-	fscrypt_set_bio_crypt_ctx(bio, mapping->host,
-			folio_pos(bh->b_folio) + bh_offset(bh), gfp_mask);
-}
-
-static void submit_bh_wbc(blk_opf_t opf, struct buffer_head *bh,
-			  enum rw_hint write_hint,
-			  struct writeback_control *wbc)
-{
-	const enum req_op op = opf & REQ_OP_MASK;
-	struct bio *bio;
-
-	BUG_ON(!buffer_locked(bh));
-	BUG_ON(!buffer_mapped(bh));
-	BUG_ON(!bh->b_end_io);
-	BUG_ON(buffer_delay(bh));
-	BUG_ON(buffer_unwritten(bh));
-
-	/*
-	 * Only clear out a write error when rewriting
-	 */
-	if (test_set_buffer_req(bh) && (op == REQ_OP_WRITE))
-		clear_buffer_write_io_error(bh);
-
-	if (buffer_meta(bh))
-		opf |= REQ_META;
-	if (buffer_prio(bh))
-		opf |= REQ_PRIO;
-
-	bio = bio_alloc(bh->b_bdev, 1, opf, GFP_NOIO);
-
-	if (IS_ENABLED(CONFIG_FS_ENCRYPTION))
-		buffer_set_crypto_ctx(bio, bh, GFP_NOIO);
-
-	bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
-	bio->bi_write_hint = write_hint;
-
-	bio_add_folio_nofail(bio, bh->b_folio, bh->b_size, bh_offset(bh));
-
-	bio->bi_end_io = end_bio_bh_io_sync;
-	bio->bi_private = bh;
-
-	/* Take care of bh's that straddle the end of the device */
-	guard_bio_eod(bio);
-
-	if (wbc) {
-		wbc_init_bio(wbc, bio);
-		wbc_account_cgroup_owner(wbc, bh->b_folio, bh->b_size);
-	}
-
-	blk_crypto_submit_bio(bio);
-}
-
-void submit_bh(blk_opf_t opf, struct buffer_head *bh)
-{
-	submit_bh_wbc(opf, bh, WRITE_LIFE_NOT_SET, NULL);
-}
-EXPORT_SYMBOL(submit_bh);
-
 void write_dirty_buffer(struct buffer_head *bh, blk_opf_t op_flags)
 {
 	lock_buffer(bh);
@@ -2750,9 +2686,7 @@ void write_dirty_buffer(struct buffer_head *bh, blk_opf_t op_flags)
 		unlock_buffer(bh);
 		return;
 	}
-	bh->b_end_io = end_buffer_write_sync;
-	get_bh(bh);
-	submit_bh(REQ_OP_WRITE | op_flags, bh);
+	bh_submit(bh, REQ_OP_WRITE | op_flags, bh_end_write);
 }
 EXPORT_SYMBOL(write_dirty_buffer);
 
@@ -2775,11 +2709,9 @@ int __sync_dirty_buffer(struct buffer_head *bh, blk_opf_t op_flags)
 			return -EIO;
 		}
 
-		get_bh(bh);
-		bh->b_end_io = end_buffer_write_sync;
-		submit_bh(REQ_OP_WRITE | op_flags, bh);
+		bh_submit(bh, REQ_OP_WRITE | op_flags, bh_end_write);
 		wait_on_buffer(bh);
-		if (!buffer_uptodate(bh))
+		if (buffer_write_io_error(bh))
 			return -EIO;
 	} else {
 		unlock_buffer(bh);
@@ -3009,9 +2941,7 @@ int __bh_read(struct buffer_head *bh, blk_opf_t op_flags, bool wait)
 
 	BUG_ON(!buffer_locked(bh));
 
-	get_bh(bh);
-	bh->b_end_io = end_buffer_read_sync;
-	submit_bh(REQ_OP_READ | op_flags, bh);
+	bh_submit(bh, REQ_OP_READ | op_flags, bh_end_read);
 	if (wait) {
 		wait_on_buffer(bh);
 		if (!buffer_uptodate(bh))
@@ -3053,9 +2983,7 @@ void __bh_read_batch(int nr, struct buffer_head *bhs[],
 			continue;
 		}
 
-		bh->b_end_io = end_buffer_read_sync;
-		get_bh(bh);
-		submit_bh(REQ_OP_READ | op_flags, bh);
+		bh_submit(bh, REQ_OP_READ | op_flags, bh_end_read);
 	}
 }
 EXPORT_SYMBOL(__bh_read_batch);

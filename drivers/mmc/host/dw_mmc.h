@@ -19,6 +19,8 @@
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
 
+extern const struct dev_pm_ops dw_mci_pmops;
+
 enum dw_mci_state {
 	STATE_IDLE = 0,
 	STATE_SENDING_CMD,
@@ -67,7 +69,7 @@ struct dw_mci_dma_slave {
  * @cmd: The command currently being sent to the card, or NULL.
  * @data: The data currently being transferred, or NULL if no data
  *	transfer is in progress.
- * @stop_abort: The command currently prepared for stoping transfer.
+ * @stop_abort: The command currently prepared for stopping transfer.
  * @prev_blksz: The former transfer blksz record.
  * @timing: Record of current ios timing.
  * @use_dma: Which DMA channel is in use for the current transfer, zero
@@ -78,8 +80,8 @@ struct dw_mci_dma_slave {
  * @sg_cpu: Virtual address of DMA buffer.
  * @dma_ops: Pointer to DMA callbacks.
  * @cmd_status: Snapshot of SR taken upon completion of the current
- * @ring_size: Buffer size for idma descriptors.
  *	command. Only valid when EVENT_CMD_COMPLETE is pending.
+ * @desc_num: Number of idmac descriptors available.
  * @dms: structure of slave-dma private data.
  * @phy_regs: physical address of controller's register map
  * @data_status: Snapshot of SR taken upon completion of the current
@@ -107,6 +109,7 @@ struct dw_mci_dma_slave {
  * @ciu_clk: Pointer to card interface unit clock instance.
  * @fifo_depth: depth of FIFO.
  * @data_addr_override: override fifo reg offset with this value.
+ * @dma_threshold: data threshold value in bytes to carry out a DMA transfer.
  * @wm_aligned: force fifo watermark equal with data length in PIO mode.
  *	Set as true if alignment is needed.
  * @data_shift: log2 of FIFO item size.
@@ -119,9 +122,11 @@ struct dw_mci_dma_slave {
  * @irq_flags: The flags to be passed to request_irq.
  * @irq: The irq value to be passed to request_irq.
  * @sdio_irq: SDIO interrupt bit in interrupt registers.
- * @cmd11_timer: Timer for SD3.0 voltage switch over scheme.
- * @cto_timer: Timer for broken command transfer over scheme.
- * @dto_timer: Timer for broken data transfer over scheme.
+ * @wd_timer: Central watchdog guarding request legs against hardware going
+ *	silent; fires when an expected completion event fails to arrive in
+ *	time so that the state machine can synthesize an error.
+ * @wd_events: pending_events bits still awaited by the armed watch.
+ * @wd_states: host->state values for which the armed watch is valid.
  * @mmc: The mmc_host representing this dw_mci.
  * @flags: Random state bits associated with the host.
  * @ctype: Card type for this host.
@@ -163,6 +168,7 @@ struct dw_mci {
 	void __iomem		*regs;
 	void __iomem		*fifo_reg;
 	u32			data_addr_override;
+	u32			dma_threshold;
 	bool			wm_aligned;
 
 	struct scatterlist	*sg;
@@ -184,7 +190,7 @@ struct dw_mci {
 	void			*sg_cpu;
 	const struct dw_mci_dma_ops	*dma_ops;
 	/* For idmac */
-	unsigned int		ring_size;
+	unsigned short		desc_num;
 
 	/* For edmac */
 	struct dw_mci_dma_slave *dms;
@@ -210,7 +216,6 @@ struct dw_mci {
 	void			*priv;
 	struct clk		*biu_clk;
 	struct clk		*ciu_clk;
-	struct dw_mci_slot	*slot;
 
 	/* FIFO push and pull */
 	int			fifo_depth;
@@ -231,9 +236,10 @@ struct dw_mci {
 
 	int			sdio_irq;
 
-	struct timer_list       cmd11_timer;
-	struct timer_list       cto_timer;
-	struct timer_list       dto_timer;
+	struct hrtimer		wd_timer;
+	unsigned long		wd_events;
+	unsigned long		wd_states;
+	u64			wd_deadline_ns;
 
 #ifdef CONFIG_FAULT_INJECTION
 	struct fault_attr	fail_data_crc;

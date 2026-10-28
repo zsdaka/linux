@@ -7,9 +7,12 @@
 #include "file_reader_fail.skel.h"
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 const char *user_ptr = "hello world";
 char file_contents[256000];
+void *addr;
+__u64 beyond_eof_offset;
 
 void *get_executable_base_addr(void)
 {
@@ -25,13 +28,18 @@ void *get_executable_base_addr(void)
 
 static int initialize_file_contents(void)
 {
+	struct stat st;
 	int fd, page_sz = sysconf(_SC_PAGESIZE);
-	ssize_t n = 0, cur, off;
-	void *addr;
+	ssize_t n = 0, cur;
 
 	fd = open("/proc/self/exe", O_RDONLY);
 	if (!ASSERT_OK_FD(fd, "Open /proc/self/exe\n"))
 		return 1;
+	if (!ASSERT_OK(fstat(fd, &st), "fstat /proc/self/exe")) {
+		close(fd);
+		return 1;
+	}
+	beyond_eof_offset = st.st_size + (1ULL << 30);
 
 	do {
 		cur = read(fd, file_contents + n, sizeof(file_contents) - n);
@@ -51,16 +59,6 @@ static int initialize_file_contents(void)
 
 	/* page-align base file address */
 	addr = (void *)((unsigned long)addr & ~(page_sz - 1));
-
-	/*
-	 * Page out range 0..512K, use 0..256K for positive tests and
-	 * 256K..512K for negative tests expecting page faults
-	 */
-	for (off = 0; off < sizeof(file_contents) * 2; off += page_sz) {
-		if (!ASSERT_OK(madvise(addr + off, page_sz, MADV_PAGEOUT),
-			       "madvise pageout"))
-			return errno;
-	}
 
 	return 0;
 }
@@ -85,9 +83,18 @@ static void run_test(const char *prog_name)
 
 	memcpy(skel->bss->user_buf, file_contents, sizeof(file_contents));
 	skel->bss->pid = getpid();
+	skel->bss->beyond_eof_offset = beyond_eof_offset;
 
 	err = file_reader__load(skel);
 	if (!ASSERT_OK(err, "file_reader__load"))
+		goto cleanup;
+
+	/*
+	 * Page out range 0..512K, use 0..256K for positive tests and
+	 * 256K..512K for negative tests expecting page faults
+	 */
+	if (!ASSERT_OK(madvise(addr, sizeof(file_contents) * 2, MADV_PAGEOUT),
+		       "madvise pageout"))
 		goto cleanup;
 
 	err = file_reader__attach(skel);
@@ -111,6 +118,12 @@ void test_file_reader(void)
 
 	if (test__start_subtest("on_open_validate_file_read"))
 		run_test("on_open_validate_file_read");
+
+	if (test__start_subtest("on_open_non_sleepable_first"))
+		run_test("on_open_non_sleepable_first");
+
+	if (test__start_subtest("on_open_sleepable_first"))
+		run_test("on_open_sleepable_first");
 
 	if (test__start_subtest("negative"))
 		RUN_TESTS(file_reader_fail);

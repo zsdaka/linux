@@ -213,7 +213,7 @@ static irqreturn_t pvr_device_irq_thread_handler(int irq, void *data)
 	while (pvr_fw_irq_pending(pvr_dev)) {
 		pvr_fw_irq_clear(pvr_dev);
 
-		if (pvr_dev->fw_dev.booted) {
+		if (READ_ONCE(pvr_dev->fw_dev.initialised)) {
 			pvr_fwccb_process(pvr_dev);
 			pvr_kccb_wake_up_waiters(pvr_dev);
 			pvr_device_process_active_queues(pvr_dev);
@@ -531,11 +531,9 @@ pvr_gpu_support_level(const struct pvr_gpu_id *gpu_id)
 {
 	switch (pvr_gpu_id_to_packed_bvnc(gpu_id)) {
 	case PVR_PACKED_BVNC(33, 15, 11, 3):
+	case PVR_PACKED_BVNC(36, 52, 104, 182):
 	case PVR_PACKED_BVNC(36, 53, 104, 796):
 		return PVR_GPU_SUPPORTED;
-
-	case PVR_PACKED_BVNC(36, 52, 104, 182):
-		return PVR_GPU_EXPERIMENTAL;
 
 	default:
 		return PVR_GPU_UNKNOWN;
@@ -699,25 +697,7 @@ pvr_device_gpu_init(struct pvr_device *pvr_dev)
 	if (err)
 		return err;
 
-	if (pvr_dev->fw_dev.processor_type != PVR_FW_PROCESSOR_TYPE_MIPS) {
-		pvr_dev->kernel_vm_ctx = pvr_vm_create_context(pvr_dev, false);
-		if (IS_ERR(pvr_dev->kernel_vm_ctx))
-			return PTR_ERR(pvr_dev->kernel_vm_ctx);
-	}
-
-	err = pvr_fw_init(pvr_dev);
-	if (err)
-		goto err_vm_ctx_put;
-
-	return 0;
-
-err_vm_ctx_put:
-	if (pvr_dev->fw_dev.processor_type != PVR_FW_PROCESSOR_TYPE_MIPS) {
-		pvr_vm_context_put(pvr_dev->kernel_vm_ctx);
-		pvr_dev->kernel_vm_ctx = NULL;
-	}
-
-	return err;
+	return pvr_fw_init(pvr_dev);
 }
 
 /**
@@ -728,11 +708,6 @@ static void
 pvr_device_gpu_fini(struct pvr_device *pvr_dev)
 {
 	pvr_fw_fini(pvr_dev);
-
-	if (pvr_dev->fw_dev.processor_type != PVR_FW_PROCESSOR_TYPE_MIPS) {
-		WARN_ON(!pvr_vm_context_put(pvr_dev->kernel_vm_ctx));
-		pvr_dev->kernel_vm_ctx = NULL;
-	}
 }
 
 /**

@@ -1784,7 +1784,7 @@ static int rs_check_takeover(struct raid_set *rs)
 
 		/* raid10* -> raid0 */
 		if (mddev->new_level == 0) {
-			/* Can takeover raid10_near with raid disks divisable by data copies! */
+			/* Can takeover raid10_near with raid disks divisible by data copies! */
 			if (near_copies > 1 &&
 			    !(mddev->raid_disks % near_copies)) {
 				mddev->raid_disks /= near_copies;
@@ -3831,6 +3831,7 @@ static void raid_presuspend(struct dm_target *ti)
 	 * resume, raid_postsuspend() is too late.
 	 */
 	set_bit(RT_FLAG_RS_FROZEN, &rs->runtime_flags);
+	set_bit(MD_DM_SUSPENDING, &mddev->flags);
 
 	if (!reshape_interrupted(mddev))
 		return;
@@ -3847,13 +3848,16 @@ static void raid_presuspend(struct dm_target *ti)
 static void raid_presuspend_undo(struct dm_target *ti)
 {
 	struct raid_set *rs = ti->private;
+	struct mddev *mddev = &rs->md;
 
+	clear_bit(MD_DM_SUSPENDING, &mddev->flags);
 	clear_bit(RT_FLAG_RS_FROZEN, &rs->runtime_flags);
 }
 
 static void raid_postsuspend(struct dm_target *ti)
 {
 	struct raid_set *rs = ti->private;
+	struct mddev *mddev = &rs->md;
 
 	if (!test_and_set_bit(RT_FLAG_RS_SUSPENDED, &rs->runtime_flags)) {
 		/*
@@ -3864,6 +3868,8 @@ static void raid_postsuspend(struct dm_target *ti)
 		mddev_suspend(&rs->md, false);
 		rs->md.ro = MD_RDONLY;
 	}
+	clear_bit(MD_DM_SUSPENDING, &mddev->flags);
+
 }
 
 static void attempt_restore_of_faulty_devices(struct raid_set *rs)

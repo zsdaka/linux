@@ -14,6 +14,7 @@
 #include <linux/acpi.h>
 #include <linux/bits.h>
 #include <linux/err.h>
+#include <linux/firmware_attributes.h>
 #include <linux/i8042.h>
 #include <linux/init.h>
 #include <linux/input.h>
@@ -28,7 +29,6 @@
 #include <linux/uuid.h>
 #include <linux/workqueue.h>
 #include <acpi/battery.h>
-#include "firmware_attributes_class.h"
 
 #define DRIVER_NAME "samsung-galaxybook"
 
@@ -1438,6 +1438,7 @@ static const struct acpi_device_id galaxybook_device_ids[] = {
 	{ "SAM0428" },
 	{ "SAM0429" },
 	{ "SAM0430" },
+	{ "SAMB430" },
 	{}
 };
 MODULE_DEVICE_TABLE(acpi, galaxybook_device_ids);

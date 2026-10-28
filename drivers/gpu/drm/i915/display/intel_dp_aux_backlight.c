@@ -120,8 +120,8 @@ intel_dp_aux_supports_hdr_backlight(struct intel_connector *connector)
 
 	intel_dp_wait_source_oui(intel_dp);
 
-	ret = drm_dp_dpcd_read(aux, INTEL_EDP_HDR_TCON_CAP0, tcon_cap, sizeof(tcon_cap));
-	if (ret != sizeof(tcon_cap))
+	ret = drm_dp_dpcd_read_data(aux, INTEL_EDP_HDR_TCON_CAP0, tcon_cap, sizeof(tcon_cap));
+	if (ret < 0)
 		return false;
 
 	drm_dbg_kms(display->drm,
@@ -178,11 +178,13 @@ intel_dp_aux_hdr_get_backlight(struct intel_connector *connector, enum pipe pipe
 	struct intel_dp *intel_dp = enc_to_intel_dp(connector->encoder);
 	u8 tmp;
 	u8 buf[2] = {};
+	int ret;
 
-	if (drm_dp_dpcd_readb(&intel_dp->aux, INTEL_EDP_HDR_GETSET_CTRL_PARAMS, &tmp) != 1) {
+	ret = drm_dp_dpcd_read_byte(&intel_dp->aux, INTEL_EDP_HDR_GETSET_CTRL_PARAMS, &tmp);
+	if (ret < 0) {
 		drm_err(display->drm,
-			"[CONNECTOR:%d:%s] Failed to read current backlight mode from DPCD\n",
-			connector->base.base.id, connector->base.name);
+			"[CONNECTOR:%d:%s] Failed to read current backlight mode from DPCD (%pe)\n",
+			connector->base.base.id, connector->base.name, ERR_PTR(ret));
 		return 0;
 	}
 
@@ -197,11 +199,12 @@ intel_dp_aux_hdr_get_backlight(struct intel_connector *connector, enum pipe pipe
 		return panel->backlight.max;
 	}
 
-	if (drm_dp_dpcd_read(&intel_dp->aux, INTEL_EDP_BRIGHTNESS_NITS_LSB, buf,
-			     sizeof(buf)) != sizeof(buf)) {
+	ret = drm_dp_dpcd_read_data(&intel_dp->aux, INTEL_EDP_BRIGHTNESS_NITS_LSB, buf,
+				    sizeof(buf));
+	if (ret < 0) {
 		drm_err(display->drm,
-			"[CONNECTOR:%d:%s] Failed to read brightness from DPCD\n",
-			connector->base.base.id, connector->base.name);
+			"[CONNECTOR:%d:%s] Failed to read brightness from DPCD (%pe)\n",
+			connector->base.base.id, connector->base.name, ERR_PTR(ret));
 		return 0;
 	}
 
@@ -215,14 +218,16 @@ intel_dp_aux_hdr_set_aux_backlight(const struct drm_connector_state *conn_state,
 	struct drm_device *dev = connector->base.dev;
 	struct intel_dp *intel_dp = enc_to_intel_dp(connector->encoder);
 	u8 buf[4] = {};
+	int ret;
 
 	buf[0] = level & 0xFF;
 	buf[1] = (level & 0xFF00) >> 8;
 
-	if (drm_dp_dpcd_write(&intel_dp->aux, INTEL_EDP_BRIGHTNESS_NITS_LSB, buf,
-			      sizeof(buf)) != sizeof(buf))
-		drm_err(dev, "[CONNECTOR:%d:%s] Failed to write brightness level to DPCD\n",
-			connector->base.base.id, connector->base.name);
+	ret = drm_dp_dpcd_write_data(&intel_dp->aux, INTEL_EDP_BRIGHTNESS_NITS_LSB, buf,
+				     sizeof(buf));
+	if (ret < 0)
+		drm_err(dev, "[CONNECTOR:%d:%s] Failed to write brightness level to DPCD (%pe)\n",
+			connector->base.base.id, connector->base.name, ERR_PTR(ret));
 }
 
 static void
@@ -258,13 +263,12 @@ intel_dp_aux_write_content_luminance(struct intel_connector *connector,
 	buf[2] = hdr_metadata->hdmi_metadata_type1.max_fall & 0xFF;
 	buf[3] = (hdr_metadata->hdmi_metadata_type1.max_fall & 0xFF00) >> 8;
 
-	ret = drm_dp_dpcd_write(&intel_dp->aux,
-				INTEL_EDP_HDR_CONTENT_LUMINANCE,
-				buf, sizeof(buf));
+	ret = drm_dp_dpcd_write_data(&intel_dp->aux,
+				     INTEL_EDP_HDR_CONTENT_LUMINANCE,
+				     buf, sizeof(buf));
 	if (ret < 0)
 		drm_dbg_kms(display->drm,
-			    "Content Luminance DPCD reg write failed, err:-%d\n",
-			    ret);
+			    "Content Luminance DPCD reg write failed (%pe)\n", ERR_PTR(ret));
 }
 
 static void
@@ -313,11 +317,11 @@ intel_dp_aux_hdr_enable_backlight(const struct intel_crtc_state *crtc_state,
 
 	intel_dp_wait_source_oui(intel_dp);
 
-	ret = drm_dp_dpcd_readb(&intel_dp->aux, INTEL_EDP_HDR_GETSET_CTRL_PARAMS, &old_ctrl);
-	if (ret != 1) {
+	ret = drm_dp_dpcd_read_byte(&intel_dp->aux, INTEL_EDP_HDR_GETSET_CTRL_PARAMS, &old_ctrl);
+	if (ret < 0) {
 		drm_err(display->drm,
-			"[CONNECTOR:%d:%s] Failed to read current backlight control mode: %d\n",
-			connector->base.base.id, connector->base.name, ret);
+			"[CONNECTOR:%d:%s] Failed to read current backlight control mode (%pe)\n",
+			connector->base.base.id, connector->base.name, ERR_PTR(ret));
 		return;
 	}
 
@@ -337,11 +341,14 @@ intel_dp_aux_hdr_enable_backlight(const struct intel_crtc_state *crtc_state,
 
 	intel_dp_aux_fill_hdr_tcon_params(conn_state, &ctrl);
 
-	if (ctrl != old_ctrl &&
-	    drm_dp_dpcd_writeb(&intel_dp->aux, INTEL_EDP_HDR_GETSET_CTRL_PARAMS, ctrl) != 1)
-		drm_err(display->drm,
-			"[CONNECTOR:%d:%s] Failed to configure DPCD brightness controls\n",
-			connector->base.base.id, connector->base.name);
+	if (ctrl != old_ctrl) {
+		ret = drm_dp_dpcd_write_byte(&intel_dp->aux,
+					     INTEL_EDP_HDR_GETSET_CTRL_PARAMS, ctrl);
+		if (ret < 0)
+			drm_err(display->drm,
+				"[CONNECTOR:%d:%s] Failed to configure DPCD brightness controls (%pe)\n",
+				connector->base.base.id, connector->base.name, ERR_PTR(ret));
+	}
 
 	if (intel_dp_in_hdr_mode(conn_state)) {
 		hdr_metadata = conn_state->hdr_output_metadata->data;
@@ -392,13 +399,12 @@ intel_dp_aux_write_panel_luminance_override(struct intel_connector *connector)
 	buf[2] = panel->backlight.max & 0xFF;
 	buf[3] = (panel->backlight.max & 0xFF00) >> 8;
 
-	ret = drm_dp_dpcd_write(&intel_dp->aux,
-				INTEL_EDP_HDR_PANEL_LUMINANCE_OVERRIDE,
-				buf, sizeof(buf));
+	ret = drm_dp_dpcd_write_data(&intel_dp->aux,
+				     INTEL_EDP_HDR_PANEL_LUMINANCE_OVERRIDE,
+				     buf, sizeof(buf));
 	if (ret < 0)
 		drm_dbg_kms(display->drm,
-			    "Panel Luminance DPCD reg write failed, err:-%d\n",
-			    ret);
+			    "Panel Luminance DPCD reg write failed (%pe)\n", ERR_PTR(ret));
 }
 
 static int
@@ -456,12 +462,12 @@ static u32 intel_dp_aux_vesa_get_backlight(struct intel_connector *connector, en
 	int ret;
 
 	if (panel->backlight.edp.vesa.luminance_control_support) {
-		ret = drm_dp_dpcd_read(&intel_dp->aux, DP_EDP_PANEL_TARGET_LUMINANCE_VALUE, buf,
-				       sizeof(buf));
+		ret = drm_dp_dpcd_read_data(&intel_dp->aux, DP_EDP_PANEL_TARGET_LUMINANCE_VALUE, buf,
+					    sizeof(buf));
 		if (ret < 0) {
 			drm_err(intel_dp->aux.drm_dev,
-				"[CONNECTOR:%d:%s] Failed to read Luminance from DPCD\n",
-				connector->base.base.id, connector->base.name);
+				"[CONNECTOR:%d:%s] Failed to read Luminance from DPCD (%pe)\n",
+				connector->base.base.id, connector->base.name, ERR_PTR(ret));
 			return 0;
 		}
 
@@ -615,12 +621,7 @@ check_if_vesa_backlight_possible(struct intel_dp *intel_dp)
 	int ret;
 	u8 bit_min, bit_max;
 
-	/*
-	 * Since we only support Fully AUX Based VESA Backlight interface make sure
-	 * backlight enable is possible via AUX along with backlight adjustment
-	 */
-	if (!(intel_dp->edp_dpcd[1] & DP_EDP_BACKLIGHT_AUX_ENABLE_CAP &&
-	      intel_dp->edp_dpcd[2] & DP_EDP_BACKLIGHT_BRIGHTNESS_AUX_SET_CAP))
+	if (!(intel_dp->edp_dpcd[2] & DP_EDP_BACKLIGHT_BRIGHTNESS_AUX_SET_CAP))
 		return false;
 
 	ret = drm_dp_dpcd_read_byte(&intel_dp->aux, DP_EDP_PWMGEN_BIT_COUNT_CAP_MIN, &bit_min);
@@ -691,10 +692,9 @@ int intel_dp_aux_init_backlight_funcs(struct intel_connector *connector)
 	struct intel_dp *intel_dp = intel_attached_dp(connector);
 	struct drm_device *dev = connector->base.dev;
 	struct intel_panel *panel = &connector->panel;
-	bool try_intel_interface = false;
+	bool try_intel_interface = false, try_vesa_interface = false;
 
-	/*
-	 * Check the VBT and user's module parameters to figure out which
+	/* Check the VBT and user's module parameters to figure out which
 	 * interfaces to probe
 	 */
 	switch (display->params.enable_dpcd_backlight) {
@@ -703,6 +703,7 @@ int intel_dp_aux_init_backlight_funcs(struct intel_connector *connector)
 	case INTEL_DP_AUX_BACKLIGHT_AUTO:
 		switch (panel->vbt.backlight.type) {
 		case INTEL_BACKLIGHT_VESA_EDP_AUX_INTERFACE:
+			try_vesa_interface = true;
 			break;
 		case INTEL_BACKLIGHT_DISPLAY_DDI:
 			try_intel_interface = true;
@@ -715,11 +716,19 @@ int intel_dp_aux_init_backlight_funcs(struct intel_connector *connector)
 		if (panel->vbt.backlight.type != INTEL_BACKLIGHT_VESA_EDP_AUX_INTERFACE)
 			try_intel_interface = true;
 
+		try_vesa_interface = true;
+		break;
+	case INTEL_DP_AUX_BACKLIGHT_FORCE_VESA:
+		try_vesa_interface = true;
 		break;
 	case INTEL_DP_AUX_BACKLIGHT_FORCE_INTEL:
 		try_intel_interface = true;
 		break;
 	}
+
+	/* For eDP 1.5 and above we are supposed to use VESA interface for brightness control */
+	if (intel_dp->edp_dpcd[0] >= DP_EDP_15)
+		try_vesa_interface = true;
 
 	/*
 	 * Since Intel has their own backlight control interface, the majority of machines out there
@@ -733,9 +742,6 @@ int intel_dp_aux_init_backlight_funcs(struct intel_connector *connector)
 	 * panel with Intel's OUI - which is also required for us to be able to detect Intel's
 	 * backlight interface at all. This means that the only sensible way for us to detect both
 	 * interfaces is to probe for Intel's first, and VESA's second.
-	 *
-	 * Also there is a chance some VBTs may advertise false Intel backlight support even if the
-	 * TCON DPCD says otherwise. This means we keep VESA interface as fallback in that case.
 	 */
 	if (try_intel_interface && intel_dp->edp_dpcd[0] <= DP_EDP_14b &&
 	    intel_dp_aux_supports_hdr_backlight(connector)) {
@@ -745,7 +751,7 @@ int intel_dp_aux_init_backlight_funcs(struct intel_connector *connector)
 		return 0;
 	}
 
-	if (intel_dp_aux_supports_vesa_backlight(connector)) {
+	if (try_vesa_interface && intel_dp_aux_supports_vesa_backlight(connector)) {
 		drm_dbg_kms(dev, "[CONNECTOR:%d:%s] Using VESA eDP backlight controls\n",
 			    connector->base.base.id, connector->base.name);
 		panel->backlight.funcs = &intel_dp_vesa_bl_funcs;

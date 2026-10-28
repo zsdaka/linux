@@ -24,20 +24,43 @@ bool cg_test_v1_named;
 /* Returns read len on success, or -errno on failure. */
 ssize_t read_text(const char *path, char *buf, size_t max_len)
 {
-	ssize_t len;
+	size_t total = 0;
+	ssize_t len, ret;
 	int fd;
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
 		return -errno;
 
-	len = read(fd, buf, max_len - 1);
+	/*
+	 * A single read() is not enough.  procfs and sysfs are backed by
+	 * seq_file, and seq_read_iter() copies out at most one internal
+	 * buffer (PAGE_SIZE) per call, leaving the rest for the next read().
+	 * Reading only once therefore silently drops everything past the
+	 * first page, no matter how big the caller's buffer is.
+	 *
+	 * Loop until the buffer is full or EOF.  A full buffer still means
+	 * the file may be longer than max_len, but that is now limited by
+	 * the caller's buffer rather than by a page of seq_file output.
+	 */
+	while (total < max_len - 1) {
+		len = read(fd, buf + total, max_len - 1 - total);
+		if (len < 0) {
+			if (errno == EINTR)
+				continue;
+			ret = -errno;
+			goto out;
+		}
+		if (!len)
+			break;
+		total += len;
+	}
 
-	if (len >= 0)
-		buf[len] = 0;
-
+	buf[total] = 0;
+	ret = total;
+out:
 	close(fd);
-	return len < 0 ? -errno : len;
+	return ret;
 }
 
 /* Returns written len on success, or -errno on failure. */
@@ -59,7 +82,8 @@ char *cg_name(const char *root, const char *name)
 	size_t len = strlen(root) + strlen(name) + 2;
 	char *ret = malloc(len);
 
-	snprintf(ret, len, "%s/%s", root, name);
+	if (ret)
+		snprintf(ret, len, "%s/%s", root, name);
 
 	return ret;
 }
@@ -69,7 +93,8 @@ char *cg_name_indexed(const char *root, const char *name, int index)
 	size_t len = strlen(root) + strlen(name) + 10;
 	char *ret = malloc(len);
 
-	snprintf(ret, len, "%s/%s_%d", root, name, index);
+	if (ret)
+		snprintf(ret, len, "%s/%s_%d", root, name, index);
 
 	return ret;
 }
@@ -79,7 +104,8 @@ char *cg_control(const char *cgroup, const char *control)
 	size_t len = strlen(cgroup) + strlen(control) + 2;
 	char *ret = malloc(len);
 
-	snprintf(ret, len, "%s/%s", cgroup, control);
+	if (ret)
+		snprintf(ret, len, "%s/%s", cgroup, control);
 
 	return ret;
 }
@@ -141,7 +167,7 @@ int cg_read_strcmp_wait(const char *cgroup, const char *control,
 
 int cg_read_strstr(const char *cgroup, const char *control, const char *needle)
 {
-	char buf[PAGE_SIZE];
+	char buf[BUF_SIZE];
 
 	if (cg_read(cgroup, control, buf, sizeof(buf)))
 		return -1;
@@ -171,7 +197,7 @@ long cg_read_long_fd(int fd)
 
 long cg_read_key_long(const char *cgroup, const char *control, const char *key)
 {
-	char buf[PAGE_SIZE];
+	char buf[BUF_SIZE];
 	char *ptr;
 
 	if (cg_read(cgroup, control, buf, sizeof(buf)))
@@ -207,7 +233,7 @@ long cg_read_key_long_poll(const char *cgroup, const char *control,
 
 long cg_read_lc(const char *cgroup, const char *control)
 {
-	char buf[PAGE_SIZE];
+	char buf[BUF_SIZE];
 	const char delim[] = "\n";
 	char *line;
 	long cnt = 0;
@@ -259,7 +285,7 @@ int cg_write_numeric(const char *cgroup, const char *control, long value)
 static int cg_find_root(char *root, size_t len, const char *controller,
 			bool *nsdelegate)
 {
-	char buf[10 * PAGE_SIZE];
+	char buf[10 * BUF_SIZE];
 	char *fs, *mount, *type, *options;
 	const char delim[] = "\n\t ";
 
@@ -276,6 +302,16 @@ static int cg_find_root(char *root, size_t len, const char *controller,
 		options = strtok(NULL, delim);
 		strtok(NULL, delim);
 		strtok(NULL, delim);
+
+		/*
+		 * A mount entry is "device mountpoint type options freq
+		 * passno".  A field can only be missing if the last entry was
+		 * cut short by the buffer being too small for the file, and
+		 * there is no complete entry left to look at.
+		 */
+		if (!mount || !type || !options)
+			break;
+
 		if (strcmp(type, "cgroup") == 0) {
 			if (!controller || !strstr(options, controller))
 				continue;
@@ -314,7 +350,7 @@ int cg_create(const char *cgroup)
 
 int cg_wait_for_proc_count(const char *cgroup, int count)
 {
-	char buf[10 * PAGE_SIZE] = {0};
+	char buf[10 * BUF_SIZE] = {0};
 	int attempts;
 	char *ptr;
 
@@ -339,7 +375,7 @@ int cg_wait_for_proc_count(const char *cgroup, int count)
 
 int cg_killall(const char *cgroup)
 {
-	char buf[PAGE_SIZE];
+	char buf[BUF_SIZE];
 	char *ptr = buf;
 
 	/* If cgroup.kill exists use it. */
@@ -549,7 +585,7 @@ int cg_run_nowait(const char *cgroup,
 
 int proc_mount_contains(const char *option)
 {
-	char buf[4 * PAGE_SIZE];
+	char buf[4 * BUF_SIZE];
 	ssize_t read;
 
 	read = read_text("/proc/mounts", buf, sizeof(buf));
@@ -561,7 +597,7 @@ int proc_mount_contains(const char *option)
 
 int cgroup_feature(const char *feature)
 {
-	char buf[PAGE_SIZE];
+	char buf[BUF_SIZE];
 	ssize_t read;
 
 	read = read_text("/sys/kernel/cgroup/features", buf, sizeof(buf));
@@ -588,7 +624,7 @@ ssize_t proc_read_text(int pid, bool thread, const char *item, char *buf, size_t
 
 int proc_read_strstr(int pid, bool thread, const char *item, const char *needle)
 {
-	char buf[PAGE_SIZE];
+	char buf[BUF_SIZE];
 
 	if (proc_read_text(pid, thread, item, buf, sizeof(buf)) < 0)
 		return -1;
@@ -623,18 +659,25 @@ int clone_into_cgroup_run_wait(const char *cgroup)
 
 static int __prepare_for_wait(const char *cgroup, const char *filename)
 {
-	int fd, ret = -1;
+	char *path;
+	int fd, ret;
+
+	path = cg_control(cgroup, filename);
+	if (!path)
+		return -1;
 
 	fd = inotify_init1(0);
 	if (fd == -1)
-		return fd;
+		goto out;
 
-	ret = inotify_add_watch(fd, cg_control(cgroup, filename), IN_MODIFY);
+	ret = inotify_add_watch(fd, path, IN_MODIFY);
 	if (ret == -1) {
 		close(fd);
 		fd = -1;
 	}
 
+out:
+	free(path);
 	return fd;
 }
 

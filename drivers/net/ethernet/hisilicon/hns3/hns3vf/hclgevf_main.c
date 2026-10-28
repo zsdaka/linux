@@ -26,11 +26,15 @@ static struct hnae3_ae_algo ae_algovf;
 static struct workqueue_struct *hclgevf_wq;
 
 static const struct pci_device_id ae_algovf_pci_tbl[] = {
-	{PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_VF), 0},
-	{PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_RDMA_DCB_PFC_VF),
-	 HNAE3_DEV_SUPPORT_ROCE_DCB_BITS},
+	{
+		PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_VF),
+		.driver_data = 0,
+	}, {
+		PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_RDMA_DCB_PFC_VF),
+		.driver_data = HNAE3_DEV_SUPPORT_ROCE_DCB_BITS,
+	},
 	/* required last entry */
-	{0, }
+	{ }
 };
 
 MODULE_DEVICE_TABLE(pci, ae_algovf_pci_tbl);
@@ -1876,7 +1880,7 @@ static void hclgevf_reset_service_task(struct hclgevf_dev *hdev)
 		 * from PF as cmdq would be in unreliable state i.e. mailbox
 		 * communication between PF and VF would be broken.
 		 *
-		 * if we are never geting into pending state it means either:
+		 * if we are never getting into pending state it means either:
 		 * 1. PF is not receiving our request which could be due to IMP
 		 *    reset
 		 * 2. PF is screwed

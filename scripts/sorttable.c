@@ -116,7 +116,7 @@ static inline void *get_index(void *start, int entsize, int index)
 }
 
 static int extable_ent_size;
-static int long_size;
+static int long_size __maybe_unused;
 
 #define ERRSTR_MAXSZ	256
 
@@ -322,9 +322,22 @@ static int parse_symbols(const char *fname)
 		return -1;
 	}
 
-	while (fscanf(fp, "%16s %16s %c %*s\n", addr_str, size_str, &type) == 3) {
+	while (fscanf(fp, "%16s %16s %c%*[^\n]", addr_str, size_str, &type) == 3) {
 		uint64_t addr;
 		uint64_t size;
+
+		/*
+		 * nm outputs size-less entries with a missing 2nd value, which
+		 * means fscanf() just misread its fields.
+		 *
+		 * These don't matter as a call site cannot be in an empty
+		 * function, so just skip them.
+		 *
+		 * nm pads address and size to the same width, so if their
+		 * widths differ, this is a misread.
+		 */
+		if (strlen(size_str) != strlen(addr_str))
+			continue;
 
 		/* Only care about functions */
 		if (type != 't' && type != 'T' && type != 'W')
@@ -891,17 +904,22 @@ static int do_file(char const *const fname, void *addr)
 	table_sort_t custom_sort = NULL;
 
 	switch (elf_map_machine(ehdr)) {
-	case EM_AARCH64:
 #ifdef MCOUNT_SORT_ENABLED
+	case EM_AARCH64:
+		/* arm64 also needs RELA-based weak-function fixups. */
 		sort_reloc = true;
 		rela_type = 0x403;
-		/* arm64 uses patchable function entry placing before function */
+		/* fallthrough */
+	case EM_RISCV:
+		/* arm64 and RISC-V place patchable entries before the function. */
 		before_func = 8;
+#else
+	case EM_AARCH64:
+	case EM_RISCV:
 #endif
 		/* fallthrough */
 	case EM_386:
 	case EM_LOONGARCH:
-	case EM_RISCV:
 	case EM_S390:
 	case EM_X86_64:
 		custom_sort = sort_relative_table_with_data;

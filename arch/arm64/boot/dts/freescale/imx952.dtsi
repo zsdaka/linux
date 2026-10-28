@@ -261,6 +261,14 @@
 		};
 	};
 
+	mqs1: mqs1 {
+		compatible = "fsl,imx95-aonmix-mqs";
+		clocks = <&scmi_clk IMX952_CLK_SAI1>;
+		clock-names = "mclk";
+		#sound-dai-cells = <0>;
+		status = "disabled";
+	};
+
 	gic: interrupt-controller@48000000 {
 		compatible = "arm,gic-v3";
 		reg = <0 0x48000000 0 0x10000>,
@@ -318,6 +326,25 @@
 		clock-names = "main_clk";
 	};
 
+	gpu_opp_table: opp-table {
+		compatible = "operating-points-v2";
+
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			opp-microvolt = <920000>;
+		};
+
+		opp-800000000 {
+			opp-hz = /bits/ 64 <800000000>;
+			opp-microvolt = <920000>;
+		};
+
+		opp-1000000000 {
+			opp-hz = /bits/ 64 <1000000000>;
+			opp-microvolt = <920000>;
+		};
+	};
+
 	soc {
 		compatible = "simple-bus";
 		#address-cells = <2>;
@@ -349,6 +376,17 @@
 				clocks = <&scmi_clk IMX952_CLK_BUSWAKEUP>;
 				timeout-sec = <40>;
 				status = "disabled";
+				bootph-all;
+			};
+
+			wdog4: watchdog@420c0000 {
+				compatible = "fsl,imx93-wdt";
+				reg = <0x420c0000 0x10000>;
+				interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH>;
+				clocks = <&scmi_clk IMX952_CLK_BUSWAKEUP>;
+				timeout-sec = <40>;
+				status = "disabled";
+				bootph-all;
 			};
 
 			tpm3: pwm@42100000 {
@@ -1131,7 +1169,7 @@
 				clock-names = "per", "ipg";
 				#address-cells = <1>;
 				#size-cells = <0>;
-				dmas = <&edma1 12 0 0>, <&edma1 13 0 FSL_EDMA_RX> ;
+				dmas = <&edma1 12 0 0>, <&edma1 13 0 FSL_EDMA_RX>;
 				dma-names = "tx", "rx";
 				status = "disabled";
 			};
@@ -1145,7 +1183,7 @@
 				clock-names = "per", "ipg";
 				#address-cells = <1>;
 				#size-cells = <0>;
-				dmas = <&edma1 14 0 0>, <&edma1 15 0 FSL_EDMA_RX> ;
+				dmas = <&edma1 14 0 0>, <&edma1 15 0 FSL_EDMA_RX>;
 				dma-names = "tx", "rx";
 				status = "disabled";
 			};
@@ -1159,7 +1197,7 @@
 				clock-names = "per", "ipg";
 				#address-cells = <1>;
 				#size-cells = <0>;
-				dmas = <&edma1 16 0 FSL_EDMA_RX>, <&edma1 17 0 0> ;
+				dmas = <&edma1 16 0 FSL_EDMA_RX>, <&edma1 17 0 0>;
 				dma-names = "tx", "rx";
 				status = "disabled";
 			};
@@ -1173,7 +1211,7 @@
 				clock-names = "per", "ipg";
 				#address-cells = <1>;
 				#size-cells = <0>;
-				dmas = <&edma1 18 0 FSL_EDMA_RX>, <&edma1 19 0 0> ;
+				dmas = <&edma1 18 0 FSL_EDMA_RX>, <&edma1 19 0 0>;
 				dma-names = "tx", "rx";
 				status = "disabled";
 			};
@@ -1483,6 +1521,20 @@
 			#sound-dai-cells = <0>;
 			power-domains = <&scmi_devpd IMX952_PD_NETC>;
 			status = "disabled";
+		};
+
+		gpu: gpu@4d900000 {
+			compatible = "nxp,imx95-mali", "arm,mali-valhall-csf";
+			reg = <0 0x4d900000 0 0x480000>;
+			interrupts = <GIC_SPI 289 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 290 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 288 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "job", "mmu", "gpu";
+			clocks = <&scmi_clk IMX952_CLK_GPU>;
+			clock-names = "core";
+			power-domains = <&scmi_devpd IMX952_PD_GPU>;
+			operating-points-v2 = <&gpu_opp_table>;
+			dynamic-power-coefficient = <1013>;
 		};
 	};
 };

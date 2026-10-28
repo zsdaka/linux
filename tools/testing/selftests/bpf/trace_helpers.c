@@ -244,6 +244,45 @@ out:
 	return err;
 }
 
+unsigned long long module_get_base_addr(const char *module)
+{
+	unsigned long long addr, base_addr = 0;
+	char name[500];
+	FILE *f;
+
+	f = fopen("/proc/modules", "r");
+	if (!f)
+		return 0;
+
+	while (fscanf(f, "%499s %*s %*s %*s %*s 0x%llx", name, &addr) == 2) {
+		if (strcmp(module, name) == 0) {
+			base_addr = addr;
+			break;
+		}
+	}
+	fclose(f);
+	return base_addr;
+}
+
+unsigned long long module_get_base_addr_sec(const char *module, const char *sec)
+{
+	unsigned long long addr = 0;
+	char *path;
+	FILE *f;
+
+	if (asprintf(&path, "/sys/module/%s/sections/%s", module, sec) < 0)
+		return 0;
+	f = fopen(path, "r");
+	free(path);
+	if (!f)
+		return 0;
+
+	if (fscanf(f, "%llx", &addr) != 1)
+		addr = 0;
+	fclose(f);
+	return addr;
+}
+
 #ifdef PROCMAP_QUERY
 int env_verbosity __weak = 0;
 
@@ -546,9 +585,10 @@ static const char * const trace_blacklist[] = {
 	"__rcu_read_lock",
 	"__rcu_read_unlock",
 	"bpf_get_numa_node_id",
+	"___migrate_enable",
 };
 
-static bool skip_entry(char *name)
+bool is_unsafe_function(const char *name)
 {
 	int i;
 
@@ -651,7 +691,7 @@ int bpf_get_ksyms(struct ksyms **ksymsp, bool kernel)
 		free(name);
 		if (sscanf(buf, "%ms$*[^\n]\n", &name) != 1)
 			continue;
-		if (skip_entry(name))
+		if (is_unsafe_function(name))
 			continue;
 
 		ks = search_kallsyms_custom_local(ksyms, name, search_kallsyms_compare);
@@ -728,7 +768,7 @@ int bpf_get_addrs(unsigned long **addrsp, size_t *cntp, bool kernel)
 		free(name);
 		if (sscanf(buf, "%p %ms$*[^\n]\n", &addr, &name) != 2)
 			continue;
-		if (skip_entry(name))
+		if (is_unsafe_function(name))
 			continue;
 
 		if (cnt == max_cnt) {

@@ -5,6 +5,7 @@
  * Copyright (c) 2016 Tom Herbert <tom@herbertland.com>
  */
 
+#include <linux/rcupdate.h>
 #include <linux/bpf.h>
 #include <linux/errno.h>
 #include <linux/errqueue.h>
@@ -24,6 +25,7 @@
 #include <linux/workqueue.h>
 #include <linux/syscalls.h>
 #include <linux/sched/signal.h>
+#include <linux/uio.h>
 
 #include <net/kcm.h>
 #include <net/netns/generic.h>
@@ -390,7 +392,9 @@ static int kcm_parse_func_strparser(struct strparser *strp, struct sk_buff *skb)
 	struct bpf_prog *prog = psock->bpf_prog;
 	int res;
 
+	rcu_read_lock();
 	res = bpf_prog_run_pin_on_cpu(prog, skb);
+	rcu_read_unlock();
 	return res;
 }
 
@@ -731,7 +735,7 @@ static void kcm_tx_work(struct work_struct *w)
 	/* Primarily for SOCK_SEQPACKET sockets */
 	if (likely(sk->sk_socket) &&
 	    test_bit(SOCK_NOSPACE, &sk->sk_socket->flags)) {
-		clear_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+		sk_clear_nospace(sk);
 		sk->sk_write_space(sk);
 	}
 
@@ -775,7 +779,7 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 	/* Call the sk_stream functions to manage the sndbuf mem. */
 	if (!sk_stream_memory_free(sk)) {
 		kcm_push(kcm);
-		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+		sk_set_nospace(sk);
 		err = sk_stream_wait_memory(sk, &timeo);
 		if (err)
 			goto out_error;
@@ -1167,7 +1171,7 @@ static int kcm_setsockopt(struct socket *sock, int level, int optname,
 }
 
 static int kcm_getsockopt(struct socket *sock, int level, int optname,
-			  char __user *optval, int __user *optlen)
+			  sockopt_t *opt)
 {
 	struct kcm_sock *kcm = kcm_sk(sock->sk);
 	int val, len;
@@ -1175,9 +1179,7 @@ static int kcm_getsockopt(struct socket *sock, int level, int optname,
 	if (level != SOL_KCM)
 		return -ENOPROTOOPT;
 
-	if (get_user(len, optlen))
-		return -EFAULT;
-
+	len = opt->optlen;
 	if (len < 0)
 		return -EINVAL;
 
@@ -1191,9 +1193,8 @@ static int kcm_getsockopt(struct socket *sock, int level, int optname,
 		return -ENOPROTOOPT;
 	}
 
-	if (put_user(len, optlen))
-		return -EFAULT;
-	if (copy_to_user(optval, &val, len))
+	opt->optlen = len;
+	if (copy_to_iter(&val, len, &opt->iter_out) != len)
 		return -EFAULT;
 	return 0;
 }
@@ -1304,8 +1305,8 @@ static int kcm_attach(struct socket *sock, struct socket *csock,
 	psock->save_write_space = csk->sk_write_space;
 	psock->save_state_change = csk->sk_state_change;
 	csk->sk_user_data = psock;
-	csk->sk_data_ready = psock_data_ready;
-	csk->sk_write_space = psock_write_space;
+	WRITE_ONCE(csk->sk_data_ready, psock_data_ready);
+	WRITE_ONCE(csk->sk_write_space, psock_write_space);
 	csk->sk_state_change = psock_state_change;
 
 	write_unlock_bh(&csk->sk_callback_lock);
@@ -1381,8 +1382,8 @@ static void kcm_unattach(struct kcm_psock *psock)
 	 */
 	write_lock_bh(&csk->sk_callback_lock);
 	csk->sk_user_data = NULL;
-	csk->sk_data_ready = psock->save_data_ready;
-	csk->sk_write_space = psock->save_write_space;
+	WRITE_ONCE(csk->sk_data_ready, psock->save_data_ready);
+	WRITE_ONCE(csk->sk_write_space, psock->save_write_space);
 	csk->sk_state_change = psock->save_state_change;
 	strp_stop(&psock->strp);
 
@@ -1579,10 +1580,10 @@ static int kcm_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 		struct kcm_clone info;
 
 		FD_PREPARE(fdf, 0, kcm_clone(sock));
-		if (fdf.err)
-			return fdf.err;
+		if (fdf->fd < 0)
+			return fdf->fd;
 
-		info.fd = fd_prepare_fd(fdf);
+		info.fd = fdf->fd;
 		if (copy_to_user((void __user *)arg, &info, sizeof(info)))
 			return -EFAULT;
 
@@ -1755,7 +1756,7 @@ static const struct proto_ops kcm_dgram_ops = {
 	.listen =	sock_no_listen,
 	.shutdown =	sock_no_shutdown,
 	.setsockopt =	kcm_setsockopt,
-	.getsockopt =	kcm_getsockopt,
+	.getsockopt_iter = kcm_getsockopt,
 	.sendmsg =	kcm_sendmsg,
 	.recvmsg =	kcm_recvmsg,
 	.mmap =		sock_no_mmap,
@@ -1776,7 +1777,7 @@ static const struct proto_ops kcm_seqpacket_ops = {
 	.listen =	sock_no_listen,
 	.shutdown =	sock_no_shutdown,
 	.setsockopt =	kcm_setsockopt,
-	.getsockopt =	kcm_getsockopt,
+	.getsockopt_iter = kcm_getsockopt,
 	.sendmsg =	kcm_sendmsg,
 	.recvmsg =	kcm_recvmsg,
 	.mmap =		sock_no_mmap,

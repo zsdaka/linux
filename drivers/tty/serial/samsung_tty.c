@@ -300,7 +300,7 @@ static void s3c24xx_serial_stop_tx(struct uart_port *port)
 		dmaengine_pause(dma->tx_chan);
 		dmaengine_tx_status(dma->tx_chan, dma->tx_cookie, &state);
 		dmaengine_terminate_all(dma->tx_chan);
-		dma_sync_single_for_cpu(dma->tx_chan->device->dev,
+		dma_sync_single_for_cpu(dmaengine_get_dma_device(dma->tx_chan),
 					dma->tx_transfer_addr, dma->tx_size,
 					DMA_TO_DEVICE);
 		async_tx_ack(dma->tx_desc);
@@ -311,7 +311,7 @@ static void s3c24xx_serial_stop_tx(struct uart_port *port)
 	ourport->tx_enabled = 0;
 	ourport->tx_in_progress = 0;
 
-	if (port->flags & UPF_CONS_FLOW)
+	if (uart_cons_flow_enabled(port))
 		s3c24xx_serial_rx_enable(port);
 
 	ourport->tx_mode = 0;
@@ -333,7 +333,7 @@ static void s3c24xx_serial_tx_dma_complete(void *args)
 	count = dma->tx_bytes_requested - state.residue;
 	async_tx_ack(dma->tx_desc);
 
-	dma_sync_single_for_cpu(dma->tx_chan->device->dev,
+	dma_sync_single_for_cpu(dmaengine_get_dma_device(dma->tx_chan),
 				dma->tx_transfer_addr, dma->tx_size,
 				DMA_TO_DEVICE);
 
@@ -435,7 +435,7 @@ static int s3c24xx_serial_start_tx_dma(struct s3c24xx_uart_port *ourport,
 	dma->tx_size = count & ~(dma_get_cache_alignment() - 1);
 	dma->tx_transfer_addr = dma->tx_addr + tail;
 
-	dma_sync_single_for_device(dma->tx_chan->device->dev,
+	dma_sync_single_for_device(dmaengine_get_dma_device(dma->tx_chan),
 				   dma->tx_transfer_addr, dma->tx_size,
 				   DMA_TO_DEVICE);
 
@@ -485,7 +485,7 @@ static void s3c24xx_serial_start_tx(struct uart_port *port)
 	struct tty_port *tport = &port->state->port;
 
 	if (!ourport->tx_enabled) {
-		if (port->flags & UPF_CONS_FLOW)
+		if (uart_cons_flow_enabled(port))
 			s3c24xx_serial_rx_disable(port);
 
 		ourport->tx_enabled = 1;
@@ -509,7 +509,7 @@ static void s3c24xx_uart_copy_rx_to_tty(struct s3c24xx_uart_port *ourport,
 	if (!count)
 		return;
 
-	dma_sync_single_for_cpu(dma->rx_chan->device->dev, dma->rx_addr,
+	dma_sync_single_for_cpu(dmaengine_get_dma_device(dma->rx_chan), dma->rx_addr,
 				dma->rx_size, DMA_FROM_DEVICE);
 
 	ourport->port.icount.rx += count;
@@ -631,7 +631,7 @@ static void s3c64xx_start_rx_dma(struct s3c24xx_uart_port *ourport)
 {
 	struct s3c24xx_uart_dma *dma = ourport->dma;
 
-	dma_sync_single_for_device(dma->rx_chan->device->dev, dma->rx_addr,
+	dma_sync_single_for_device(dmaengine_get_dma_device(dma->rx_chan), dma->rx_addr,
 				   dma->rx_size, DMA_FROM_DEVICE);
 
 	dma->rx_desc = dmaengine_prep_slave_single(dma->rx_chan,
@@ -773,7 +773,7 @@ static void s3c24xx_serial_rx_drain_fifo(struct s3c24xx_uart_port *ourport)
 		uerstat = rd_regl(port, S3C2410_UERSTAT);
 		ch = rd_reg(port, S3C2410_URXH);
 
-		if (port->flags & UPF_CONS_FLOW) {
+		if (uart_cons_flow_enabled(port)) {
 			bool txe = s3c24xx_serial_txempty_nofifo(port);
 
 			if (ourport->rx_enabled) {
@@ -1101,20 +1101,23 @@ static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 		goto err_release_tx;
 	}
 
-	dma->rx_addr = dma_map_single(dma->rx_chan->device->dev, dma->rx_buf,
+	struct device *rx_dev = dmaengine_get_dma_device(dma->rx_chan);
+	struct device *tx_dev = dmaengine_get_dma_device(dma->tx_chan);
+
+	dma->rx_addr = dma_map_single(rx_dev, dma->rx_buf,
 				      dma->rx_size, DMA_FROM_DEVICE);
-	if (dma_mapping_error(dma->rx_chan->device->dev, dma->rx_addr)) {
+	if (dma_mapping_error(rx_dev, dma->rx_addr)) {
 		reason = "DMA mapping error for RX buffer";
 		ret = -EIO;
 		goto err_free_rx;
 	}
 
 	/* TX buffer */
-	dma->tx_addr = dma_map_single(dma->tx_chan->device->dev,
+	dma->tx_addr = dma_map_single(tx_dev,
 				      p->port.state->port.xmit_buf,
 				      UART_XMIT_SIZE,
 				      DMA_TO_DEVICE);
-	if (dma_mapping_error(dma->tx_chan->device->dev, dma->tx_addr)) {
+	if (dma_mapping_error(tx_dev, dma->tx_addr)) {
 		reason = "DMA mapping error for TX buffer";
 		ret = -EIO;
 		goto err_unmap_rx;
@@ -1123,7 +1126,7 @@ static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 	return 0;
 
 err_unmap_rx:
-	dma_unmap_single(dma->rx_chan->device->dev, dma->rx_addr,
+	dma_unmap_single(dmaengine_get_dma_device(dma->rx_chan), dma->rx_addr,
 			 dma->rx_size, DMA_FROM_DEVICE);
 err_free_rx:
 	kfree(dma->rx_buf);
@@ -1143,7 +1146,7 @@ static void s3c24xx_serial_release_dma(struct s3c24xx_uart_port *p)
 
 	if (dma->rx_chan) {
 		dmaengine_terminate_all(dma->rx_chan);
-		dma_unmap_single(dma->rx_chan->device->dev, dma->rx_addr,
+		dma_unmap_single(dmaengine_get_dma_device(dma->rx_chan), dma->rx_addr,
 				 dma->rx_size, DMA_FROM_DEVICE);
 		kfree(dma->rx_buf);
 		dma_release_channel(dma->rx_chan);
@@ -1152,7 +1155,7 @@ static void s3c24xx_serial_release_dma(struct s3c24xx_uart_port *p)
 
 	if (dma->tx_chan) {
 		dmaengine_terminate_all(dma->tx_chan);
-		dma_unmap_single(dma->tx_chan->device->dev, dma->tx_addr,
+		dma_unmap_single(dmaengine_get_dma_device(dma->tx_chan), dma->tx_addr,
 				 UART_XMIT_SIZE, DMA_TO_DEVICE);
 		dma_release_channel(dma->tx_chan);
 		dma->tx_chan = NULL;
@@ -1822,7 +1825,7 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
 
 	if (cfg->uart_flags & UPF_CONS_FLOW) {
 		dev_dbg(port->dev, "enabling flow control\n");
-		port->flags |= UPF_CONS_FLOW;
+		uart_set_cons_flow_enabled(port, true);
 	}
 
 	/* sort our the physical and virtual addresses for each UART */

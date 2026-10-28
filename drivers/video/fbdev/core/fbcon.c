@@ -70,7 +70,6 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/fb.h>
-#include <linux/fbcon.h>
 #include <linux/vt_kern.h>
 #include <linux/selection.h>
 #include <linux/font.h>
@@ -79,7 +78,6 @@
 #include <linux/interrupt.h>
 #include <linux/crc32.h> /* For counting font checksums */
 #include <linux/uaccess.h>
-#include <linux/vga_switcheroo.h>
 #include <asm/irq.h>
 
 #include "fbcon.h"
@@ -446,44 +444,21 @@ static void fbcon_del_cursor_work(struct fb_info *info)
 	cancel_delayed_work_sync(&par->cursor_work);
 }
 
-void fbcon_fill_cursor_mask(struct fbcon_par *par, struct vc_data *vc, unsigned char *mask)
+unsigned char *fbcon_cursor_glyph(const struct vc_font *font, unsigned int cursor_type)
 {
-	static const unsigned int pattern = 0xffffffff;
-	unsigned int pitch = vc_font_pitch(&vc->vc_font);
-	unsigned int cur_height, size;
+	unsigned int height = font->height;
+	unsigned int cursor_size = vc_cursor_valid_size(CUR_SIZE(cursor_type));
+	unsigned char *glyph;
 
-	switch (CUR_SIZE(vc->vc_cursor_type)) {
-	case CUR_NONE:
-		cur_height = 0;
-		break;
-	case CUR_UNDERLINE:
-		if (vc->vc_font.height < 10)
-			cur_height = 1;
-		else
-			cur_height = 2;
-		break;
-	case CUR_LOWER_THIRD:
-		cur_height = vc->vc_font.height / 3;
-		break;
-	case CUR_LOWER_HALF:
-		cur_height = vc->vc_font.height / 2;
-		break;
-	case CUR_TWO_THIRDS:
-		cur_height = (vc->vc_font.height * 2) / 3;
-		break;
-	case CUR_BLOCK:
-	default:
-		cur_height = vc->vc_font.height;
-		break;
-	}
+	glyph = kmalloc_array(height, vc_font_pitch(font), GFP_ATOMIC);
+	if (!glyph)
+		return NULL;
 
-	size = (vc->vc_font.height - cur_height) * pitch;
-	while (size--)
-		*mask++ = (unsigned char)~pattern;
+	font_glyph_cursor(font->width, height,
+			  vc_cursor_start(height, cursor_size),
+			  vc_cursor_end(height, cursor_size), glyph);
 
-	size = cur_height * pitch;
-	while (size--)
-		*mask++ = (unsigned char)pattern;
+	return glyph;
 }
 
 #ifndef MODULE
@@ -661,6 +636,13 @@ static void fbcon_prepare_logo(struct vc_data *vc, struct fb_info *info,
 		erase &= ~0x400;
 	logo_height = fb_prepare_logo(info, par->rotate);
 	logo_lines = DIV_ROUND_UP(logo_height, vc->vc_font.height);
+	logo_lines = min(logo_lines, rows);
+	logo_lines = min(logo_lines, new_rows - 1);
+	if (logo_lines <= 0) {
+		logo_lines = 0;
+		logo_shown = FBCON_LOGO_DONTSHOW;
+		return;
+	}
 	q = (unsigned short *) (vc->vc_origin +
 				vc->vc_size_row * rows);
 	step = logo_lines * cols;
@@ -769,7 +751,7 @@ static int fbcon_invalid_charcount(struct fb_info *info, unsigned charcount)
 	return 0;
 }
 
-#endif /* CONFIG_MISC_TILEBLITTING */
+#endif /* CONFIG_FB_TILEBLITTING */
 
 static void fbcon_release(struct fb_info *info)
 {
@@ -1274,6 +1256,7 @@ static void fbcon_deinit(struct vc_data *vc)
 	int idx;
 
 	fbcon_free_font(p);
+	p->mode = NULL;
 	idx = con2fb_map[vc->vc_num];
 
 	if (idx == -1)
@@ -1440,17 +1423,16 @@ static void fbcon_set_disp(struct fb_info *info, struct fb_var_screeninfo *var,
 	struct vc_data **default_mode, *vc;
 	struct vc_data *svc;
 	struct fbcon_par *par = info->fbcon_par;
-	int rows, cols;
-	unsigned long ret = 0;
+	int rows, cols, ret;
 
 	p = &fb_display[unit];
-
-	if (var_to_display(p, var, info))
-		return;
 
 	vc = vc_cons[unit].d;
 
 	if (!vc)
+		return;
+
+	if (var_to_display(p, var, info))
 		return;
 
 	default_mode = vc->vc_display_fg;
@@ -2407,6 +2389,11 @@ static int fbcon_do_set_font(struct vc_data *vc, int w, int h, int charcount,
 	int resize, ret, old_width, old_height, old_charcount;
 	font_data_t *old_fontdata = p->fontdata;
 	const u8 *old_data = vc->vc_font.data;
+	unsigned short old_hi_font_mask = vc->vc_hi_font_mask;
+#ifdef CONFIG_FRAMEBUFFER_CONSOLE_ROTATION
+	struct fbcon_rotated saved_rotated = { };
+	bool rotated_saved = false;
+#endif
 
 	font_data_get(data);
 
@@ -2425,6 +2412,27 @@ static int fbcon_do_set_font(struct vc_data *vc, int w, int h, int charcount,
 	else if (!vc->vc_hi_font_mask && charcount == 512)
 		set_vc_hi_font(vc, true);
 
+	/*
+	 * Select the console's blitting state and update par->rotated to
+	 * match the new font, so that the rendering below does not use a
+	 * cache that was built for the old font. Clear the cached state so
+	 * the rebuild allocates a fresh buffer; the old state is kept until
+	 * the font change can no longer fail.
+	 */
+	if (con_is_visible(vc)) {
+		set_blitting_type(vc, info);
+		if (par->bitops->rotate_font) {
+#ifdef CONFIG_FRAMEBUFFER_CONSOLE_ROTATION
+			saved_rotated = par->rotated;
+			memset(&par->rotated, 0, sizeof(par->rotated));
+			rotated_saved = true;
+#endif
+			ret = par->bitops->rotate_font(info, vc);
+			if (ret)
+				goto err_out;
+		}
+	}
+
 	if (resize) {
 		int cols, rows;
 
@@ -2441,17 +2449,44 @@ static int fbcon_do_set_font(struct vc_data *vc, int w, int h, int charcount,
 		update_screen(vc);
 	}
 
+#ifdef CONFIG_FRAMEBUFFER_CONSOLE_ROTATION
+	if (rotated_saved)
+		kfree(saved_rotated.buf);
+#endif
 	if (old_fontdata)
 		font_data_put(old_fontdata);
 
 	return 0;
 
 err_out:
+#ifdef CONFIG_FRAMEBUFFER_CONSOLE_ROTATION
+	/*
+	 * Drop the buffer built for the new font and restore the saved
+	 * state.
+	 */
+	if (rotated_saved) {
+		kfree(par->rotated.buf);
+		par->rotated = saved_rotated;
+	}
+#endif
 	p->fontdata = old_fontdata;
 	vc->vc_font.data = old_data;
 	vc->vc_font.width = old_width;
 	vc->vc_font.height = old_height;
 	vc->vc_font.charcount = old_charcount;
+
+	/* Restore the hi_font state and screen buffer */
+	if (old_hi_font_mask && !vc->vc_hi_font_mask)
+		set_vc_hi_font(vc, true);
+	else if (!old_hi_font_mask && vc->vc_hi_font_mask)
+		set_vc_hi_font(vc, false);
+
+	/*
+	 * Re-select the blitting type, which re-uploads the font map on
+	 * tile-blitting hardware.
+	 */
+	if (con_is_visible(vc))
+		set_blitting_type(vc, info);
 
 	font_data_put(data);
 
@@ -2602,8 +2637,9 @@ void fbcon_suspended(struct fb_info *info)
 		return;
 	vc = vc_cons[par->currcon].d;
 
-	/* Clear cursor, restore saved data */
-	fbcon_cursor(vc, false);
+	/* Clear cursor, restore saved data when in text mode */
+	if ((vc->vc_mode == KD_TEXT) && con_is_visible(vc))
+		fbcon_cursor(vc, false);
 }
 
 void fbcon_resumed(struct fb_info *info)
@@ -2615,7 +2651,9 @@ void fbcon_resumed(struct fb_info *info)
 		return;
 	vc = vc_cons[par->currcon].d;
 
-	update_screen(vc);
+	/* Update screen when in text mode only */
+	if ((vc->vc_mode == KD_TEXT) && con_is_visible(vc))
+		update_screen(vc);
 }
 
 static void fbcon_modechanged(struct fb_info *info)
@@ -2632,8 +2670,30 @@ static void fbcon_modechanged(struct fb_info *info)
 	    fbcon_info_from_console(par->currcon) != info)
 		return;
 
+	/*
+	 * Clear the selection before switching bitops.  Without this, the
+	 * clear_selection() inside vc_resize() below repaints the highlighted
+	 * cells through the new bitops while the console geometry(vc_rows/vc_cols)
+	 * has not been updated to match, so the repaint is computed from a
+	 * half-switched geometry and overflows the framebuffer address.
+	 * Pre-clearing makes that repaint a no-op.
+	 */
+	clear_selection();
+
 	p = &fb_display[vc->vc_num];
 	set_blitting_type(vc, info);
+
+	/*
+	 * Rebuild par->rotated.buf for the new rotation now that bitops have
+	 * switched.  The new putcs/cursor ops read this buffer; if it is still
+	 * sized for the old rotation, fbcon_putcs() and the cursor path reached
+	 * via update_screen() below overflow it.  Mirrors fbcon_switch(); fall
+	 * back to unrotated rendering on allocation failure.
+	 */
+	if (par->bitops->rotate_font && par->bitops->rotate_font(info, vc)) {
+		par->rotate = FB_ROTATE_UR;
+		set_blitting_type(vc, info);
+	}
 
 	if (con_is_visible(vc)) {
 		var_to_display(p, &info->var, info);
@@ -2665,6 +2725,9 @@ static void fbcon_set_all_vcs(struct fb_info *info)
 
 	if (!par || par->currcon < 0)
 		return;
+
+	/* See the comment in fbcon_modechanged(). */
+	clear_selection();
 
 	for (i = first_fb_vc; i <= last_fb_vc; i++) {
 		vc = vc_cons[i].d;
@@ -2699,7 +2762,6 @@ void fbcon_update_vcs(struct fb_info *info, bool all)
 	else
 		fbcon_modechanged(info);
 }
-EXPORT_SYMBOL(fbcon_update_vcs);
 
 /* let fbcon check if it supports a new screen resolution */
 int fbcon_modechange_possible(struct fb_info *info, struct fb_var_screeninfo *var)
@@ -2727,7 +2789,6 @@ int fbcon_modechange_possible(struct fb_info *info, struct fb_var_screeninfo *va
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(fbcon_modechange_possible);
 
 int fbcon_mode_deleted(struct fb_info *info,
 		       struct fb_videomode *mode)
@@ -2843,9 +2904,6 @@ void fbcon_fb_unregistered(struct fb_info *info)
 	int i, idx;
 
 	console_lock();
-
-	if (info->device && dev_is_pci(info->device))
-		vga_switcheroo_client_fb_set(to_pci_dev(info->device), NULL);
 
 	fbcon_registered_fb[info->node] = NULL;
 	fbcon_num_registered_fb--;
@@ -2979,10 +3037,6 @@ static int do_fb_registered(struct fb_info *info)
 				set_con2fb_map(i, idx, 0);
 		}
 	}
-
-	/* Set the fb info for vga_switcheroo clients. Does nothing otherwise. */
-	if (info->device && dev_is_pci(info->device))
-		vga_switcheroo_client_fb_set(to_pci_dev(info->device), info);
 
 	return ret;
 }

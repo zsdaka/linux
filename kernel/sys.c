@@ -1077,6 +1077,9 @@ SYSCALL_DEFINE1(times, struct tms __user *, tbuf)
 #ifdef CONFIG_COMPAT
 static compat_clock_t clock_t_to_compat_clock_t(clock_t x)
 {
+	if (USER_HZ == COMPAT_USER_HZ)
+		return x;
+
 	return compat_jiffies_to_clock_t(clock_t_to_jiffies(x));
 }
 
@@ -2189,7 +2192,7 @@ static int prctl_set_auxv(struct mm_struct *mm, unsigned long addr,
 	BUILD_BUG_ON(sizeof(user_auxv) != sizeof(mm->saved_auxv));
 
 	task_lock(current);
-	memcpy(mm->saved_auxv, user_auxv, len);
+	memcpy(mm->saved_auxv, user_auxv, sizeof(user_auxv));
 	task_unlock(current);
 
 	return 0;
@@ -2565,14 +2568,14 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		error = put_user(me->pdeath_signal, (int __user *)arg2);
 		break;
 	case PR_GET_DUMPABLE:
-		error = get_dumpable(me->mm);
+		error = task_exec_state_get_dumpable(me);
 		break;
 	case PR_SET_DUMPABLE:
-		if (arg2 != SUID_DUMP_DISABLE && arg2 != SUID_DUMP_USER) {
+		if (arg2 != TASK_DUMPABLE_OFF && arg2 != TASK_DUMPABLE_OWNER) {
 			error = -EINVAL;
 			break;
 		}
-		set_dumpable(me->mm, arg2);
+		task_exec_state_set_dumpable(arg2);
 		break;
 
 	case PR_SET_UNALIGN:

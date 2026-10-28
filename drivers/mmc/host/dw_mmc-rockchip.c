@@ -327,7 +327,7 @@ static int dw_mci_rk3288_execute_tuning(struct dw_mci *host, u32 opcode)
 						i,
 						priv->num_phases));
 
-		v = !mmc_send_tuning(mmc, opcode, NULL);
+		v = !mmc_send_tuning_timeout(mmc, opcode, NULL, 5);
 
 		if (i == 0)
 			first_v = v;
@@ -441,6 +441,22 @@ static int dw_mci_common_parse_dt(struct dw_mci *host)
 	return 0;
 }
 
+static int dw_mci_rk2928_parse_dt(struct dw_mci *host)
+{
+	struct dw_mci_rockchip_priv_data *priv;
+	int err;
+
+	err = dw_mci_common_parse_dt(host);
+	if (err)
+		return err;
+
+	priv = host->priv;
+
+	priv->internal_phase = false;
+
+	return 0;
+}
+
 static int dw_mci_rk3288_parse_dt(struct dw_mci *host)
 {
 	struct dw_mci_rockchip_priv_data *priv;
@@ -514,6 +530,7 @@ static int dw_mci_rockchip_init(struct dw_mci *host)
 
 static const struct dw_mci_drv_data rk2928_drv_data = {
 	.init			= dw_mci_rockchip_init,
+	.parse_dt		= dw_mci_rk2928_parse_dt,
 };
 
 static const struct dw_mci_drv_data rk3288_drv_data = {

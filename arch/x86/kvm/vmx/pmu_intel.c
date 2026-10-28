@@ -15,6 +15,7 @@
 #include <linux/perf_event.h>
 #include <asm/msr.h>
 #include <asm/perf_event.h>
+#include <asm/cpuid/api.h>
 #include "x86.h"
 #include "cpuid.h"
 #include "lapic.h"
@@ -56,8 +57,16 @@ static struct x86_pmu_lbr *vcpu_to_lbr_records(struct kvm_vcpu *vcpu)
 
 static void reprogram_fixed_counters(struct kvm_pmu *pmu, u64 data)
 {
+	/*
+	 * Compare against the value the mediated PMU shoves into hardware, not
+	 * the guest's desired value.  For the emulated PMU (proxied via perf),
+	 * they are one and the same (fixed_ctr_ctrl_hw isn't used other than
+	 * here).  For the mediated PMU, KVM needs to reprogram the actual MSR,
+	 * and so needs to react to potential changes in the value shoved into
+	 * hardware, e.g. to ensure the event filter is enforced.
+	 */
+	u64 old_fixed_ctr_ctrl = pmu->fixed_ctr_ctrl_hw;
 	struct kvm_pmc *pmc;
-	u64 old_fixed_ctr_ctrl = pmu->fixed_ctr_ctrl;
 	int i;
 
 	pmu->fixed_ctr_ctrl = data;
@@ -178,6 +187,9 @@ static bool intel_is_valid_msr(struct kvm_vcpu *vcpu, u32 msr)
 	int ret;
 
 	switch (msr) {
+	case MSR_CORE_PERF_GLOBAL_STATUS:
+	case MSR_CORE_PERF_GLOBAL_CTRL:
+	case MSR_CORE_PERF_GLOBAL_OVF_CTRL:
 	case MSR_CORE_PERF_FIXED_CTR_CTRL:
 		return kvm_pmu_has_perf_global_ctrl(pmu);
 	case MSR_IA32_PEBS_ENABLE:
@@ -308,13 +320,15 @@ static bool intel_pmu_handle_lbr_msrs_access(struct kvm_vcpu *vcpu,
 	 */
 	local_irq_disable();
 	if (lbr_desc->event->state == PERF_EVENT_STATE_ACTIVE) {
+		int err = 0;
+
 		if (read)
 			rdmsrq(index, msr_info->data);
 		else
-			wrmsrq(index, msr_info->data);
+			err = wrmsrq_safe(index, msr_info->data);
 		__set_bit(INTEL_PMC_IDX_FIXED_VLBR, vcpu_to_pmu(vcpu)->pmc_in_use);
 		local_irq_enable();
-		return true;
+		return !err;
 	}
 	clear_bit(INTEL_PMC_IDX_FIXED_VLBR, vcpu_to_pmu(vcpu)->pmc_in_use);
 	local_irq_enable();
@@ -391,7 +405,7 @@ static int intel_pmu_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		if (pmu->pebs_enable != data) {
 			diff = pmu->pebs_enable ^ data;
 			pmu->pebs_enable = data;
-			reprogram_counters(pmu, diff);
+			kvm_pmu_request_counters_reprogram(pmu, diff);
 		}
 		break;
 	case MSR_IA32_DS_AREA:
@@ -736,24 +750,36 @@ static void intel_pmu_cleanup(struct kvm_vcpu *vcpu)
 		intel_pmu_release_guest_lbr_event(vcpu);
 }
 
-void intel_pmu_cross_mapped_check(struct kvm_pmu *pmu)
+u64 __intel_pmu_compute_pebs_enable(struct kvm_pmu *pmu)
 {
-	struct kvm_pmc *pmc = NULL;
+	u64 guest_pebs_enable = pmu->pebs_enable & pmu->global_ctrl;
+	u64 pebs_enable = 0;
+	struct kvm_pmc *pmc;
 	int bit, hw_idx;
 
-	kvm_for_each_pmc(pmu, pmc, bit, (unsigned long *)&pmu->global_ctrl) {
-		if (!pmc_is_locally_enabled(pmc) ||
-		    !pmc_is_globally_enabled(pmc) || !pmc->perf_event)
+	/*
+	 * Omit counters that are locally disabled, don't have a perf event, or
+	 * ended up with a perf event that is using a different counter than
+	 * the guest, i.e. where the guest PMC is different than the host PMC
+	 * being used on behalf of the guest.  PEBS records include
+	 * PERF_GLOBAL_STATUS, and so using a counter with a different index
+	 * means the guest will see overflow status for the wrong counter(s).
+	 */
+	kvm_for_each_pmc(pmu, pmc, bit, (unsigned long *)&guest_pebs_enable) {
+		if (!pmc_is_locally_enabled(pmc) || !pmc->perf_event)
 			continue;
 
 		/*
-		 * A negative index indicates the event isn't mapped to a
+		 * Note, a negative index indicates the event isn't mapped to a
 		 * physical counter in the host, e.g. due to contention.
 		 */
 		hw_idx = pmc->perf_event->hw.idx;
-		if (hw_idx != pmc->idx && hw_idx > -1)
-			pmu->host_cross_mapped_mask |= BIT_ULL(hw_idx);
+		if (hw_idx != pmc->idx)
+			continue;
+
+		pebs_enable |= BIT_ULL(pmc->idx);
 	}
+	return pebs_enable;
 }
 
 static bool intel_pmu_is_mediated_pmu_supported(struct x86_pmu_capability *host_pmu)
@@ -784,7 +810,6 @@ static void intel_pmu_write_global_ctrl(u64 global_ctrl)
 {
 	vmcs_write64(GUEST_IA32_PERF_GLOBAL_CTRL, global_ctrl);
 }
-
 
 static void intel_mediated_pmu_load(struct kvm_vcpu *vcpu)
 {

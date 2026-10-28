@@ -410,9 +410,16 @@ static void ublk_batch_compl_commit_cmd(struct ublk_thread *t,
 {
 	unsigned short buf_idx = user_data_to_tag(cqe->user_data);
 
-	if (op == _IOC_NR(UBLK_U_IO_PREP_IO_CMDS))
-		ublk_assert(cqe->res == 0);
-	else if (op == _IOC_NR(UBLK_U_IO_COMMIT_IO_CMDS)) {
+	if (op == _IOC_NR(UBLK_U_IO_PREP_IO_CMDS)) {
+		/* e.g. UBLK_IO_RES_ABORT after STOP_DEV: stop like a FETCH */
+		if (cqe->res < 0) {
+			ublk_dbg(UBLK_DBG_IO_CMD, "%s: prep failed %d\n",
+				 __func__, cqe->res);
+			t->state |= UBLKS_T_STOPPING;
+		} else {
+			ublk_assert(cqe->res == 0);
+		}
+	} else if (op == _IOC_NR(UBLK_U_IO_COMMIT_IO_CMDS)) {
 		int nr_elem = user_data_to_tgt_data(cqe->user_data);
 
 		ublk_assert(cqe->res == t->commit_buf_elem_size * nr_elem);
@@ -535,7 +542,7 @@ void ublk_batch_complete_io(struct ublk_thread *t, struct ublk_queue *q,
 
 	elem = (struct ublk_batch_elem *)(cb->elem + cb->done * t->commit_buf_elem_size);
 	elem->tag = tag;
-	elem->buf_index = ublk_batch_io_buf_idx(t, q, tag);
+	elem->buf_index = ublk_batch_io_buf_idx_next(t, q, tag);
 	elem->result = res;
 
 	if (!ublk_queue_no_buf(q))

@@ -438,7 +438,6 @@ struct address_space_operations {
 	int (*swap_activate)(struct swap_info_struct *sis, struct file *file,
 				sector_t *span);
 	void (*swap_deactivate)(struct file *file);
-	int (*swap_rw)(struct kiocb *iocb, struct iov_iter *iter);
 };
 
 extern const struct address_space_operations empty_aops;
@@ -460,7 +459,6 @@ struct mapping_metadata_bhs {
  *   memory mappings.
  * @gfp_mask: Memory allocation flags to use for allocating pages.
  * @i_mmap_writable: Number of VM_SHARED, VM_MAYWRITE mappings.
- * @nr_thps: Number of THPs in the pagecache (non-shmem only).
  * @i_mmap: Tree of private and shared mappings.
  * @i_mmap_rwsem: Protects @i_mmap and @i_mmap_writable.
  * @nrpages: Number of page entries, protected by the i_pages lock.
@@ -476,10 +474,6 @@ struct address_space {
 	struct rw_semaphore	invalidate_lock;
 	gfp_t			gfp_mask;
 	atomic_t		i_mmap_writable;
-#ifdef CONFIG_READ_ONLY_THP_FOR_FS
-	/* number of thp, only for non-shmem files */
-	atomic_t		nr_thps;
-#endif
 	struct rb_root_cached	i_mmap;
 	unsigned long		nrpages;
 	pgoff_t			writeback_index;
@@ -745,7 +739,8 @@ enum inode_state_flags_enum {
 	I_CREATING		= (1U << 15),
 	I_DONTCACHE		= (1U << 16),
 	I_SYNC_QUEUED		= (1U << 17),
-	I_PINNING_NETFS_WB	= (1U << 18)
+	I_PINNING_NETFS_WB	= (1U << 18),
+	I_METADATA_WRITEBACK	= (1U << 19),
 };
 
 #define I_DIRTY_INODE (I_DIRTY_SYNC | I_DIRTY_DATASYNC)
@@ -1441,10 +1436,10 @@ static inline void i_gid_write(struct inode *inode, gid_t gid)
  * @idmap: idmap of the mount the inode was found from
  * @inode: inode to map
  *
- * Return: whe inode's i_uid mapped down according to @idmap.
+ * Return: the inode's i_uid mapped down according to @idmap.
  * If the inode's i_uid has no mapping INVALID_VFSUID is returned.
  */
-static inline vfsuid_t i_uid_into_vfsuid(struct mnt_idmap *idmap,
+static inline vfsuid_t i_uid_into_vfsuid(const struct mnt_idmap *idmap,
 					 const struct inode *inode)
 {
 	return make_vfsuid(idmap, i_user_ns(inode), inode->i_uid);
@@ -1461,7 +1456,7 @@ static inline vfsuid_t i_uid_into_vfsuid(struct mnt_idmap *idmap,
  *
  * Return: true if @inode's i_uid field needs to be updated, false if not.
  */
-static inline bool i_uid_needs_update(struct mnt_idmap *idmap,
+static inline bool i_uid_needs_update(const struct mnt_idmap *idmap,
 				      const struct iattr *attr,
 				      const struct inode *inode)
 {
@@ -1479,7 +1474,7 @@ static inline bool i_uid_needs_update(struct mnt_idmap *idmap,
  * Safely update @inode's i_uid field translating the vfsuid of any idmapped
  * mount into the filesystem kuid.
  */
-static inline void i_uid_update(struct mnt_idmap *idmap,
+static inline void i_uid_update(const struct mnt_idmap *idmap,
 				const struct iattr *attr,
 				struct inode *inode)
 {
@@ -1496,7 +1491,7 @@ static inline void i_uid_update(struct mnt_idmap *idmap,
  * Return: the inode's i_gid mapped down according to @idmap.
  * If the inode's i_gid has no mapping INVALID_VFSGID is returned.
  */
-static inline vfsgid_t i_gid_into_vfsgid(struct mnt_idmap *idmap,
+static inline vfsgid_t i_gid_into_vfsgid(const struct mnt_idmap *idmap,
 					 const struct inode *inode)
 {
 	return make_vfsgid(idmap, i_user_ns(inode), inode->i_gid);
@@ -1513,7 +1508,7 @@ static inline vfsgid_t i_gid_into_vfsgid(struct mnt_idmap *idmap,
  *
  * Return: true if @inode's i_gid field needs to be updated, false if not.
  */
-static inline bool i_gid_needs_update(struct mnt_idmap *idmap,
+static inline bool i_gid_needs_update(const struct mnt_idmap *idmap,
 				      const struct iattr *attr,
 				      const struct inode *inode)
 {
@@ -1531,7 +1526,7 @@ static inline bool i_gid_needs_update(struct mnt_idmap *idmap,
  * Safely update @inode's i_gid field translating the vfsgid of any idmapped
  * mount into the filesystem kgid.
  */
-static inline void i_gid_update(struct mnt_idmap *idmap,
+static inline void i_gid_update(const struct mnt_idmap *idmap,
 				const struct iattr *attr,
 				struct inode *inode)
 {
@@ -1549,7 +1544,7 @@ static inline void i_gid_update(struct mnt_idmap *idmap,
  * an idmapped mount map the caller's fsuid according to @idmap.
  */
 static inline void inode_fsuid_set(struct inode *inode,
-				   struct mnt_idmap *idmap)
+				   const struct mnt_idmap *idmap)
 {
 	inode->i_uid = mapped_fsuid(idmap, i_user_ns(inode));
 }
@@ -1563,7 +1558,7 @@ static inline void inode_fsuid_set(struct inode *inode,
  * an idmapped mount map the caller's fsgid according to @idmap.
  */
 static inline void inode_fsgid_set(struct inode *inode,
-				   struct mnt_idmap *idmap)
+				   const struct mnt_idmap *idmap)
 {
 	inode->i_gid = mapped_fsgid(idmap, i_user_ns(inode));
 }
@@ -1580,7 +1575,7 @@ static inline void inode_fsgid_set(struct inode *inode,
  * Return: true if fsuid and fsgid is mapped, false if not.
  */
 static inline bool fsuidgid_has_mapping(struct super_block *sb,
-					struct mnt_idmap *idmap)
+					const struct mnt_idmap *idmap)
 {
 	struct user_namespace *fs_userns = sb->s_user_ns;
 	kuid_t kuid;
@@ -1603,12 +1598,12 @@ struct timespec64 inode_set_ctime_deleg(struct inode *inode,
 
 static inline time64_t inode_get_atime_sec(const struct inode *inode)
 {
-	return inode->i_atime_sec;
+	return READ_ONCE(inode->i_atime_sec);
 }
 
 static inline long inode_get_atime_nsec(const struct inode *inode)
 {
-	return inode->i_atime_nsec;
+	return READ_ONCE(inode->i_atime_nsec);
 }
 
 static inline struct timespec64 inode_get_atime(const struct inode *inode)
@@ -1622,8 +1617,8 @@ static inline struct timespec64 inode_get_atime(const struct inode *inode)
 static inline struct timespec64 inode_set_atime_to_ts(struct inode *inode,
 						      struct timespec64 ts)
 {
-	inode->i_atime_sec = ts.tv_sec;
-	inode->i_atime_nsec = ts.tv_nsec;
+	WRITE_ONCE(inode->i_atime_sec, ts.tv_sec);
+	WRITE_ONCE(inode->i_atime_nsec, ts.tv_nsec);
 	return ts;
 }
 
@@ -1638,12 +1633,12 @@ static inline struct timespec64 inode_set_atime(struct inode *inode,
 
 static inline time64_t inode_get_mtime_sec(const struct inode *inode)
 {
-	return inode->i_mtime_sec;
+	return READ_ONCE(inode->i_mtime_sec);
 }
 
 static inline long inode_get_mtime_nsec(const struct inode *inode)
 {
-	return inode->i_mtime_nsec;
+	return READ_ONCE(inode->i_mtime_nsec);
 }
 
 static inline struct timespec64 inode_get_mtime(const struct inode *inode)
@@ -1656,8 +1651,8 @@ static inline struct timespec64 inode_get_mtime(const struct inode *inode)
 static inline struct timespec64 inode_set_mtime_to_ts(struct inode *inode,
 						      struct timespec64 ts)
 {
-	inode->i_mtime_sec = ts.tv_sec;
-	inode->i_mtime_nsec = ts.tv_nsec;
+	WRITE_ONCE(inode->i_mtime_sec, ts.tv_sec);
+	WRITE_ONCE(inode->i_mtime_nsec, ts.tv_nsec);
 	return ts;
 }
 
@@ -1682,12 +1677,12 @@ static inline struct timespec64 inode_set_mtime(struct inode *inode,
 
 static inline time64_t inode_get_ctime_sec(const struct inode *inode)
 {
-	return inode->i_ctime_sec;
+	return READ_ONCE(inode->i_ctime_sec);
 }
 
 static inline long inode_get_ctime_nsec(const struct inode *inode)
 {
-	return inode->i_ctime_nsec & ~I_CTIME_QUERIED;
+	return READ_ONCE(inode->i_ctime_nsec) & ~I_CTIME_QUERIED;
 }
 
 static inline struct timespec64 inode_get_ctime(const struct inode *inode)
@@ -1760,25 +1755,25 @@ static inline bool file_write_not_started(const struct file *file)
 	return sb_write_not_started(file_inode(file)->i_sb);
 }
 
-bool inode_owner_or_capable(struct mnt_idmap *idmap,
+bool inode_owner_or_capable(const struct mnt_idmap *idmap,
 			    const struct inode *inode);
 
 /*
  * VFS helper functions..
  */
-int vfs_create(struct mnt_idmap *, struct dentry *, umode_t,
+int vfs_create(const struct mnt_idmap *, struct dentry *, umode_t,
 	       struct delegated_inode *);
-struct dentry *vfs_mkdir(struct mnt_idmap *, struct inode *,
+struct dentry *vfs_mkdir(const struct mnt_idmap *, struct inode *,
 			 struct dentry *, umode_t, struct delegated_inode *);
-int vfs_mknod(struct mnt_idmap *, struct inode *, struct dentry *,
+int vfs_mknod(const struct mnt_idmap *, struct inode *, struct dentry *,
 	      umode_t, dev_t, struct delegated_inode *);
-int vfs_symlink(struct mnt_idmap *, struct inode *,
+int vfs_symlink(const struct mnt_idmap *, struct inode *,
 		struct dentry *, const char *, struct delegated_inode *);
-int vfs_link(struct dentry *, struct mnt_idmap *, struct inode *,
+int vfs_link(struct dentry *, const struct mnt_idmap *, struct inode *,
 	     struct dentry *, struct delegated_inode *);
-int vfs_rmdir(struct mnt_idmap *, struct inode *, struct dentry *,
+int vfs_rmdir(const struct mnt_idmap *, struct inode *, struct dentry *,
 	      struct delegated_inode *);
-int vfs_unlink(struct mnt_idmap *, struct inode *, struct dentry *,
+int vfs_unlink(const struct mnt_idmap *, struct inode *, struct dentry *,
 	       struct delegated_inode *);
 
 /**
@@ -1792,7 +1787,7 @@ int vfs_unlink(struct mnt_idmap *, struct inode *, struct dentry *,
  * @flags:             rename flags
  */
 struct renamedata {
-	struct mnt_idmap *mnt_idmap;
+	const struct mnt_idmap *mnt_idmap;
 	struct dentry *old_parent;
 	struct dentry *old_dentry;
 	struct dentry *new_parent;
@@ -1803,14 +1798,14 @@ struct renamedata {
 
 int vfs_rename(struct renamedata *);
 
-static inline int vfs_whiteout(struct mnt_idmap *idmap,
+static inline int vfs_whiteout(const struct mnt_idmap *idmap,
 			       struct inode *dir, struct dentry *dentry)
 {
 	return vfs_mknod(idmap, dir, dentry, S_IFCHR | WHITEOUT_MODE,
 			 WHITEOUT_DEV, NULL);
 }
 
-struct file *kernel_tmpfile_open(struct mnt_idmap *idmap,
+struct file *kernel_tmpfile_open(const struct mnt_idmap *idmap,
 				 const struct path *parentpath,
 				 umode_t mode, int open_flag,
 				 const struct cred *cred);
@@ -1835,12 +1830,12 @@ extern long compat_ptr_ioctl(struct file *file, unsigned int cmd,
 /*
  * VFS file helper functions.
  */
-void inode_init_owner(struct mnt_idmap *idmap, struct inode *inode,
+void inode_init_owner(const struct mnt_idmap *idmap, struct inode *inode,
 		      const struct inode *dir, umode_t mode);
 extern bool may_open_dev(const struct path *path);
-umode_t mode_strip_sgid(struct mnt_idmap *idmap,
+umode_t mode_strip_sgid(const struct mnt_idmap *idmap,
 			const struct inode *dir, umode_t mode);
-bool in_group_or_capable(struct mnt_idmap *idmap,
+bool in_group_or_capable(const struct mnt_idmap *idmap,
 			 const struct inode *inode, vfsgid_t vfsgid);
 
 /*
@@ -1919,9 +1914,8 @@ struct dir_context {
 #define COPY_FILE_SPLICE		(1 << 0)
 
 struct io_uring_cmd;
+struct dma_buf_io_ctx;
 struct offset_ctx;
-
-typedef unsigned int __bitwise fop_flags_t;
 
 struct file_operations {
 	struct module *owner;
@@ -1967,6 +1961,7 @@ struct file_operations {
 	int (*uring_cmd_iopoll)(struct io_uring_cmd *, struct io_comp_batch *,
 				unsigned int poll_flags);
 	int (*mmap_prepare)(struct vm_area_desc *);
+	int (*init_dma_buf_io_ctx)(struct file *, struct dma_buf_io_ctx *);
 } __randomize_layout;
 
 /* Supports async buffered reads */
@@ -1985,6 +1980,8 @@ struct file_operations {
 #define FOP_ASYNC_LOCK		((__force fop_flags_t)(1 << 6))
 /* File system supports uncached read/write buffered IO */
 #define FOP_DONTCACHE		((__force fop_flags_t)(1 << 7))
+/* Never changes and is never removed, readdir of a directory takes no lock */
+#define FOP_IMMUTABLE		((__force fop_flags_t)(1 << 8))
 
 /* Wrap a directory iterator that needs exclusive inode access */
 int wrap_directory_iterator(struct file *, struct dir_context *,
@@ -2001,26 +1998,26 @@ enum fs_update_time {
 struct inode_operations {
 	struct dentry * (*lookup) (struct inode *,struct dentry *, unsigned int);
 	const char * (*get_link) (struct dentry *, struct inode *, struct delayed_call *);
-	int (*permission) (struct mnt_idmap *, struct inode *, int);
+	int (*permission) (const struct mnt_idmap *, struct inode *, int);
 	struct posix_acl * (*get_inode_acl)(struct inode *, int, bool);
 
 	int (*readlink) (struct dentry *, char __user *,int);
 
-	int (*create) (struct mnt_idmap *, struct inode *,struct dentry *,
-		       umode_t, bool);
+	int (*create) (const struct mnt_idmap *, struct inode *,struct dentry *,
+		       umode_t);
 	int (*link) (struct dentry *,struct inode *,struct dentry *);
 	int (*unlink) (struct inode *,struct dentry *);
-	int (*symlink) (struct mnt_idmap *, struct inode *,struct dentry *,
+	int (*symlink) (const struct mnt_idmap *, struct inode *,struct dentry *,
 			const char *);
-	struct dentry *(*mkdir) (struct mnt_idmap *, struct inode *,
+	struct dentry *(*mkdir) (const struct mnt_idmap *, struct inode *,
 				 struct dentry *, umode_t);
 	int (*rmdir) (struct inode *,struct dentry *);
-	int (*mknod) (struct mnt_idmap *, struct inode *,struct dentry *,
+	int (*mknod) (const struct mnt_idmap *, struct inode *,struct dentry *,
 		      umode_t,dev_t);
-	int (*rename) (struct mnt_idmap *, struct inode *, struct dentry *,
+	int (*rename) (const struct mnt_idmap *, struct inode *, struct dentry *,
 			struct inode *, struct dentry *, unsigned int);
-	int (*setattr) (struct mnt_idmap *, struct dentry *, struct iattr *);
-	int (*getattr) (struct mnt_idmap *, const struct path *,
+	int (*setattr) (const struct mnt_idmap *, struct dentry *, struct iattr *);
+	int (*getattr) (const struct mnt_idmap *, const struct path *,
 			struct kstat *, u32, unsigned int);
 	ssize_t (*listxattr) (struct dentry *, char *, size_t);
 	int (*fiemap)(struct inode *, struct fiemap_extent_info *, u64 start,
@@ -2031,13 +2028,13 @@ struct inode_operations {
 	int (*atomic_open)(struct inode *, struct dentry *,
 			   struct file *, unsigned open_flag,
 			   umode_t create_mode);
-	int (*tmpfile) (struct mnt_idmap *, struct inode *,
+	int (*tmpfile) (const struct mnt_idmap *, struct inode *,
 			struct file *, umode_t);
-	struct posix_acl *(*get_acl)(struct mnt_idmap *, struct dentry *,
+	struct posix_acl *(*get_acl)(const struct mnt_idmap *, struct dentry *,
 				     int);
-	int (*set_acl)(struct mnt_idmap *, struct dentry *,
+	int (*set_acl)(const struct mnt_idmap *, struct dentry *,
 		       struct posix_acl *, int);
-	int (*fileattr_set)(struct mnt_idmap *idmap,
+	int (*fileattr_set)(const struct mnt_idmap *idmap,
 			    struct dentry *dentry, struct file_kattr *fa);
 	int (*fileattr_get)(struct dentry *dentry, struct file_kattr *fa);
 	struct offset_ctx *(*get_offset_ctx)(struct inode *inode);
@@ -2180,7 +2177,7 @@ extern loff_t vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
 				 (inode)->i_rdev == WHITEOUT_DEV)
 #define IS_ANON_FILE(inode)	((inode)->i_flags & S_ANON_INODE)
 
-static inline bool HAS_UNMAPPED_ID(struct mnt_idmap *idmap,
+static inline bool HAS_UNMAPPED_ID(const struct mnt_idmap *idmap,
 				   struct inode *inode)
 {
 	return !vfsuid_valid(i_uid_into_vfsuid(idmap, inode)) ||
@@ -2218,8 +2215,28 @@ static inline void mark_inode_dirty_sync(struct inode *inode)
 	__mark_inode_dirty(inode, I_DIRTY_SYNC);
 }
 
+static inline void set_inode_metadata_writeback(struct inode *inode)
+{
+	spin_lock(&inode->i_lock);
+	inode_state_set(inode, I_METADATA_WRITEBACK);
+	spin_unlock(&inode->i_lock);
+}
+
+/*
+ * returns the refcount on the inode. it can change arbitrarily.
+ */
+static inline int icount_read_once(const struct inode *inode)
+{
+	return atomic_read(&inode->i_count);
+}
+
+/*
+ * returns the refcount on the inode. The lock guarantees no 0->1 or 1->0 transitions
+ * of the count are going to take place, otherwise it changes arbitrarily.
+ */
 static inline int icount_read(const struct inode *inode)
 {
+	lockdep_assert_held(&inode->i_lock);
 	return atomic_read(&inode->i_count);
 }
 
@@ -2281,12 +2298,15 @@ struct file_system_type {
 #define FS_MGTIME		64	/* FS uses multigrain timestamps */
 #define FS_LBS			128	/* FS supports LBS */
 #define FS_POWER_FREEZE		256	/* Always freeze on suspend/hibernate */
+#define FS_USERNS_MOUNT_RESTRICTED 512	/* Restrict mount in userns if not already visible */
+#define FS_USERNS_DELEGATABLE	1024	/* Can be mounted inside userns from outside */
+#define FS_DISALLOW_NOTIFY	2048	/* No fsnotify marks on its objects */
 #define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
 	int (*init_fs_context)(struct fs_context *);
 	const struct fs_parameter_spec *parameters;
 	void (*kill_sb) (struct super_block *);
 	struct module *owner;
-	struct file_system_type * next;
+	struct hlist_node list;
 	struct hlist_head fs_supers;
 
 	struct lock_class_key s_lock_key;
@@ -2298,6 +2318,8 @@ struct file_system_type {
 	struct lock_class_key i_mutex_key;
 	struct lock_class_key invalidate_lock_key;
 	struct lock_class_key i_mutex_dir_key;
+
+	struct lock_class_key d_lookup_key;
 };
 
 #define MODULE_ALIAS_FS(NAME) MODULE_ALIAS("fs-" NAME)
@@ -2327,10 +2349,6 @@ void free_anon_bdev(dev_t);
 struct super_block *sget_fc(struct fs_context *fc,
 			    int (*test)(struct super_block *, struct fs_context *),
 			    int (*set)(struct super_block *, struct fs_context *));
-struct super_block *sget(struct file_system_type *type,
-			int (*test)(struct super_block *,void *),
-			int (*set)(struct super_block *,void *),
-			int flags, void *data);
 struct super_block *sget_dev(struct fs_context *fc, dev_t dev);
 
 /* Alas, no aliases. Too much hassle with bringing module.h everywhere */
@@ -2407,6 +2425,21 @@ static inline void super_set_sysfs_name_generic(struct super_block *sb, const ch
 extern void ihold(struct inode * inode);
 extern void iput(struct inode *);
 void iput_not_last(struct inode *);
+
+/**
+ * iput_if_not_last - drop an inode reference only if it is not the last one
+ * @inode: inode to put
+ *
+ * Returns true if the reference was dropped, false if this was the last
+ * reference and the caller must arrange for final iput() in a safe context.
+ */
+static inline bool __must_check iput_if_not_last(struct inode *inode)
+{
+	VFS_BUG_ON_INODE(inode_state_read_once(inode) & (I_FREEING | I_CLEAR), inode);
+	VFS_BUG_ON_INODE(icount_read_once(inode) < 1, inode);
+	return atomic_add_unless(&inode->i_count, -1, 1);
+}
+
 int inode_update_time(struct inode *inode, enum fs_update_time type,
 		unsigned int flags);
 int generic_update_time(struct inode *inode, enum fs_update_time type,
@@ -2433,9 +2466,14 @@ struct filename {
 static_assert(offsetof(struct filename, iname) % sizeof(long) == 0);
 static_assert(sizeof(struct filename) % 64 == 0);
 
-static inline struct mnt_idmap *file_mnt_idmap(const struct file *file)
+static inline const struct mnt_idmap *file_mnt_idmap(const struct file *file)
 {
 	return mnt_idmap(file->f_path.mnt);
+}
+
+static inline bool file_owner_or_capable(const struct file *file)
+{
+	return inode_owner_or_capable(file_mnt_idmap(file), file_inode(file));
 }
 
 /**
@@ -2452,7 +2490,7 @@ static inline bool is_idmapped_mnt(const struct vfsmount *mnt)
 }
 
 int vfs_truncate(const struct path *, loff_t);
-int do_truncate(struct mnt_idmap *, struct dentry *, loff_t start,
+int do_truncate(const struct mnt_idmap *, struct dentry *, loff_t start,
 		unsigned int time_attrs, struct file *filp);
 extern int vfs_fallocate(struct file *file, int mode, loff_t offset,
 			loff_t len);
@@ -2624,6 +2662,7 @@ extern int __must_check file_write_and_wait_range(struct file *file,
 						loff_t start, loff_t end);
 int filemap_flush_range(struct address_space *mapping, loff_t start,
 		loff_t end);
+void filemap_dontcache_kick_writeback(struct address_space *mapping);
 
 static inline int file_write_and_wait(struct file *file)
 {
@@ -2657,10 +2696,7 @@ static inline ssize_t generic_write_sync(struct kiocb *iocb, ssize_t count)
 		if (ret)
 			return ret;
 	} else if (iocb->ki_flags & IOCB_DONTCACHE) {
-		struct address_space *mapping = iocb->ki_filp->f_mapping;
-
-		filemap_flush_range(mapping, iocb->ki_pos - count,
-				iocb->ki_pos - 1);
+		filemap_dontcache_kick_writeback(iocb->ki_filp->f_mapping);
 	}
 
 	return count;
@@ -2678,10 +2714,10 @@ static inline int bmap(struct inode *inode,  sector_t *block)
 }
 #endif
 
-int notify_change(struct mnt_idmap *, struct dentry *,
+int notify_change(const struct mnt_idmap *, struct dentry *,
 		  struct iattr *, struct delegated_inode *);
-int inode_permission(struct mnt_idmap *, struct inode *, int);
-int generic_permission(struct mnt_idmap *, struct inode *, int);
+int inode_permission(const struct mnt_idmap *, struct inode *, int);
+int generic_permission(const struct mnt_idmap *, struct inode *, int);
 static inline int file_permission(struct file *file, int mask)
 {
 	return inode_permission(file_mnt_idmap(file),
@@ -2692,12 +2728,12 @@ static inline int path_permission(const struct path *path, int mask)
 	return inode_permission(mnt_idmap(path->mnt),
 				d_inode(path->dentry), mask);
 }
-int __check_sticky(struct mnt_idmap *idmap, struct inode *dir,
+int __check_sticky(const struct mnt_idmap *idmap, struct inode *dir,
 		   struct inode *inode);
 
-int may_delete_dentry(struct mnt_idmap *idmap, struct inode *dir,
+int may_delete_dentry(const struct mnt_idmap *idmap, struct inode *dir,
 		      struct dentry *victim, bool isdir);
-int may_create_dentry(struct mnt_idmap *idmap,
+int may_create_dentry(const struct mnt_idmap *idmap,
 		      struct inode *dir, struct dentry *child);
 
 static inline bool execute_ok(struct inode *inode)
@@ -3016,9 +3052,9 @@ static inline struct inode *new_inode_pseudo(struct super_block *sb)
 }
 extern struct inode *new_inode(struct super_block *sb);
 extern void free_inode_nonrcu(struct inode *inode);
-extern int setattr_should_drop_suidgid(struct mnt_idmap *, struct inode *);
+extern int setattr_should_drop_suidgid(const struct mnt_idmap *, struct inode *);
 extern int file_remove_privs(struct file *);
-int setattr_should_drop_sgid(struct mnt_idmap *idmap,
+int setattr_should_drop_sgid(const struct mnt_idmap *idmap,
 			     const struct inode *inode);
 
 /*
@@ -3175,7 +3211,7 @@ extern int page_symlink(struct inode *inode, const char *symname, int len);
 extern const struct inode_operations page_symlink_inode_operations;
 extern void kfree_link(void *);
 void fill_mg_cmtime(struct kstat *stat, u32 request_mask, struct inode *inode);
-void generic_fillattr(struct mnt_idmap *, u32, struct inode *, struct kstat *);
+void generic_fillattr(const struct mnt_idmap *, u32, struct inode *, struct kstat *);
 void generic_fill_statx_attr(struct inode *inode, struct kstat *stat);
 void generic_fill_statx_atomic_writes(struct kstat *stat,
 				      unsigned int unit_min,
@@ -3232,9 +3268,9 @@ extern int dcache_dir_open(struct inode *, struct file *);
 extern int dcache_dir_close(struct inode *, struct file *);
 extern loff_t dcache_dir_lseek(struct file *, loff_t, int);
 extern int dcache_readdir(struct file *, struct dir_context *);
-extern int simple_setattr(struct mnt_idmap *, struct dentry *,
+extern int simple_setattr(const struct mnt_idmap *, struct dentry *,
 			  struct iattr *);
-extern int simple_getattr(struct mnt_idmap *, const struct path *,
+extern int simple_getattr(const struct mnt_idmap *, const struct path *,
 			  struct kstat *, u32, unsigned int);
 extern int simple_statfs(struct dentry *, struct kstatfs *);
 extern int simple_open(struct inode *inode, struct file *file);
@@ -3247,7 +3283,7 @@ void simple_rename_timestamp(struct inode *old_dir, struct dentry *old_dentry,
 			     struct inode *new_dir, struct dentry *new_dentry);
 extern int simple_rename_exchange(struct inode *old_dir, struct dentry *old_dentry,
 				  struct inode *new_dir, struct dentry *new_dentry);
-extern int simple_rename(struct mnt_idmap *, struct inode *,
+extern int simple_rename(const struct mnt_idmap *, struct inode *,
 			 struct dentry *, struct inode *, struct dentry *,
 			 unsigned int);
 extern void simple_recursive_removal(struct dentry *,
@@ -3368,11 +3404,11 @@ static inline bool generic_ci_validate_strict_name(struct inode *dir,
 }
 #endif
 
-int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
+int may_setattr(const struct mnt_idmap *idmap, struct inode *inode,
 		unsigned int ia_valid);
-int setattr_prepare(struct mnt_idmap *, struct dentry *, struct iattr *);
+int setattr_prepare(const struct mnt_idmap *, struct dentry *, struct iattr *);
 extern int inode_newsize_ok(const struct inode *, loff_t offset);
-void setattr_copy(struct mnt_idmap *, struct inode *inode,
+void setattr_copy(const struct mnt_idmap *, struct inode *inode,
 		  const struct iattr *attr);
 
 extern int file_update_time(struct file *file);
@@ -3549,7 +3585,7 @@ static inline bool is_sxid(umode_t mode)
 	return mode & (S_ISUID | S_ISGID);
 }
 
-static inline int check_sticky(struct mnt_idmap *idmap,
+static inline int check_sticky(const struct mnt_idmap *idmap,
 			       struct inode *dir, struct inode *inode)
 {
 	if (!(dir->i_mode & S_ISVTX))
@@ -3623,23 +3659,6 @@ extern int vfs_fadvise(struct file *file, loff_t offset, loff_t len,
 		       int advice);
 extern int generic_fadvise(struct file *file, loff_t offset, loff_t len,
 			   int advice);
-
-static inline bool vfs_empty_path(int dfd, const char __user *path)
-{
-	char c;
-
-	if (dfd < 0)
-		return false;
-
-	/* We now allow NULL to be used for empty path. */
-	if (!path)
-		return true;
-
-	if (unlikely(get_user(c, path)))
-		return false;
-
-	return !c;
-}
 
 int generic_atomic_write_valid(struct kiocb *iocb, struct iov_iter *iter);
 

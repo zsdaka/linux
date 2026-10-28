@@ -441,11 +441,21 @@ err:
 	return ret;
 }
 
+static const u64 tas2780_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF;
+
 static const struct snd_soc_dai_ops tas2780_dai_ops = {
 	.mute_stream = tas2780_mute,
 	.hw_params  = tas2780_hw_params,
 	.set_fmt    = tas2780_set_fmt,
 	.set_tdm_slot = tas2780_set_dai_tdm_slot,
+	.auto_selectable_formats	= &tas2780_selectable_formats,
+	.num_auto_selectable_formats	= 1,
 	.no_capture_mute = 1,
 };
 
@@ -527,13 +537,13 @@ static const struct reg_default tas2780_reg_defaults[] = {
 	{ TAS2780_PAGE, 0x00 },
 	{ TAS2780_SW_RST, 0x00 },
 	{ TAS2780_PWR_CTRL, 0x1a },
-	{ TAS2780_DVC, 0x00 },
 	{ TAS2780_CHNL_0, 0x00 },
 	{ TAS2780_TDM_CFG0, 0x09 },
 	{ TAS2780_TDM_CFG1, 0x02 },
 	{ TAS2780_TDM_CFG2, 0x0a },
 	{ TAS2780_TDM_CFG3, 0x10 },
 	{ TAS2780_TDM_CFG5, 0x42 },
+	{ TAS2780_DVC, 0x00 },
 };
 
 static const struct regmap_range_cfg tas2780_regmap_ranges[] = {
@@ -621,7 +631,7 @@ static int tas2780_i2c_probe(struct i2c_client *client)
 }
 
 static const struct i2c_device_id tas2780_i2c_id[] = {
-	{ "tas2780"},
+	{ .name = "tas2780" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, tas2780_i2c_id);

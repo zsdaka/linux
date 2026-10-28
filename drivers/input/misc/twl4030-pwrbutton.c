@@ -27,7 +27,6 @@
 #include <linux/errno.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
-#include <linux/mod_devicetable.h>
 #include <linux/property.h>
 #include <linux/platform_device.h>
 #include <linux/mfd/twl.h>
@@ -91,7 +90,6 @@ static int twl4030_pwrbutton_probe(struct platform_device *pdev)
 	input_set_capability(pwr, EV_KEY, KEY_POWER);
 	pwr->name = "twl4030_pwrbutton";
 	pwr->phys = "twl4030_pwrbutton/input0";
-	pwr->dev.parent = &pdev->dev;
 
 	err = devm_request_threaded_irq(&pdev->dev, irq, NULL, powerbutton_irq,
 			IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING |

@@ -46,12 +46,21 @@ __noinline long global_dead(void)
 }
 
 SEC("?raw_tp")
-__success __log_level(2)
+__success __log_level(6)
 /* main prog is validated completely first */
 __msg("('global_calls_good_only') is global and assumed valid.")
 /* eventually global_good() is transitively validated as well */
 __msg("Validating global_good() func")
 __msg("('global_good') is safe for any args that match its prototype")
+__msg("subprog 0 (chained_global_func_calls_success) main insns_self 7 insns_total 7 stack")
+__msg("subprog {{[0-9]+}} (global_calls_good_only) global insns_self 2 insns_total 2 stack")
+#if defined(__BPF_CPU_VERSION__) && __BPF_CPU_VERSION__ >= 4
+__msg("subprog {{[0-9]+}} (global_good) global insns_self 3 insns_total 3 stack")
+__msg("processed 12 insns")
+#else
+__msg("subprog {{[0-9]+}} (global_good) global insns_self 5 insns_total 5 stack")
+__msg("processed 14 insns")
+#endif
 int chained_global_func_calls_success(void)
 {
 	int sum = 0;
@@ -151,6 +160,23 @@ int anon_user_mem_valid(void *ctx)
 	return subprog_user_anon_mem(&t);
 }
 
+__noinline __weak int subprog_user_anon_mem_huge(int (*p)[0x3fffffff])
+{
+	return p ? (*p)[1] : 0;
+}
+
+SEC("?tracepoint")
+__failure __log_level(2)
+__msg("R1 memory size 4294967292 is too large")
+int anon_user_mem_huge_size_invalid(void *ctx)
+{
+	int (*p)[0x3fffffff];
+	int tiny = 42;
+
+	p = (void *)&tiny;
+	return subprog_user_anon_mem_huge(p) + tiny;
+}
+
 __noinline __weak int subprog_nonnull_ptr_good(int *p1 __arg_nonnull, int *p2 __arg_nonnull)
 {
 	return (*p1) * (*p2); /* good, no need for NULL checks */
@@ -165,6 +191,16 @@ int arg_tag_nonnull_ptr_good(void *ctx)
 	int y = 74;
 
 	return subprog_nonnull_ptr_good(&x, &y);
+}
+
+SEC("?raw_tp")
+__failure __log_level(2)
+__msg("Possibly NULL pointer passed to trusted R1")
+int arg_tag_nonnull_ptr_null_bad(void *ctx)
+{
+	int y = 74;
+
+	return subprog_nonnull_ptr_good(NULL, &y);
 }
 
 /* this global subprog can be now called from many types of entry progs, each
@@ -498,6 +534,37 @@ int return_from_void_global(struct __sk_buff *skb)
 	);
 
 	return 0;
+}
+
+int global_calls_loop(int x);
+
+static __noinline int static_calls_global(int x)
+{
+	return global_calls_loop(x);
+}
+
+static __noinline int loop_cb_calls_static(u32 i, void *ctx)
+{
+	return static_calls_global(i);
+}
+
+__noinline int global_calls_loop(int x)
+{
+	bpf_loop(1, loop_cb_calls_static, NULL, 0);
+	return 0;
+}
+
+/*
+ * loop_cb_calls_static() -> static_calls_global() -> global_calls_loop() ->
+ * bpf_loop() -> loop_cb_calls_static() is an unbounded recursion that the
+ * main verification pass can't see, because it doesn't follow calls of global
+ * functions. None of the functions use stack.
+ */
+SEC("?raw_tp")
+__failure __msg("recursive call from global_calls_loop() to loop_cb_calls_static()")
+int recursion_via_global_func_and_callback(const void *ctx)
+{
+	return loop_cb_calls_static(0, NULL);
 }
 
 char _license[] SEC("license") = "GPL";

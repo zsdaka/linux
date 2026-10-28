@@ -449,7 +449,6 @@ static int cyapa_create_input_dev(struct cyapa *cyapa)
 	input->id.bustype = BUS_I2C;
 	input->id.version = 1;
 	input->id.product = 0;  /* Means any product in eventcomm. */
-	input->dev.parent = &cyapa->client->dev;
 
 	input->open = cyapa_open;
 	input->close = cyapa_close;
@@ -1456,16 +1455,16 @@ static const struct dev_pm_ops cyapa_pm_ops = {
 };
 
 static const struct i2c_device_id cyapa_id_table[] = {
-	{ "cyapa" },
+	{ .name = "cyapa" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, cyapa_id_table);
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id cyapa_acpi_id[] = {
-	{ "CYAP0000", 0 },  /* Gen3 trackpad with 0x67 I2C address. */
-	{ "CYAP0001", 0 },  /* Gen5 trackpad with 0x24 I2C address. */
-	{ "CYAP0002", 0 },  /* Gen6 trackpad with 0x24 I2C address. */
+	{ .id = "CYAP0000" },  /* Gen3 trackpad with 0x67 I2C address. */
+	{ .id = "CYAP0001" },  /* Gen5 trackpad with 0x24 I2C address. */
+	{ .id = "CYAP0002" },  /* Gen6 trackpad with 0x24 I2C address. */
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, cyapa_acpi_id);

@@ -236,12 +236,11 @@ with respect to allocation:
 		user can request.
 
 "bandwidth_gran":
-		The granularity in which the memory bandwidth
-		percentage is allocated. The allocated
-		b/w percentage is rounded off to the next
-		control step available on the hardware. The
-		available bandwidth control steps are:
-		min_bandwidth + N * bandwidth_gran.
+		The approximate granularity in which the memory bandwidth
+		percentage is allocated. The allocated bandwidth percentage is
+		rounded up or down to the closest control step available on the
+		hardware. The available hardware steps are no larger than this
+		value.
 
 "delay_linear":
 		Indicates if the delay scale is linear or
@@ -427,9 +426,9 @@ with the following files:
 
 	Two MBM events are supported by default: mbm_local_bytes and mbm_total_bytes.
 	Each MBM event's sub-directory contains a file named "event_filter" that is
-	used to view and modify which memory transactions the MBM event is configured
-	with. The file is accessible only when "mbm_event" counter assignment mode is
-	enabled.
+	used to view and (if writable) modify which memory transactions the MBM event
+	is configured with. The file is accessible only when "mbm_event" counter
+	assignment mode is enabled.
 
 	List of memory transaction types supported:
 
@@ -454,9 +453,8 @@ with the following files:
 	  # cat /sys/fs/resctrl/info/L3_MON/event_configs/mbm_local_bytes/event_filter
 	  local_reads,local_non_temporal_writes,local_reads_slow_memory
 
-	Modify the event configuration by writing to the "event_filter" file within
-	the "event_configs" directory. The read/write "event_filter" file contains the
-	configuration of the event that reflects which memory transactions are counted by it.
+	The memory transactions the MBM event is configured with can be changed
+	if "event_filter" is writable.
 
 	For example::
 
@@ -479,6 +477,12 @@ with the following files:
 		Auto assignment is disabled.
 	"1":
 		Auto assignment is enabled.
+
+	Automatic counter assignment is done with best effort. If auto
+	assignment is enabled but there are not enough available counters then
+	monitor group creation could succeed while one or more events belonging
+	to the group may not have a counter assigned in all domains. Consult
+	mbm_L3_assignments for counter assignment states of the new groups.
 
 	Example::
 
@@ -570,6 +574,11 @@ All groups contain the following files:
 	then the task must already belong to the CTRL_MON parent of this
 	group. The task is removed from any previous MON group.
 
+	When writing to this file, a task id of 0 is interpreted as the
+	task id of the currently running task. On reading the file, a task
+	id of 0 will never be shown and there is no representation of the
+	idle tasks. Instead, a CPU's idle task is always considered as a
+	member of the group owning the CPU.
 
 "cpus":
 	Reading this file shows a bitmask of the logical CPUs owned by
@@ -633,7 +642,7 @@ When monitoring is enabled all MON groups will also contain:
 	during execution of instructions summed across all logical CPUs on a
 	package for the current monitoring group.
 
-	"activity" also reports a floating point value (in Farads).  This provides
+	"activity" also reports a floating point value (in nanofarads).  This provides
 	an estimate of work done independent of the frequency that the CPUs used
 	for execution.
 
@@ -871,8 +880,10 @@ The minimum bandwidth percentage value for each cpu model is predefined
 and can be looked up through "info/MB/min_bandwidth". The bandwidth
 granularity that is allocated is also dependent on the cpu model and can
 be looked up at "info/MB/bandwidth_gran". The available bandwidth
-control steps are: min_bw + N * bw_gran. Intermediate values are rounded
-to the next control step available on the hardware.
+control steps are, approximately, min_bw + N * bw_gran.  The steps may
+appear irregular due to rounding to an exact percentage: bw_gran is the
+maximum interval between the percentage values corresponding to any two
+adjacent steps in the hardware.
 
 The bandwidth throttling is a core specific mechanism on some of Intel
 SKUs. Using a high bandwidth and a low bandwidth setting on two threads

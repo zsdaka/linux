@@ -15,7 +15,7 @@
 #include <linux/jiffies.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
-#include <linux/of.h>
+#include <linux/property.h>
 
 #define	DRIVER_NAME "tmp102"
 
@@ -58,7 +58,7 @@ struct tmp102 {
 	const char *label;
 	struct regmap *regmap;
 	u16 config_orig;
-	unsigned long ready_time;
+	u64 ready_time;
 	u16 sample_time;
 };
 
@@ -106,7 +106,7 @@ static int tmp102_read_temp(struct device *dev, u32 attr, long *val)
 	switch (attr) {
 	case hwmon_temp_input:
 		/* Is it too early to return a conversion ? */
-		if (time_before(jiffies, tmp102->ready_time)) {
+		if (time_before64(get_jiffies_64(), tmp102->ready_time)) {
 			dev_dbg(dev, "%s: Conversion not ready yet..\n", __func__);
 			return -EAGAIN;
 		}
@@ -313,7 +313,7 @@ static int tmp102_probe(struct i2c_client *client)
 	if (!tmp102)
 		return -ENOMEM;
 
-	of_property_read_string(dev->of_node, "label", &tmp102->label);
+	device_property_read_string(dev, "label", &tmp102->label);
 
 	i2c_set_clientdata(client, tmp102);
 
@@ -354,7 +354,7 @@ static int tmp102_probe(struct i2c_client *client)
 	 * Mark that we are not ready with data until the first
 	 * conversion is complete
 	 */
-	tmp102->ready_time = jiffies + msecs_to_jiffies(CONVERSION_TIME_MS);
+	tmp102->ready_time = get_jiffies_64() + msecs_to_jiffies(CONVERSION_TIME_MS);
 
 	hwmon_dev = devm_hwmon_device_register_with_info(dev, client->name,
 							 tmp102,
@@ -387,7 +387,7 @@ static int tmp102_resume(struct device *dev)
 	err = regmap_update_bits(tmp102->regmap, TMP102_CONF_REG,
 				 TMP102_CONF_SD, 0);
 
-	tmp102->ready_time = jiffies + msecs_to_jiffies(CONVERSION_TIME_MS);
+	tmp102->ready_time = get_jiffies_64() + msecs_to_jiffies(CONVERSION_TIME_MS);
 
 	return err;
 }
@@ -395,12 +395,14 @@ static int tmp102_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(tmp102_dev_pm_ops, tmp102_suspend, tmp102_resume);
 
 static const struct i2c_device_id tmp102_id[] = {
-	{ "tmp102" },
+	{ .name = "tmp102" },
+	{ .name = "tmp110" },
+	{ .name = "tmp113" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, tmp102_id);
 
-static const struct of_device_id __maybe_unused tmp102_of_match[] = {
+static const struct of_device_id tmp102_of_match[] = {
 	{ .compatible = "ti,tmp102" },
 	{ },
 };
@@ -408,7 +410,7 @@ MODULE_DEVICE_TABLE(of, tmp102_of_match);
 
 static struct i2c_driver tmp102_driver = {
 	.driver.name	= DRIVER_NAME,
-	.driver.of_match_table = of_match_ptr(tmp102_of_match),
+	.driver.of_match_table = tmp102_of_match,
 	.driver.pm	= pm_sleep_ptr(&tmp102_dev_pm_ops),
 	.probe		= tmp102_probe,
 	.id_table	= tmp102_id,

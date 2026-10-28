@@ -10,18 +10,48 @@
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
 #include <linux/export.h>
+#include <linux/if_addr.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
-#include <linux/workqueue.h>
+#include <net/netlink.h>
+#include <net/rtnetlink.h>
+#include <net/sock.h>
 #include <kunit/visibility.h>
 
 #include "dev.h"
 
-static void netdev_rx_mode_work(struct work_struct *work);
+/* RTM_GETMULTICAST dumps use the netns generation counter to detect
+ * changes of dev->mc between dump rounds.
+ */
+static void __hw_addr_changed(struct netdev_hw_addr_list *list)
+{
+	if (list->mc_dev)
+		atomic_inc(&dev_net(list->mc_dev)->dev_mc_genid);
+}
 
-static LIST_HEAD(rx_mode_list);
-static DEFINE_SPINLOCK(rx_mode_lock);
-static DECLARE_WORK(rx_mode_work, netdev_rx_mode_work);
+static void __hw_addr_count_add(struct netdev_hw_addr_list *list, int value)
+{
+	list->_count += value;
+	__hw_addr_changed(list);
+}
+
+static void __hw_addr_count_inc(struct netdev_hw_addr_list *list)
+{
+	__hw_addr_count_add(list, 1);
+}
+
+static void __hw_addr_count_dec(struct netdev_hw_addr_list *list)
+{
+	__hw_addr_count_add(list, -1);
+}
+
+static void __hw_addr_count_reset(struct netdev_hw_addr_list *list)
+{
+	if (!list->_count)
+		return;
+	list->_count = 0;
+	__hw_addr_changed(list);
+}
 
 /*
  * General list handling functions
@@ -132,7 +162,7 @@ static int __hw_addr_add_ex(struct netdev_hw_addr_list *list,
 	rb_insert_color(&ha->node, &list->tree);
 
 	list_add_tail_rcu(&ha->list, &list->list);
-	list->count++;
+	__hw_addr_count_inc(list);
 
 	return 0;
 }
@@ -168,7 +198,7 @@ static int __hw_addr_del_entry(struct netdev_hw_addr_list *list,
 
 	list_del_rcu(&ha->list);
 	kfree_rcu(ha, rcu_head);
-	list->count--;
+	__hw_addr_count_dec(list);
 	return 0;
 }
 
@@ -499,15 +529,16 @@ void __hw_addr_flush(struct netdev_hw_addr_list *list)
 		list_del_rcu(&ha->list);
 		kfree_rcu(ha, rcu_head);
 	}
-	list->count = 0;
+	__hw_addr_count_reset(list);
 }
 EXPORT_SYMBOL_IF_KUNIT(__hw_addr_flush);
 
 void __hw_addr_init(struct netdev_hw_addr_list *list)
 {
 	INIT_LIST_HEAD(&list->list);
-	list->count = 0;
+	list->_count = 0;
 	list->tree = RB_ROOT;
+	list->mc_dev = NULL;
 }
 EXPORT_SYMBOL(__hw_addr_init);
 
@@ -516,8 +547,8 @@ static void __hw_addr_splice(struct netdev_hw_addr_list *dst,
 {
 	src->tree = RB_ROOT;
 	list_splice_init(&src->list, &dst->list);
-	dst->count += src->count;
-	src->count = 0;
+	__hw_addr_count_add(dst, netdev_hw_addr_list_count(src));
+	__hw_addr_count_reset(src);
 }
 
 /**
@@ -539,11 +570,11 @@ int __hw_addr_list_snapshot(struct netdev_hw_addr_list *snap,
 	struct netdev_hw_addr *ha, *entry;
 
 	list_for_each_entry(ha, &list->list, list) {
-		if (cache->count) {
+		if (netdev_hw_addr_list_count(cache)) {
 			entry = list_first_entry(&cache->list,
 						 struct netdev_hw_addr, list);
 			list_del(&entry->list);
-			cache->count--;
+			__hw_addr_count_dec(cache);
 			memcpy(entry->addr, ha->addr, addr_len);
 			entry->type = ha->type;
 			entry->global_use = false;
@@ -561,7 +592,7 @@ int __hw_addr_list_snapshot(struct netdev_hw_addr_list *snap,
 
 		list_add_tail(&entry->list, &snap->list);
 		__hw_addr_insert(snap, entry, addr_len);
-		snap->count++;
+		__hw_addr_count_inc(snap);
 	}
 
 	return 0;
@@ -611,14 +642,14 @@ void __hw_addr_list_reconcile(struct netdev_hw_addr_list *real_list,
 			if (delta > 0) {
 				rb_erase(&ref_ha->node, &ref->tree);
 				list_del(&ref_ha->list);
-				ref->count--;
+				__hw_addr_count_dec(ref);
 				ref_ha->sync_cnt = delta;
 				ref_ha->refcount = delta;
 				list_add_tail_rcu(&ref_ha->list,
 						  &real_list->list);
 				__hw_addr_insert(real_list, ref_ha,
 						 addr_len);
-				real_list->count++;
+				__hw_addr_count_inc(real_list);
 			}
 			continue;
 		}
@@ -629,7 +660,7 @@ void __hw_addr_list_reconcile(struct netdev_hw_addr_list *real_list,
 			rb_erase(&real_ha->node, &real_list->tree);
 			list_del_rcu(&real_ha->list);
 			kfree_rcu(real_ha, rcu_head);
-			real_list->count--;
+			__hw_addr_count_dec(real_list);
 		}
 	}
 
@@ -1184,8 +1215,197 @@ EXPORT_SYMBOL(dev_mc_flush);
 void dev_mc_init(struct net_device *dev)
 {
 	__hw_addr_init(&dev->mc);
+	dev->mc.mc_dev = dev;
 }
 EXPORT_SYMBOL(dev_mc_init);
+
+static int dev_mc_fill_addr(struct sk_buff *skb, const struct net_device *dev,
+			    const struct netdev_hw_addr *ha, u32 portid,
+			    u32 seq, unsigned int flags, int netnsid)
+{
+	struct ifaddrmsg *ifm;
+	struct nlmsghdr *nlh;
+
+	nlh = nlmsg_put(skb, portid, seq, RTM_GETMULTICAST, sizeof(*ifm),
+			flags);
+	if (!nlh)
+		return -EMSGSIZE;
+
+	ifm = nlmsg_data(nlh);
+	ifm->ifa_family = AF_PACKET;
+	ifm->ifa_prefixlen = 0;
+	ifm->ifa_flags = 0;
+	ifm->ifa_scope = RT_SCOPE_LINK;
+	ifm->ifa_index = dev->ifindex;
+
+	if ((netnsid >= 0 &&
+	     nla_put_s32(skb, IFA_TARGET_NETNSID, netnsid)) ||
+	    nla_put(skb, IFA_MULTICAST, dev->addr_len, ha->addr) ||
+	    nla_put_u32(skb, IFA_MC_USERS, ha->refcount) ||
+	    nla_put_u32(skb, IFA_FLAGS, ha->global_use ? IFA_F_GLOBAL : 0)) {
+		nlmsg_cancel(skb, nlh);
+		return -EMSGSIZE;
+	}
+
+	nlmsg_end(skb, nlh);
+	return 0;
+}
+
+/* Combine dev_mc_genid and dev_base_seq to detect changes, like
+ * inet_base_seq().
+ */
+static u32 dev_mc_base_seq(const struct net *net)
+{
+	u32 res = atomic_read(&net->dev_mc_genid) +
+		  READ_ONCE(net->dev_base_seq);
+
+	/* Must not return 0 (see nl_dump_check_consistent()). */
+	if (!res)
+		res = 0x80000000;
+	return res;
+}
+
+static int dev_mc_dump_dev(struct net_device *dev, struct sk_buff *skb,
+			   struct netlink_callback *cb, int *s_addr_idx,
+			   unsigned int flags, int netnsid)
+{
+	struct netdev_hw_addr *ha;
+	int addr_idx = 0;
+	int err = 0;
+
+	netif_addr_lock_bh(dev);
+	netdev_for_each_mc_addr(ha, dev) {
+		if (addr_idx < *s_addr_idx) {
+			addr_idx++;
+			continue;
+		}
+		err = dev_mc_fill_addr(skb, dev, ha, NETLINK_CB(cb->skb).portid,
+				       cb->nlh->nlmsg_seq, flags, netnsid);
+		if (err < 0)
+			break;
+		addr_idx++;
+	}
+	netif_addr_unlock_bh(dev);
+
+	*s_addr_idx = err < 0 ? addr_idx : 0;
+
+	return err;
+}
+
+struct dev_mc_dump_filter {
+	struct net *tgt_net;
+	netns_tracker ns_tracker;
+	int netnsid;
+	int ifindex;
+};
+
+static const struct nla_policy dev_mc_dump_policy[IFA_MAX + 1] = {
+	[IFA_TARGET_NETNSID]	= { .type = NLA_S32 },
+};
+
+static int dev_mc_valid_dump_req(const struct nlmsghdr *nlh, struct sock *sk,
+				 struct dev_mc_dump_filter *filter,
+				 struct netlink_ext_ack *extack)
+{
+	struct nlattr *tb[IFA_MAX + 1];
+	struct ifaddrmsg *ifm;
+	int err;
+
+	ifm = nlmsg_payload(nlh, sizeof(*ifm));
+	if (!ifm) {
+		NL_SET_ERR_MSG(extack,
+			       "Invalid header for multicast dump request");
+		return -EINVAL;
+	}
+
+	if (ifm->ifa_prefixlen || ifm->ifa_flags || ifm->ifa_scope) {
+		NL_SET_ERR_MSG(extack,
+			       "Invalid values in multicast dump header");
+		return -EINVAL;
+	}
+
+	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFA_MAX,
+			  dev_mc_dump_policy, extack);
+	if (err < 0)
+		return err;
+
+	if (tb[IFA_TARGET_NETNSID]) {
+		struct net *net;
+
+		filter->netnsid = nla_get_s32(tb[IFA_TARGET_NETNSID]);
+		net = rtnl_get_net_ns_capable(sk, filter->netnsid);
+		if (IS_ERR(net)) {
+			NL_SET_ERR_MSG(extack,
+				       "Invalid target network namespace id");
+			return PTR_ERR(net);
+		}
+		netns_tracker_alloc(net, &filter->ns_tracker, GFP_KERNEL);
+		filter->tgt_net = net;
+	}
+
+	filter->ifindex = ifm->ifa_index;
+
+	return 0;
+}
+
+int dev_mc_dump(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	struct dev_mc_dump_filter filter = {
+		.tgt_net = sock_net(skb->sk),
+		.netnsid = -1,
+	};
+	unsigned int flags = NLM_F_MULTI;
+	struct {
+		unsigned long ifindex;
+		int addr_idx;
+	} *ctx = (void *)cb->ctx;
+	unsigned long s_ifindex;
+	struct net_device *dev;
+	int err;
+
+	err = dev_mc_valid_dump_req(cb->nlh, skb->sk, &filter, cb->extack);
+	if (err < 0)
+		return err;
+
+	rcu_read_lock();
+
+	cb->seq = dev_mc_base_seq(filter.tgt_net);
+	if (filter.ifindex) {
+		cb->answer_flags |= NLM_F_DUMP_FILTERED;
+		flags |= NLM_F_DUMP_FILTERED;
+		dev = dev_get_by_index_rcu(filter.tgt_net, filter.ifindex);
+		if (dev)
+			err = dev_mc_dump_dev(dev, skb, cb, &ctx->addr_idx,
+					      flags, filter.netnsid);
+		else
+			err = -ENODEV;
+	} else {
+		s_ifindex = ctx->ifindex;
+		for_each_netdev_dump(filter.tgt_net, dev, ctx->ifindex) {
+			/* The device the dump stopped at is gone, do not
+			 * skip entries of the next one.
+			 */
+			if (dev->ifindex != s_ifindex)
+				ctx->addr_idx = 0;
+			err = dev_mc_dump_dev(dev, skb, cb, &ctx->addr_idx,
+					      flags, filter.netnsid);
+			if (err < 0)
+				break;
+		}
+	}
+	/* A round without a message has nothing to flag, the NLMSG_DONE
+	 * check then compares against the previous round.
+	 */
+	if (skb->len)
+		nl_dump_check_consistent(cb, nlmsg_hdr(skb));
+	/* Let the NLMSG_DONE check see changes made during the last round */
+	cb->seq = dev_mc_base_seq(filter.tgt_net);
+
+	rcu_read_unlock();
+	if (filter.netnsid >= 0)
+		put_net_track(filter.tgt_net, &filter.ns_tracker);
+	return err;
+}
 
 static int netif_addr_lists_snapshot(struct net_device *dev,
 				     struct netdev_hw_addr_list *uc_snap,
@@ -1252,7 +1472,36 @@ static int netif_uc_promisc_update(struct net_device *dev)
 	return 0;
 }
 
-static void netif_rx_mode_run(struct net_device *dev)
+/* Total retry budget (4): 1+2+4+8 = 15 seconds */
+#define NETIF_RX_MODE_RETRY_MAX	4
+
+void netif_rx_mode_schedule_retry(struct net_device *dev)
+{
+	unsigned long delay;
+
+	netdev_assert_locked_ops_compat(dev);
+
+	if (dev->rx_mode_retry_count >= NETIF_RX_MODE_RETRY_MAX) {
+		netdev_err(dev, "rx_mode retry limit reached, giving up\n");
+		return;
+	}
+
+	delay = HZ << dev->rx_mode_retry_count;
+	if (mod_timer(&dev->rx_mode_retry_timer, jiffies + delay))
+		return;
+	if (!dev->rx_mode_retry_count)
+		netdev_info(dev, "rx_mode install failed, retrying with backoff\n");
+	dev->rx_mode_retry_count++;
+}
+EXPORT_SYMBOL_GPL(netif_rx_mode_schedule_retry);
+
+void netif_rx_mode_cancel_retry(struct net_device *dev)
+{
+	timer_delete_sync(&dev->rx_mode_retry_timer);
+	dev->rx_mode_retry_count = 0;
+}
+
+void netif_rx_mode_run(struct net_device *dev)
 {
 	struct netdev_hw_addr_list uc_snap, mc_snap, uc_ref, mc_ref;
 	const struct net_device_ops *ops = dev->netdev_ops;
@@ -1260,7 +1509,7 @@ static void netif_rx_mode_run(struct net_device *dev)
 	int err;
 
 	might_sleep();
-	netdev_ops_assert_locked(dev);
+	netdev_assert_locked_ops_compat(dev);
 
 	__hw_addr_init(&uc_snap);
 	__hw_addr_init(&mc_snap);
@@ -1275,8 +1524,8 @@ static void netif_rx_mode_run(struct net_device *dev)
 		err = netif_addr_lists_snapshot(dev, &uc_snap, &mc_snap,
 						&uc_ref, &mc_ref);
 		if (err) {
-			netdev_WARN(dev, "failed to sync uc/mc addresses\n");
 			netif_addr_unlock_bh(dev);
+			netif_rx_mode_schedule_retry(dev);
 			return;
 		}
 
@@ -1292,12 +1541,17 @@ static void netif_rx_mode_run(struct net_device *dev)
 		__dev_set_promiscuity(dev, promisc_inc, false);
 
 	if (ops->ndo_set_rx_mode_async) {
-		ops->ndo_set_rx_mode_async(dev, &uc_snap, &mc_snap);
+		err = ops->ndo_set_rx_mode_async(dev, &uc_snap, &mc_snap);
 
 		netif_addr_lock_bh(dev);
 		netif_addr_lists_reconcile(dev, &uc_snap, &mc_snap,
 					   &uc_ref, &mc_ref);
 		netif_addr_unlock_bh(dev);
+
+		if (err)
+			netif_rx_mode_schedule_retry(dev);
+		else
+			dev->rx_mode_retry_count = 0;
 	} else if (ops->ndo_set_rx_mode) {
 		netif_addr_lock_bh(dev);
 		ops->ndo_set_rx_mode(dev);
@@ -1305,49 +1559,23 @@ static void netif_rx_mode_run(struct net_device *dev)
 	}
 }
 
-static void netdev_rx_mode_work(struct work_struct *work)
-{
-	struct net_device *dev;
-
-	rtnl_lock();
-
-	while (true) {
-		spin_lock_bh(&rx_mode_lock);
-		if (list_empty(&rx_mode_list)) {
-			spin_unlock_bh(&rx_mode_lock);
-			break;
-		}
-		dev = list_first_entry(&rx_mode_list, struct net_device,
-				       rx_mode_node);
-		list_del_init(&dev->rx_mode_node);
-		/* We must free netdev tracker under
-		 * the spinlock protection.
-		 */
-		netdev_tracker_free(dev, &dev->rx_mode_tracker);
-		spin_unlock_bh(&rx_mode_lock);
-
-		netdev_lock_ops(dev);
-		netif_rx_mode_run(dev);
-		netdev_unlock_ops(dev);
-		/* Use __dev_put() because netdev_tracker_free() was already
-		 * called above. Must be after netdev_unlock_ops() to prevent
-		 * netdev_run_todo() from freeing the device while still in use.
-		 */
-		__dev_put(dev);
-	}
-
-	rtnl_unlock();
-}
-
 static void netif_rx_mode_queue(struct net_device *dev)
 {
-	spin_lock_bh(&rx_mode_lock);
-	if (list_empty(&dev->rx_mode_node)) {
-		list_add_tail(&dev->rx_mode_node, &rx_mode_list);
-		netdev_hold(dev, &dev->rx_mode_tracker, GFP_ATOMIC);
-	}
-	spin_unlock_bh(&rx_mode_lock);
-	schedule_work(&rx_mode_work);
+	__netdev_work_core_sched(dev, NETDEV_WORK_RX_MODE);
+}
+
+static void netif_rx_mode_retry(struct timer_list *t)
+{
+	struct net_device *dev =
+		timer_container_of(dev, t, rx_mode_retry_timer);
+
+	netif_rx_mode_queue(dev);
+}
+
+void netif_rx_mode_init(struct net_device *dev)
+{
+	__hw_addr_init(&dev->rx_mode_addr_cache);
+	timer_setup(&dev->rx_mode_retry_timer, netif_rx_mode_retry, 0);
 }
 
 /**
@@ -1393,24 +1621,6 @@ void dev_set_rx_mode(struct net_device *dev)
 	netif_addr_unlock_bh(dev);
 }
 
-bool netif_rx_mode_clean(struct net_device *dev)
-{
-	bool clean = false;
-
-	spin_lock_bh(&rx_mode_lock);
-	if (!list_empty(&dev->rx_mode_node)) {
-		list_del_init(&dev->rx_mode_node);
-		clean = true;
-		/* We must release netdev tracker under
-		 * the spinlock protection.
-		 */
-		netdev_tracker_free(dev, &dev->rx_mode_tracker);
-	}
-	spin_unlock_bh(&rx_mode_lock);
-
-	return clean;
-}
-
 /**
  * netif_rx_mode_sync() - sync rx mode inline
  * @dev: network device
@@ -1424,11 +1634,6 @@ bool netif_rx_mode_clean(struct net_device *dev)
  */
 void netif_rx_mode_sync(struct net_device *dev)
 {
-	if (netif_rx_mode_clean(dev)) {
+	if (__netdev_work_core_cancel(dev, NETDEV_WORK_RX_MODE))
 		netif_rx_mode_run(dev);
-		/* Use __dev_put() because netdev_tracker_free() was already
-		 * called inside netif_rx_mode_clean().
-		 */
-		__dev_put(dev);
-	}
 }

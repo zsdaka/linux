@@ -285,6 +285,13 @@ static u32 encode_config_ggtt(u32 *cfg, const struct xe_gt_sriov_config *config,
 	return encode_ggtt(cfg, xe_ggtt_node_addr(node), xe_ggtt_node_size(node), details);
 }
 
+static bool custom_sched_priority(struct xe_gt *gt, u32 priority)
+{
+	return xe_gt_sriov_pf_policy_get_sched_if_idle_locked(gt) ?
+		priority != GUC_SCHED_PRIORITY_NORMAL :
+		priority != GUC_SCHED_PRIORITY_LOW;
+}
+
 static u32 encode_config_sched(struct xe_gt *gt, u32 *cfg, u32 n,
 			       const struct xe_gt_sriov_config *config)
 {
@@ -311,6 +318,11 @@ static u32 encode_config_sched(struct xe_gt *gt, u32 *cfg, u32 n,
 
 		cfg[n++] = PREP_GUC_KLV_TAG(VF_CFG_PREEMPT_TIMEOUT);
 		cfg[n++] = config->preempt_timeout[0];
+	}
+
+	if (custom_sched_priority(gt, config->sched_priority)) {
+		cfg[n++] = PREP_GUC_KLV_TAG(VF_CFG_SCHED_PRIORITY);
+		cfg[n++] = config->sched_priority;
 	}
 
 	return n;
@@ -656,7 +668,42 @@ static int pf_config_bulk_set_u64_done(struct xe_gt *gt, unsigned int first, uns
 }
 
 /**
- * xe_gt_sriov_pf_config_bulk_set_ggtt - Provision many VFs with GGTT.
+ * xe_gt_sriov_pf_config_bulk_set_ggtt_locked() - Provision many VFs with GGTT.
+ * @gt: the &xe_gt (can't be media)
+ * @vfid: starting VF identifier (can't be 0)
+ * @num_vfs: number of VFs to provision
+ * @size: requested GGTT size
+ *
+ * This function can only be called on PF.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int xe_gt_sriov_pf_config_bulk_set_ggtt_locked(struct xe_gt *gt, unsigned int vfid,
+					       unsigned int num_vfs, u64 size)
+{
+	unsigned int n;
+	int err = 0;
+
+	xe_gt_assert(gt, vfid);
+	xe_gt_assert(gt, xe_gt_is_main_type(gt));
+	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
+
+	if (!num_vfs)
+		return 0;
+
+	for (n = vfid; n < vfid + num_vfs; n++) {
+		err = pf_provision_vf_ggtt(gt, n, size);
+		if (err)
+			break;
+	}
+
+	return pf_config_bulk_set_u64_done(gt, vfid, num_vfs, size,
+					   pf_get_vf_config_ggtt,
+					   "GGTT", n, err);
+}
+
+/**
+ * xe_gt_sriov_pf_config_bulk_set_ggtt() - Provision many VFs with GGTT.
  * @gt: the &xe_gt (can't be media)
  * @vfid: starting VF identifier (can't be 0)
  * @num_vfs: number of VFs to provision
@@ -669,26 +716,9 @@ static int pf_config_bulk_set_u64_done(struct xe_gt *gt, unsigned int first, uns
 int xe_gt_sriov_pf_config_bulk_set_ggtt(struct xe_gt *gt, unsigned int vfid,
 					unsigned int num_vfs, u64 size)
 {
-	unsigned int n;
-	int err = 0;
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
 
-	xe_gt_assert(gt, vfid);
-	xe_gt_assert(gt, xe_gt_is_main_type(gt));
-
-	if (!num_vfs)
-		return 0;
-
-	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
-	for (n = vfid; n < vfid + num_vfs; n++) {
-		err = pf_provision_vf_ggtt(gt, n, size);
-		if (err)
-			break;
-	}
-	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
-
-	return pf_config_bulk_set_u64_done(gt, vfid, num_vfs, size,
-					   xe_gt_sriov_pf_config_get_ggtt,
-					   "GGTT", n, err);
+	return xe_gt_sriov_pf_config_bulk_set_ggtt_locked(gt, vfid, num_vfs, size);
 }
 
 /* Return: size of the largest continuous GGTT region */
@@ -763,10 +793,9 @@ int xe_gt_sriov_pf_config_set_fair_ggtt(struct xe_gt *gt, unsigned int vfid,
 	xe_gt_assert(gt, num_vfs);
 	xe_gt_assert(gt, xe_gt_is_main_type(gt));
 
-	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
-	fair = pf_estimate_fair_ggtt(gt, num_vfs);
-	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
 
+	fair = pf_estimate_fair_ggtt(gt, num_vfs);
 	if (!fair)
 		return -ENOSPC;
 
@@ -775,7 +804,7 @@ int xe_gt_sriov_pf_config_set_fair_ggtt(struct xe_gt *gt, unsigned int vfid,
 		xe_gt_sriov_info(gt, "Using non-profile provisioning (%s %llu vs %llu)\n",
 				 "GGTT", fair, profile);
 
-	return xe_gt_sriov_pf_config_bulk_set_ggtt(gt, vfid, num_vfs, fair);
+	return xe_gt_sriov_pf_config_bulk_set_ggtt_locked(gt, vfid, num_vfs, fair);
 }
 
 /**
@@ -1087,7 +1116,41 @@ static int pf_config_bulk_set_u32_done(struct xe_gt *gt, unsigned int first, uns
 }
 
 /**
- * xe_gt_sriov_pf_config_bulk_set_ctxs - Provision many VFs with GuC context IDs.
+ * xe_gt_sriov_pf_config_bulk_set_ctxs_locked() - Provision many VFs with GuC context IDs.
+ * @gt: the &xe_gt
+ * @vfid: starting VF identifier
+ * @num_vfs: number of VFs to provision
+ * @num_ctxs: requested number of GuC contexts IDs (0 to release)
+ *
+ * This function can only be called on PF.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int xe_gt_sriov_pf_config_bulk_set_ctxs_locked(struct xe_gt *gt, unsigned int vfid,
+					       unsigned int num_vfs, u32 num_ctxs)
+{
+	unsigned int n;
+	int err = 0;
+
+	xe_gt_assert(gt, vfid);
+	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
+
+	if (!num_vfs)
+		return 0;
+
+	for (n = vfid; n < vfid + num_vfs; n++) {
+		err = pf_provision_vf_ctxs(gt, n, num_ctxs);
+		if (err)
+			break;
+	}
+
+	return pf_config_bulk_set_u32_done(gt, vfid, num_vfs, num_ctxs,
+					   pf_get_vf_config_ctxs,
+					   "GuC context IDs", no_unit, n, err);
+}
+
+/**
+ * xe_gt_sriov_pf_config_bulk_set_ctxs() - Provision many VFs with GuC context IDs.
  * @gt: the &xe_gt
  * @vfid: starting VF identifier
  * @num_vfs: number of VFs to provision
@@ -1100,25 +1163,9 @@ static int pf_config_bulk_set_u32_done(struct xe_gt *gt, unsigned int first, uns
 int xe_gt_sriov_pf_config_bulk_set_ctxs(struct xe_gt *gt, unsigned int vfid,
 					unsigned int num_vfs, u32 num_ctxs)
 {
-	unsigned int n;
-	int err = 0;
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
 
-	xe_gt_assert(gt, vfid);
-
-	if (!num_vfs)
-		return 0;
-
-	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
-	for (n = vfid; n < vfid + num_vfs; n++) {
-		err = pf_provision_vf_ctxs(gt, n, num_ctxs);
-		if (err)
-			break;
-	}
-	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
-
-	return pf_config_bulk_set_u32_done(gt, vfid, num_vfs, num_ctxs,
-					   xe_gt_sriov_pf_config_get_ctxs,
-					   "GuC context IDs", no_unit, n, err);
+	return xe_gt_sriov_pf_config_bulk_set_ctxs_locked(gt, vfid, num_vfs, num_ctxs);
 }
 
 static u32 pf_profile_fair_ctxs(struct xe_gt *gt, unsigned int num_vfs)
@@ -1169,10 +1216,9 @@ int xe_gt_sriov_pf_config_set_fair_ctxs(struct xe_gt *gt, unsigned int vfid,
 	xe_gt_assert(gt, vfid);
 	xe_gt_assert(gt, num_vfs);
 
-	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
-	fair = pf_estimate_fair_ctxs(gt, num_vfs);
-	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
 
+	fair = pf_estimate_fair_ctxs(gt, num_vfs);
 	if (!fair)
 		return -ENOSPC;
 
@@ -1181,7 +1227,7 @@ int xe_gt_sriov_pf_config_set_fair_ctxs(struct xe_gt *gt, unsigned int vfid,
 		xe_gt_sriov_info(gt, "Using non-profile provisioning (%s %u vs %u)\n",
 				 "GuC context IDs", fair, profile);
 
-	return xe_gt_sriov_pf_config_bulk_set_ctxs(gt, vfid, num_vfs, fair);
+	return xe_gt_sriov_pf_config_bulk_set_ctxs_locked(gt, vfid, num_vfs, fair);
 }
 
 static u32 pf_get_min_spare_dbs(struct xe_gt *gt)
@@ -1351,7 +1397,41 @@ int xe_gt_sriov_pf_config_set_dbs(struct xe_gt *gt, unsigned int vfid, u32 num_d
 }
 
 /**
- * xe_gt_sriov_pf_config_bulk_set_dbs - Provision many VFs with GuC context IDs.
+ * xe_gt_sriov_pf_config_bulk_set_dbs_locked() - Provision many VFs with GuC doorbells.
+ * @gt: the &xe_gt
+ * @vfid: starting VF identifier (can't be 0)
+ * @num_vfs: number of VFs to provision
+ * @num_dbs: requested number of GuC doorbell IDs (0 to release)
+ *
+ * This function can only be called on PF.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int xe_gt_sriov_pf_config_bulk_set_dbs_locked(struct xe_gt *gt, unsigned int vfid,
+					      unsigned int num_vfs, u32 num_dbs)
+{
+	unsigned int n;
+	int err = 0;
+
+	xe_gt_assert(gt, vfid);
+	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
+
+	if (!num_vfs)
+		return 0;
+
+	for (n = vfid; n < vfid + num_vfs; n++) {
+		err = pf_provision_vf_dbs(gt, n, num_dbs);
+		if (err)
+			break;
+	}
+
+	return pf_config_bulk_set_u32_done(gt, vfid, num_vfs, num_dbs,
+					   pf_get_vf_config_dbs,
+					   "GuC doorbell IDs", no_unit, n, err);
+}
+
+/**
+ * xe_gt_sriov_pf_config_bulk_set_dbs() - Provision many VFs with GuC doorbells.
  * @gt: the &xe_gt
  * @vfid: starting VF identifier (can't be 0)
  * @num_vfs: number of VFs to provision
@@ -1364,25 +1444,9 @@ int xe_gt_sriov_pf_config_set_dbs(struct xe_gt *gt, unsigned int vfid, u32 num_d
 int xe_gt_sriov_pf_config_bulk_set_dbs(struct xe_gt *gt, unsigned int vfid,
 				       unsigned int num_vfs, u32 num_dbs)
 {
-	unsigned int n;
-	int err = 0;
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
 
-	xe_gt_assert(gt, vfid);
-
-	if (!num_vfs)
-		return 0;
-
-	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
-	for (n = vfid; n < vfid + num_vfs; n++) {
-		err = pf_provision_vf_dbs(gt, n, num_dbs);
-		if (err)
-			break;
-	}
-	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
-
-	return pf_config_bulk_set_u32_done(gt, vfid, num_vfs, num_dbs,
-					   xe_gt_sriov_pf_config_get_dbs,
-					   "GuC doorbell IDs", no_unit, n, err);
+	return xe_gt_sriov_pf_config_bulk_set_dbs_locked(gt, vfid, num_vfs, num_dbs);
 }
 
 static u32 pf_profile_fair_dbs(struct xe_gt *gt, unsigned int num_vfs)
@@ -1434,10 +1498,9 @@ int xe_gt_sriov_pf_config_set_fair_dbs(struct xe_gt *gt, unsigned int vfid,
 	xe_gt_assert(gt, vfid);
 	xe_gt_assert(gt, num_vfs);
 
-	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
-	fair = pf_estimate_fair_dbs(gt, num_vfs);
-	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
 
+	fair = pf_estimate_fair_dbs(gt, num_vfs);
 	if (!fair)
 		return -ENOSPC;
 
@@ -1446,7 +1509,7 @@ int xe_gt_sriov_pf_config_set_fair_dbs(struct xe_gt *gt, unsigned int vfid,
 		xe_gt_sriov_info(gt, "Using non-profile provisioning (%s %u vs %u)\n",
 				 "GuC doorbell IDs", fair, profile);
 
-	return xe_gt_sriov_pf_config_bulk_set_dbs(gt, vfid, num_vfs, fair);
+	return xe_gt_sriov_pf_config_bulk_set_dbs_locked(gt, vfid, num_vfs, fair);
 }
 
 static u64 pf_get_lmem_alignment(struct xe_gt *gt)
@@ -1922,29 +1985,45 @@ static u64 pf_profile_fair_lmem(struct xe_gt *gt, unsigned int num_vfs)
 	return ALIGN_DOWN(fair, alignment);
 }
 
-static void __pf_show_provisioning_lmem(struct xe_gt *gt, unsigned int first_vf,
-					unsigned int num_vfs, bool provisioned)
+static void __pf_show_provisioned(struct xe_gt *gt, unsigned int first_vf,
+				  unsigned int num_vfs, bool provisioned,
+				  u32 (*get32)(struct xe_gt *, unsigned int),
+				  u64 (*get64)(struct xe_gt *, unsigned int),
+				  const char *what)
 {
 	unsigned int allvfs = 1 + xe_gt_sriov_pf_get_totalvfs(gt); /* PF plus VFs */
 	unsigned long *bitmap __free(bitmap) = bitmap_zalloc(allvfs, GFP_KERNEL);
 	unsigned int weight;
 	unsigned int n;
+	bool pf;
+
+	xe_gt_assert(gt, get32 || get64);
 
 	if (!bitmap)
 		return;
 
 	for (n = first_vf; n < first_vf + num_vfs; n++) {
-		if (!!pf_get_vf_config_lmem(gt, VFID(n)) == provisioned)
+		if ((get32 && (!!get32(gt, VFID(n)) == provisioned)) ||
+		    (get64 && (!!get64(gt, VFID(n)) == provisioned)))
 			bitmap_set(bitmap, n, 1);
 	}
 
+	pf = test_and_clear_bit(0, bitmap);
 	weight = bitmap_weight(bitmap, allvfs);
-	if (!weight)
+	if (!pf && !weight)
 		return;
 
-	xe_gt_sriov_info(gt, "VF%s%*pbl %s provisioned with VRAM\n",
-			 weight > 1 ? "s " : "", allvfs, bitmap,
-			 provisioned ? "already" : "not");
+	xe_gt_sriov_info(gt, "%s%s%s%s%*pbl %s provisioned with %s\n",
+			 pf ? "PF" : "", pf && weight ? " and " : "",
+			 weight ? "VF" : "", weight > 1 ? "s " : "",
+			 allvfs, bitmap, provisioned ? "already" : "not", what);
+}
+
+static void __pf_show_provisioning_lmem(struct xe_gt *gt, unsigned int first_vf,
+					unsigned int num_vfs, bool provisioned)
+{
+	__pf_show_provisioned(gt, first_vf, num_vfs, provisioned,
+			      NULL, pf_get_vf_config_lmem, "VRAM");
 }
 
 static void pf_show_all_provisioned_lmem(struct xe_gt *gt)
@@ -2078,6 +2157,17 @@ static u32 pf_get_exec_quantum(struct xe_gt *gt, unsigned int vfid)
 	return config->exec_quantum[0];
 }
 
+static bool pf_non_default_exec_quantum(struct xe_gt *gt, unsigned int vfid)
+{
+	struct xe_gt_sriov_config *config = pf_pick_vf_config(gt, vfid);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(config->exec_quantum); i++)
+		if (config->exec_quantum[i])
+			return true;
+	return false;
+}
+
 /**
  * xe_gt_sriov_pf_config_set_exec_quantum_locked() - Configure PF/VF execution quantum.
  * @gt: the &xe_gt
@@ -2154,6 +2244,25 @@ u32 xe_gt_sriov_pf_config_get_exec_quantum(struct xe_gt *gt, unsigned int vfid)
 	return pf_get_exec_quantum(gt, vfid);
 }
 
+static int pf_bulk_set_exec_quantum(struct xe_gt *gt, u32 exec_quantum,
+				    unsigned int first_vf, unsigned int num_vfs)
+{
+	unsigned int n;
+	int err = 0;
+
+	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
+
+	for (n = first_vf; n < first_vf + num_vfs; n++) {
+		err = pf_provision_exec_quantum(gt, VFID(n), exec_quantum);
+		if (err)
+			break;
+	}
+
+	return pf_config_bulk_set_u32_done(gt, first_vf, num_vfs, exec_quantum,
+					   pf_get_exec_quantum, "execution quantum",
+					   exec_quantum_unit, n, err);
+}
+
 /**
  * xe_gt_sriov_pf_config_bulk_set_exec_quantum_locked() - Configure EQ for PF and VFs.
  * @gt: the &xe_gt to configure
@@ -2166,20 +2275,8 @@ u32 xe_gt_sriov_pf_config_get_exec_quantum(struct xe_gt *gt, unsigned int vfid)
 int xe_gt_sriov_pf_config_bulk_set_exec_quantum_locked(struct xe_gt *gt, u32 exec_quantum)
 {
 	unsigned int totalvfs = xe_gt_sriov_pf_get_totalvfs(gt);
-	unsigned int n;
-	int err = 0;
 
-	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
-
-	for (n = 0; n <= totalvfs; n++) {
-		err = pf_provision_exec_quantum(gt, VFID(n), exec_quantum);
-		if (err)
-			break;
-	}
-
-	return pf_config_bulk_set_u32_done(gt, 0, 1 + totalvfs, exec_quantum,
-					   pf_get_exec_quantum, "execution quantum",
-					   exec_quantum_unit, n, err);
+	return pf_bulk_set_exec_quantum(gt, exec_quantum, PFID, 1 + totalvfs);
 }
 
 static int pf_provision_groups_exec_quantums(struct xe_gt *gt, unsigned int vfid,
@@ -2293,6 +2390,17 @@ static u32 pf_get_preempt_timeout(struct xe_gt *gt, unsigned int vfid)
 	return config->preempt_timeout[0];
 }
 
+static bool pf_non_default_preempt_timeout(struct xe_gt *gt, unsigned int vfid)
+{
+	struct xe_gt_sriov_config *config = pf_pick_vf_config(gt, vfid);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(config->preempt_timeout); i++)
+		if (config->preempt_timeout[i])
+			return true;
+	return false;
+}
+
 /**
  * xe_gt_sriov_pf_config_set_preempt_timeout_locked() - Configure PF/VF preemption timeout.
  * @gt: the &xe_gt
@@ -2368,6 +2476,25 @@ u32 xe_gt_sriov_pf_config_get_preempt_timeout(struct xe_gt *gt, unsigned int vfi
 	return pf_get_preempt_timeout(gt, vfid);
 }
 
+static int pf_bulk_set_preempt_timeout(struct xe_gt *gt, u32 preempt_timeout,
+				       unsigned int first_vf, unsigned int num_vfs)
+{
+	unsigned int n;
+	int err = 0;
+
+	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
+
+	for (n = first_vf; n < first_vf + num_vfs; n++) {
+		err = pf_provision_preempt_timeout(gt, VFID(n), preempt_timeout);
+		if (err)
+			break;
+	}
+
+	return pf_config_bulk_set_u32_done(gt, first_vf, num_vfs, preempt_timeout,
+					   pf_get_preempt_timeout, "preemption timeout",
+					   preempt_timeout_unit, n, err);
+}
+
 /**
  * xe_gt_sriov_pf_config_bulk_set_preempt_timeout_locked() - Configure PT for PF and VFs.
  * @gt: the &xe_gt to configure
@@ -2380,20 +2507,8 @@ u32 xe_gt_sriov_pf_config_get_preempt_timeout(struct xe_gt *gt, unsigned int vfi
 int xe_gt_sriov_pf_config_bulk_set_preempt_timeout_locked(struct xe_gt *gt, u32 preempt_timeout)
 {
 	unsigned int totalvfs = xe_gt_sriov_pf_get_totalvfs(gt);
-	unsigned int n;
-	int err = 0;
 
-	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
-
-	for (n = 0; n <= totalvfs; n++) {
-		err = pf_provision_preempt_timeout(gt, VFID(n), preempt_timeout);
-		if (err)
-			break;
-	}
-
-	return pf_config_bulk_set_u32_done(gt, 0, 1 + totalvfs, preempt_timeout,
-					   pf_get_preempt_timeout, "preemption timeout",
-					   preempt_timeout_unit, n, err);
+	return pf_bulk_set_preempt_timeout(gt, preempt_timeout, PFID, 1 + totalvfs);
 }
 
 static int pf_provision_groups_preempt_timeouts(struct xe_gt *gt, unsigned int vfid,
@@ -2500,11 +2615,35 @@ static int pf_provision_sched_priority(struct xe_gt *gt, unsigned int vfid, u32 
 	return 0;
 }
 
-static int pf_get_sched_priority(struct xe_gt *gt, unsigned int vfid)
+static u32 pf_get_sched_priority(struct xe_gt *gt, unsigned int vfid)
 {
 	struct xe_gt_sriov_config *config = pf_pick_vf_config(gt, vfid);
 
 	return config->sched_priority;
+}
+
+/**
+ * xe_gt_sriov_pf_config_set_sched_priority_locked() - Configure scheduling priority.
+ * @gt: the &xe_gt
+ * @vfid: the VF identifier
+ * @priority: requested scheduling priority
+ *
+ * This function can only be called on PF with the master mutex hold.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int xe_gt_sriov_pf_config_set_sched_priority_locked(struct xe_gt *gt, unsigned int vfid,
+						    u32 priority)
+{
+	int err;
+
+	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
+
+	err = pf_provision_sched_priority(gt, vfid, priority);
+
+	return pf_config_set_u32_done(gt, vfid, priority,
+				      pf_get_sched_priority(gt, vfid),
+				      "scheduling priority", sched_priority_unit, err);
 }
 
 /**
@@ -2519,15 +2658,9 @@ static int pf_get_sched_priority(struct xe_gt *gt, unsigned int vfid)
  */
 int xe_gt_sriov_pf_config_set_sched_priority(struct xe_gt *gt, unsigned int vfid, u32 priority)
 {
-	int err;
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
 
-	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
-	err = pf_provision_sched_priority(gt, vfid, priority);
-	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
-
-	return pf_config_set_u32_done(gt, vfid, priority,
-				      xe_gt_sriov_pf_config_get_sched_priority(gt, vfid),
-				      "scheduling priority", sched_priority_unit, err);
+	return xe_gt_sriov_pf_config_set_sched_priority_locked(gt, vfid, priority);
 }
 
 /**
@@ -2550,6 +2683,35 @@ u32 xe_gt_sriov_pf_config_get_sched_priority(struct xe_gt *gt, unsigned int vfid
 	return priority;
 }
 
+/**
+ * xe_gt_sriov_pf_config_force_sched_priority_locked() - Force update scheduling priority.
+ * @gt: the &xe_gt
+ * @priority: new scheduling priority to set
+ *
+ * This function allows to update cached values of the scheduling priorities of all
+ * VFs (and PF) as result of applying the `GUC_KLV_VGT_POLICY_SCHED_IF_IDLE`_ policy.
+ *
+ * This function can only be called on PF.
+ */
+void xe_gt_sriov_pf_config_force_sched_priority_locked(struct xe_gt *gt, u32 priority)
+{
+	unsigned int total_vfs = xe_gt_sriov_pf_get_totalvfs(gt);
+	struct xe_gt_sriov_config *config;
+	unsigned int n;
+
+	xe_gt_assert(gt, IS_SRIOV_PF(gt_to_xe(gt)));
+	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
+
+	for (n = 0; n <= total_vfs; n++) {
+		config = pf_pick_vf_config(gt, VFID(n));
+		config->sched_priority = priority;
+	}
+
+	pf_config_bulk_set_u32_done(gt, PFID, 1 + total_vfs, priority,
+				    pf_get_sched_priority, "scheduling priority",
+				    sched_priority_unit, n, 0);
+}
+
 static void pf_reset_config_sched(struct xe_gt *gt, struct xe_gt_sriov_config *config)
 {
 	int i;
@@ -2560,6 +2722,121 @@ static void pf_reset_config_sched(struct xe_gt *gt, struct xe_gt_sriov_config *c
 		config->exec_quantum[i] = 0;
 		config->preempt_timeout[i] = 0;
 	}
+}
+
+static bool pf_non_default_sched(struct xe_gt *gt, unsigned int vfid)
+{
+	return pf_non_default_exec_quantum(gt, vfid) ||
+	       pf_non_default_preempt_timeout(gt, vfid) ||
+	       custom_sched_priority(gt, pf_get_sched_priority(gt, vfid));
+}
+
+static void __pf_show_provisioned_sched(struct xe_gt *gt, unsigned int first_vf,
+					unsigned int num_vfs, bool provisioned)
+{
+	__pf_show_provisioned(gt, first_vf, num_vfs, provisioned,
+			      pf_get_exec_quantum, NULL, "EQ");
+	__pf_show_provisioned(gt, first_vf, num_vfs, provisioned,
+			      pf_get_preempt_timeout, NULL, "PT");
+
+	/* we only care about non-default priorities */
+	if (provisioned)
+		__pf_show_provisioned(gt, first_vf, num_vfs, true,
+				      pf_get_sched_priority, NULL, "PRIORITY");
+}
+
+static void pf_show_all_provisioned_sched(struct xe_gt *gt)
+{
+	__pf_show_provisioned_sched(gt, PFID, 1 + xe_gt_sriov_pf_get_totalvfs(gt), true);
+}
+
+static void pf_show_unprovisioned_sched(struct xe_gt *gt, unsigned int num_vfs)
+{
+	__pf_show_provisioned_sched(gt, PFID, 1 + num_vfs, false);
+}
+
+static bool pf_needs_provision_sched(struct xe_gt *gt, unsigned int num_vfs)
+{
+	unsigned int vfid;
+
+	for (vfid = PFID; vfid <= PFID + num_vfs; vfid++) {
+		if (pf_non_default_sched(gt, vfid)) {
+			pf_show_all_provisioned_sched(gt);
+			pf_show_unprovisioned_sched(gt, num_vfs);
+			return false;
+		}
+	}
+
+	if (xe_gt_sriov_pf_policy_get_sched_if_idle_locked(gt)) {
+		pf_show_all_provisioned_sched(gt);
+		pf_show_unprovisioned_sched(gt, num_vfs);
+		return false;
+	}
+
+	pf_show_all_provisioned_sched(gt);
+	return true;
+}
+
+/* With 16ms EQ/PT GuC should be able to handle up to 63 VFs within 2s */
+#define XE_FAIR_EXEC_QUANTUM_MS		16
+#define XE_FAIR_PREEMPT_TIMEOUT_US	16000
+#define XE_FAIR_SCHED_PRIORITY		GUC_SCHED_PRIORITY_LOW
+#define XE_ADMIN_PF_SCHED_PRIORITY	GUC_SCHED_PRIORITY_HIGH
+
+/**
+ * xe_gt_sriov_pf_config_set_fair_sched_locked() - Provision PF and VFs with fair scheduling.
+ * @gt: the &xe_gt
+ * @num_vfs: number of VFs to provision (can't be 0)
+ *
+ * The caller must hold the master PF mutex.
+ * This function can only be called on PF.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int xe_gt_sriov_pf_config_set_fair_sched_locked(struct xe_gt *gt, unsigned int num_vfs)
+{
+	int result = 0;
+	int err;
+
+	xe_gt_assert(gt, num_vfs);
+	xe_gt_assert(gt, XE_FAIR_EXEC_QUANTUM_MS);
+	xe_gt_assert(gt, XE_FAIR_PREEMPT_TIMEOUT_US);
+
+	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
+
+	if (!pf_needs_provision_sched(gt, num_vfs))
+		return 0;
+
+	err = pf_bulk_set_exec_quantum(gt, XE_FAIR_EXEC_QUANTUM_MS, PFID, 1 + num_vfs);
+	result = result ?: err;
+	err = pf_bulk_set_preempt_timeout(gt, XE_FAIR_PREEMPT_TIMEOUT_US, PFID, 1 + num_vfs);
+	result = result ?: err;
+
+	xe_gt_assert(gt, XE_FAIR_SCHED_PRIORITY == GUC_SCHED_PRIORITY_LOW);
+	xe_gt_assert(gt, !xe_gt_sriov_pf_policy_get_sched_if_idle_locked(gt));
+
+	if (xe_sriov_pf_admin_only(gt_to_xe(gt))) {
+		err = pf_provision_sched_priority(gt, PFID, XE_ADMIN_PF_SCHED_PRIORITY);
+		result = result ?: err;
+	}
+
+	return result;
+}
+
+/**
+ * xe_gt_sriov_pf_config_set_fair_sched() - Provision PF and VFs with fair scheduling.
+ * @gt: the &xe_gt
+ * @num_vfs: number of VFs to provision (can't be 0)
+ *
+ * This function can only be called on PF.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int xe_gt_sriov_pf_config_set_fair_sched(struct xe_gt *gt, unsigned int num_vfs)
+{
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
+
+	return xe_gt_sriov_pf_config_set_fair_sched_locked(gt, num_vfs);
 }
 
 static int pf_provision_threshold(struct xe_gt *gt, unsigned int vfid,
@@ -2672,7 +2949,38 @@ static void pf_release_vf_config(struct xe_gt *gt, unsigned int vfid)
 }
 
 /**
- * xe_gt_sriov_pf_config_release - Release and reset VF configuration.
+ * xe_gt_sriov_pf_config_release_locked() - Release and reset VF configuration.
+ * @gt: the &xe_gt
+ * @vfid: the VF identifier (can't be PF)
+ * @force: force configuration release
+ *
+ * Note: The caller must hold the master PF mutex.
+ * This function can only be called on PF.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+int xe_gt_sriov_pf_config_release_locked(struct xe_gt *gt, unsigned int vfid, bool force)
+{
+	int err;
+
+	xe_gt_assert(gt, vfid);
+	lockdep_assert_held(xe_gt_sriov_pf_master_mutex(gt));
+
+	err = pf_send_vf_cfg_reset(gt, vfid);
+	if (!err || force)
+		pf_release_vf_config(gt, vfid);
+
+	if (unlikely(err)) {
+		xe_gt_sriov_notice(gt, "VF%u unprovisioning failed with error (%pe)%s\n",
+				   vfid, ERR_PTR(err),
+				   force ? " but all resources were released anyway!" : "");
+	}
+
+	return force ? 0 : err;
+}
+
+/**
+ * xe_gt_sriov_pf_config_release() - Release and reset VF configuration.
  * @gt: the &xe_gt
  * @vfid: the VF identifier (can't be PF)
  * @force: force configuration release
@@ -2683,23 +2991,9 @@ static void pf_release_vf_config(struct xe_gt *gt, unsigned int vfid)
  */
 int xe_gt_sriov_pf_config_release(struct xe_gt *gt, unsigned int vfid, bool force)
 {
-	int err;
+	guard(mutex)(xe_gt_sriov_pf_master_mutex(gt));
 
-	xe_gt_assert(gt, vfid);
-
-	mutex_lock(xe_gt_sriov_pf_master_mutex(gt));
-	err = pf_send_vf_cfg_reset(gt, vfid);
-	if (!err || force)
-		pf_release_vf_config(gt, vfid);
-	mutex_unlock(xe_gt_sriov_pf_master_mutex(gt));
-
-	if (unlikely(err)) {
-		xe_gt_sriov_notice(gt, "VF%u unprovisioning failed with error (%pe)%s\n",
-				   vfid, ERR_PTR(err),
-				   force ? " but all resources were released anyway!" : "");
-	}
-
-	return force ? 0 : err;
+	return xe_gt_sriov_pf_config_release_locked(gt, vfid, force);
 }
 
 static void pf_sanitize_ggtt(struct xe_ggtt_node *ggtt_region, unsigned int vfid)
@@ -2837,6 +3131,9 @@ static int pf_validate_vf_config(struct xe_gt *gt, unsigned int vfid)
 		valid_any = valid_any || (valid_lmem && is_primary);
 		valid_all = valid_all && valid_lmem;
 	}
+
+	/* also check optional EQ/PT/PRIO */
+	valid_any = valid_any || pf_non_default_sched(gt, vfid);
 
 	return valid_all ? 0 : valid_any ? -ENOKEY : -ENODATA;
 }

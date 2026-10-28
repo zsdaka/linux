@@ -150,7 +150,7 @@ static void virtfn_remove_bus(struct pci_bus *physbus, struct pci_bus *virtbus)
 		pci_remove_bus(virtbus);
 }
 
-resource_size_t pci_iov_resource_size(struct pci_dev *dev, int resno)
+resource_size_t pci_iov_resource_size(const struct pci_dev *dev, int resno)
 {
 	if (!dev->is_physfn)
 		return 0;
@@ -177,29 +177,6 @@ bool pci_iov_is_memory_decoding_enabled(struct pci_dev *dev)
 	pci_read_config_word(dev, dev->sriov->pos + PCI_SRIOV_CTRL, &cmd);
 
 	return cmd & PCI_SRIOV_CTRL_MSE;
-}
-
-static void pci_read_vf_config_common(struct pci_dev *virtfn)
-{
-	struct pci_dev *physfn = virtfn->physfn;
-
-	/*
-	 * Some config registers are the same across all associated VFs.
-	 * Read them once from VF0 so we can skip reading them from the
-	 * other VFs.
-	 *
-	 * PCIe r4.0, sec 9.3.4.1, technically doesn't require all VFs to
-	 * have the same Revision ID and Subsystem ID, but we assume they
-	 * do.
-	 */
-	pci_read_config_dword(virtfn, PCI_CLASS_REVISION,
-			      &physfn->sriov->class);
-	pci_read_config_byte(virtfn, PCI_HEADER_TYPE,
-			     &physfn->sriov->hdr_type);
-	pci_read_config_word(virtfn, PCI_SUBSYSTEM_VENDOR_ID,
-			     &physfn->sriov->subsystem_vendor);
-	pci_read_config_word(virtfn, PCI_SUBSYSTEM_ID,
-			     &physfn->sriov->subsystem_device);
 }
 
 int pci_iov_sysfs_link(struct pci_dev *dev,
@@ -329,8 +306,6 @@ static struct pci_dev *pci_iov_scan_device(struct pci_dev *dev, int id,
 	virtfn->physfn = pci_dev_get(dev);
 	virtfn->no_command_memory = 1;
 
-	if (id == 0)
-		pci_read_vf_config_common(virtfn);
 
 	rc = pci_setup_device(virtfn);
 	if (rc) {
@@ -938,16 +913,21 @@ static void sriov_restore_vf_rebar_state(struct pci_dev *dev)
 		return;
 
 	pci_read_config_dword(dev, pos + PCI_VF_REBAR_CTRL, &ctrl);
+	if (PCI_POSSIBLE_ERROR(ctrl))
+		return;
+
 	nbars = FIELD_GET(PCI_VF_REBAR_CTRL_NBAR_MASK, ctrl);
 
 	for (i = 0; i < nbars; i++, pos += 8) {
 		int bar_idx, size;
 
 		pci_read_config_dword(dev, pos + PCI_VF_REBAR_CTRL, &ctrl);
+		if (PCI_POSSIBLE_ERROR(ctrl))
+			return;
+
 		bar_idx = FIELD_GET(PCI_VF_REBAR_CTRL_BAR_IDX, ctrl);
 		size = pci_rebar_bytes_to_size(dev->sriov->barsz[bar_idx]);
-		ctrl &= ~PCI_VF_REBAR_CTRL_BAR_SIZE;
-		ctrl |= FIELD_PREP(PCI_VF_REBAR_CTRL_BAR_SIZE, size);
+		FIELD_MODIFY(PCI_VF_REBAR_CTRL_BAR_SIZE, &ctrl, size);
 		pci_write_config_dword(dev, pos + PCI_VF_REBAR_CTRL, ctrl);
 	}
 }
@@ -1084,7 +1064,7 @@ void pci_iov_update_resource(struct pci_dev *dev, int resno)
 	}
 }
 
-resource_size_t __weak pcibios_iov_resource_alignment(struct pci_dev *dev,
+resource_size_t __weak pcibios_iov_resource_alignment(const struct pci_dev *dev,
 						      int resno)
 {
 	return pci_iov_resource_size(dev, resno);
@@ -1100,7 +1080,8 @@ resource_size_t __weak pcibios_iov_resource_alignment(struct pci_dev *dev,
  * the VF BAR size multiplied by the number of VFs.  The alignment
  * is just the VF BAR size.
  */
-resource_size_t pci_sriov_resource_alignment(struct pci_dev *dev, int resno)
+resource_size_t pci_sriov_resource_alignment(const struct pci_dev *dev,
+					     int resno)
 {
 	return pcibios_iov_resource_alignment(dev, resno);
 }
@@ -1277,7 +1258,7 @@ EXPORT_SYMBOL_GPL(pci_sriov_set_totalvfs);
  * SRIOV capability value of TotalVFs or the value of driver_max_VFs
  * if the driver reduced it.  Otherwise 0.
  */
-int pci_sriov_get_totalvfs(struct pci_dev *dev)
+unsigned int pci_sriov_get_totalvfs(struct pci_dev *dev)
 {
 	if (!dev->is_physfn)
 		return 0;

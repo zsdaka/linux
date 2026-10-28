@@ -255,7 +255,7 @@ static void trace_noc_remove(struct amba_device *adev)
 	coresight_trace_id_put_system_id(drvdata->atid);
 }
 
-static struct amba_id trace_noc_ids[] = {
+static const struct amba_id trace_noc_ids[] = {
 	{
 		.id     = 0x000f0c00,
 		.mask   = 0x00ffff00,
@@ -344,7 +344,7 @@ static struct platform_driver itnoc_driver = {
 
 static int __init tnoc_init(void)
 {
-	return coresight_init_driver("tnoc", &trace_noc_driver, &itnoc_driver, THIS_MODULE);
+	return coresight_init_driver("tnoc", &trace_noc_driver, &itnoc_driver);
 }
 
 static void __exit tnoc_exit(void)

@@ -123,6 +123,15 @@ enum v4l2_colorfx {
 #define V4L2_CID_USER_MEYE_BASE			(V4L2_CID_USER_BASE + 0x1000)
 #endif
 
+/*
+ * The base for the vim2m driver controls.
+ * We reserve 16 controls for this driver.
+ * The vim2m control range clashed with the meye control range, which was not
+ * intended, but since the meye driver has been removed, we can just keep the
+ * vim2m control range.
+ */
+#define V4L2_CID_USER_VIM2M_BASE		(V4L2_CID_USER_BASE + 0x1000)
+
 /* The base for the bttv driver controls.
  * We reserve 32 controls for this driver. */
 #define V4L2_CID_USER_BTTV_BASE			(V4L2_CID_USER_BASE + 0x1010)
@@ -233,6 +242,18 @@ enum v4l2_colorfx {
  * We reserve 16 controls for this driver
  */
 #define V4L2_CID_USER_MALI_C55_BASE		(V4L2_CID_USER_BASE + 0x1230)
+
+/*
+ * The base for the ST DCMIPP driver controls.
+ * We reserve 16 controls for this driver
+ */
+#define V4L2_CID_USER_DCMIPP_BASE		(V4L2_CID_USER_BASE + 0x1240)
+
+/*
+ * The base for IT6625/IT6626 driver controls.
+ * We reserve 16 controls for this driver.
+ */
+#define V4L2_CID_USER_IT6625_BASE		(V4L2_CID_USER_BASE + 0x1250)
 
 /* MPEG-class control IDs */
 /* The MPEG controls are applicable to all codec controls
@@ -463,6 +484,8 @@ enum v4l2_mpeg_video_intra_refresh_period_type {
 	V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE_RANDOM	= 0,
 	V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE_CYCLIC	= 1,
 };
+
+#define V4L2_CID_MPEG_VIDEO_BACKGROUND_DETECTION	(V4L2_CID_CODEC_BASE + 238)
 
 /* CIDs for the MPEG-2 Part 2 (H.262) codec */
 #define V4L2_CID_MPEG_VIDEO_MPEG2_LEVEL			(V4L2_CID_CODEC_BASE+270)

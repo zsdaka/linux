@@ -116,10 +116,9 @@ struct dentry {
 					 * possible!
 					 */
 
-	union {
-		struct list_head d_lru;		/* LRU list */
-		wait_queue_head_t *d_wait;	/* in-lookup ones only */
-	};
+	/* lockdep tracking of DCACHE_PAR_LOOKUP locks */
+	struct lockdep_map		dep_map;
+	struct list_head d_lru;		/* LRU list */
 	struct hlist_node d_sib;	/* child of parent list */
 	struct hlist_head d_children;	/* our children */
 	/*
@@ -210,6 +209,9 @@ enum dentry_flags {
 	DCACHE_REFERENCED		= BIT(6),	/* Recently used, don't discard. */
 	DCACHE_DONTCACHE		= BIT(7),	/* Purge from memory on final dput() */
 	DCACHE_CANT_MOUNT		= BIT(8),
+	DCACHE_LOOKUP_WAITERS		= BIT(9),	/* A thread is waiting for
+							 * PAR_LOOKUP to clear
+							 */
 	DCACHE_SHRINK_LIST		= BIT(10),
 	DCACHE_OP_WEAK_REVALIDATE	= BIT(11),
 	/*
@@ -236,7 +238,9 @@ enum dentry_flags {
 	DCACHE_PAR_LOOKUP		= BIT(24),	/* being looked up (with parent locked shared) */
 	DCACHE_DENTRY_CURSOR		= BIT(25),
 	DCACHE_NORCU			= BIT(26),	/* No RCU delay for freeing */
-	DCACHE_PERSISTENT		= BIT(27)
+	DCACHE_PERSISTENT		= BIT(27),
+/* 28, 29, 30 free */
+	DCACHE_PRIVATE			= BIT(31)	/* fs-specific flag */
 };
 
 #define DCACHE_MANAGED_DENTRY \
@@ -256,9 +260,10 @@ extern void d_delete(struct dentry *);
 /* allocate/de-allocate */
 extern struct dentry * d_alloc(struct dentry *, const struct qstr *);
 extern struct dentry * d_alloc_anon(struct super_block *);
-extern struct dentry * d_alloc_parallel(struct dentry *, const struct qstr *,
-					wait_queue_head_t *);
+extern struct dentry * d_alloc_parallel(struct dentry *, const struct qstr *);
+extern struct dentry * d_alloc_trylock(struct dentry *, struct qstr *);
 extern struct dentry * d_splice_alias(struct inode *, struct dentry *);
+struct dentry *d_duplicate(struct dentry *dentry);
 /* weird procfs mess; *NOT* exported */
 extern struct dentry * d_splice_alias_ops(struct inode *, struct dentry *,
 					  const struct dentry_operations *);
@@ -281,7 +286,7 @@ extern void d_tmpfile(struct file *, struct inode *);
 
 extern struct dentry *d_find_alias(struct inode *);
 extern void d_prune_aliases(struct inode *);
-extern void d_dispose_if_unused(struct dentry *, struct list_head *);
+extern bool __move_to_shrink_list(struct dentry *, struct list_head *);
 extern void shrink_dentry_list(struct list_head *);
 
 extern struct dentry *d_find_alias_rcu(struct inode *);
@@ -364,6 +369,24 @@ static inline struct dentry *dget(struct dentry *dentry)
 	if (dentry)
 		lockref_get(&dentry->d_lockref);
 	return dentry;
+}
+
+/* dentry->d_inode->i_lock must be held by caller */
+static inline bool dget_alias_ilocked(struct dentry *dentry)
+{
+	if (likely(!(READ_ONCE(dentry->d_flags) & DCACHE_NORCU))) {
+		lockref_get(&dentry->d_lockref);
+		return true;
+	}
+	// NORCU dentries with zero refcount MUST NOT be grabbed
+	spin_lock(&dentry->d_lock);
+	if (dentry->d_lockref.count > 0) {
+		dget_dlock(dentry);
+		spin_unlock(&dentry->d_lock);
+		return true;
+	}
+	spin_unlock(&dentry->d_lock);
+	return false;
 }
 
 extern struct dentry *dget_parent(struct dentry *dentry);
@@ -534,6 +557,36 @@ static inline int simple_positive(const struct dentry *dentry)
 }
 
 unsigned long vfs_pressure_ratio(unsigned long val);
+
+/**
+ * d_lookup_release - release ownership of DCACHE_PAR_LOOKUP lock
+ * @dentry: dentry that is locked
+ *
+ * If an in-lookup dentry is to be passed to another thread which
+ * will drop the in-lookup lock, then d_lookup_release() must be called
+ * to tell lockdep that this thread no lock holds the lock.  The
+ * thread that receives the lock must call d_lookup_acquire() to
+ * acquire the lock.
+ */
+static inline void d_lookup_release(struct dentry *dentry)
+{
+	if (d_in_lookup(dentry))
+		lock_map_release(&dentry->dep_map);
+}
+
+/**
+ * d_lookup_acquire - acquire ownership of DCACHE_PAR_LOOKUP lock
+ * @dentry: dentry that is locked
+ *
+ * If an in-lookup dentry was passed to this thread, the
+ * d_lookup_acquire() must be called to tell lockdep that this
+ * thread now owns the DCACHE_PAR_LOOKUP lock.
+ */
+static inline void d_lookup_acquire(struct dentry *dentry)
+{
+	if (d_in_lookup(dentry))
+		lock_map_acquire_try(&dentry->dep_map);
+}
 
 /**
  * d_inode - Get the actual inode of this dentry

@@ -21,7 +21,7 @@
 #include "vs_plane.h"
 
 static void vs_crtc_atomic_disable(struct drm_crtc *crtc,
-				   struct drm_atomic_state *state)
+				   struct drm_atomic_commit *state)
 {
 	struct vs_crtc *vcrtc = drm_crtc_to_vs_crtc(crtc);
 	struct vs_dc *dc = vcrtc->dc;
@@ -33,7 +33,7 @@ static void vs_crtc_atomic_disable(struct drm_crtc *crtc,
 }
 
 static void vs_crtc_atomic_enable(struct drm_crtc *crtc,
-				  struct drm_atomic_state *state)
+				  struct drm_atomic_commit *state)
 {
 	struct vs_crtc *vcrtc = drm_crtc_to_vs_crtc(crtc);
 	struct vs_dc *dc = vcrtc->dc;
@@ -149,7 +149,7 @@ static const struct drm_crtc_funcs vs_crtc_funcs = {
 	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
 	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
 	.page_flip		= drm_atomic_helper_page_flip,
-	.reset			= drm_atomic_helper_crtc_reset,
+	.atomic_create_state = drm_atomic_helper_crtc_create_state,
 	.set_config		= drm_atomic_helper_set_config,
 	.enable_vblank		= vs_crtc_enable_vblank,
 	.disable_vblank		= vs_crtc_disable_vblank,
@@ -159,7 +159,7 @@ struct vs_crtc *vs_crtc_init(struct drm_device *drm_dev, struct vs_dc *dc,
 			     unsigned int output)
 {
 	struct vs_crtc *vcrtc;
-	struct drm_plane *primary;
+	struct drm_plane *primary, *cursor;
 	int ret;
 
 	vcrtc = drmm_kzalloc(drm_dev, sizeof(*vcrtc), GFP_KERNEL);
@@ -175,9 +175,16 @@ struct vs_crtc *vs_crtc_init(struct drm_device *drm_dev, struct vs_dc *dc,
 		return ERR_PTR(PTR_ERR(primary));
 	}
 
+	/* Create our cursor plane */
+	cursor = vs_cursor_plane_init(drm_dev, dc);
+	if (IS_ERR(cursor)) {
+		drm_err(drm_dev, "Couldn't create the cursor plane\n");
+		return ERR_CAST(cursor);
+	}
+
 	ret = drmm_crtc_init_with_planes(drm_dev, &vcrtc->base,
 					 primary,
-					 NULL,
+					 cursor,
 					 &vs_crtc_funcs,
 					 NULL);
 	if (ret) {

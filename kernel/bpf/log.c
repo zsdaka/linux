@@ -13,17 +13,17 @@
 
 #define verbose(env, fmt, args...) bpf_verifier_log_write(env, fmt, ##args)
 
-static bool bpf_verifier_log_attr_valid(const struct bpf_verifier_log *log)
+static bool bpf_verifier_log_attr_valid(u32 log_level, char __user *log_buf, u32 log_size)
 {
 	/* ubuf and len_total should both be specified (or not) together */
-	if (!!log->ubuf != !!log->len_total)
+	if (!!log_buf != !!log_size)
 		return false;
 	/* log buf without log_level is meaningless */
-	if (log->ubuf && log->level == 0)
+	if (log_buf && log_level == 0)
 		return false;
-	if (log->level & ~BPF_LOG_MASK)
+	if (log_level & ~BPF_LOG_MASK)
 		return false;
-	if (log->len_total > UINT_MAX >> 2)
+	if (log_size > UINT_MAX >> 2)
 		return false;
 	return true;
 }
@@ -36,7 +36,7 @@ int bpf_vlog_init(struct bpf_verifier_log *log, u32 log_level,
 	log->len_total = log_size;
 
 	/* log attributes have to be sane */
-	if (!bpf_verifier_log_attr_valid(log))
+	if (!bpf_verifier_log_attr_valid(log_level, log_buf, log_size))
 		return -EINVAL;
 
 	return 0;
@@ -527,7 +527,7 @@ static void verbose_unum(struct bpf_verifier_env *env, u64 num)
 		verbose(env, "%#llx", num);
 }
 
-static void verbose_snum(struct bpf_verifier_env *env, s64 num)
+void bpf_verbose_snum(struct bpf_verifier_env *env, s64 num)
 {
 	if (is_snum_decimal(num))
 		verbose(env, "%lld", num);
@@ -571,20 +571,20 @@ static void print_scalar_ranges(struct bpf_verifier_env *env,
 		u64 val;
 		bool omit;
 	} minmaxs[] = {
-		{"smin",   reg->smin_value,         reg->smin_value == S64_MIN},
-		{"smax",   reg->smax_value,         reg->smax_value == S64_MAX},
-		{"umin",   reg->umin_value,         reg->umin_value == 0},
-		{"umax",   reg->umax_value,         reg->umax_value == U64_MAX},
+		{"smin",   reg_smin(reg),         reg_smin(reg) == S64_MIN},
+		{"smax",   reg_smax(reg),         reg_smax(reg) == S64_MAX},
+		{"umin",   reg_umin(reg),         reg_umin(reg) == 0},
+		{"umax",   reg_umax(reg),         reg_umax(reg) == U64_MAX},
 		{"smin32",
-		 is_snum_decimal((s64)reg->s32_min_value)
-			 ? (s64)reg->s32_min_value
-			 : (u32)reg->s32_min_value, reg->s32_min_value == S32_MIN},
+		 is_snum_decimal((s64)reg_s32_min(reg))
+			 ? (s64)reg_s32_min(reg)
+			 : (u32)reg_s32_min(reg), reg_s32_min(reg) == S32_MIN},
 		{"smax32",
-		 is_snum_decimal((s64)reg->s32_max_value)
-			 ? (s64)reg->s32_max_value
-			 : (u32)reg->s32_max_value, reg->s32_max_value == S32_MAX},
-		{"umin32", reg->u32_min_value,      reg->u32_min_value == 0},
-		{"umax32", reg->u32_max_value,      reg->u32_max_value == U32_MAX},
+		 is_snum_decimal((s64)reg_s32_max(reg))
+			 ? (s64)reg_s32_max(reg)
+			 : (u32)reg_s32_max(reg), reg_s32_max(reg) == S32_MAX},
+		{"umin32", reg_u32_min(reg),      reg_u32_min(reg) == 0},
+		{"umax32", reg_u32_max(reg),      reg_u32_max(reg) == U32_MAX},
 	}, *m1, *m2, *mend = &minmaxs[ARRAY_SIZE(minmaxs)];
 	bool neg1, neg2;
 
@@ -609,20 +609,9 @@ static void print_scalar_ranges(struct bpf_verifier_env *env,
 		}
 
 		if (m1->name[0] == 's')
-			verbose_snum(env, m1->val);
+			bpf_verbose_snum(env, m1->val);
 		else
 			verbose_unum(env, m1->val);
-	}
-}
-
-static bool type_is_map_ptr(enum bpf_reg_type t) {
-	switch (base_type(t)) {
-	case CONST_PTR_TO_MAP:
-	case PTR_TO_MAP_KEY:
-	case PTR_TO_MAP_VALUE:
-		return true;
-	default:
-		return false;
 	}
 }
 
@@ -643,7 +632,7 @@ static void print_reg_state(struct bpf_verifier_env *env,
 	if (t == SCALAR_VALUE && reg->precise)
 		verbose(env, "P");
 	if (t == SCALAR_VALUE && tnum_is_const(reg->var_off)) {
-		verbose_snum(env, reg->var_off.value);
+		bpf_verbose_snum(env, reg->var_off.value);
 		return;
 	}
 
@@ -654,7 +643,7 @@ static void print_reg_state(struct bpf_verifier_env *env,
 		if (state->frameno != reg->frameno)
 			verbose(env, "[%d]", reg->frameno);
 		if (tnum_is_const(reg->var_off)) {
-			verbose_snum(env, reg->var_off.value + reg->delta);
+			bpf_verbose_snum(env, reg->var_off.value + reg->delta);
 			return;
 		}
 	}
@@ -665,8 +654,8 @@ static void print_reg_state(struct bpf_verifier_env *env,
 		verbose_a("id=%d", reg->id & ~BPF_ADD_CONST);
 	if (reg->id & BPF_ADD_CONST)
 		verbose(env, "%+d", reg->delta);
-	if (reg->ref_obj_id)
-		verbose_a("ref_obj_id=%d", reg->ref_obj_id);
+	if (reg->parent_id)
+		verbose_a("parent_id=%d", reg->parent_id);
 	if (type_is_non_owning_ref(reg->type))
 		verbose_a("%s", "non_own_ref");
 	if (type_is_map_ptr(t)) {
@@ -678,7 +667,7 @@ static void print_reg_state(struct bpf_verifier_env *env,
 	}
 	if (t != SCALAR_VALUE && reg->delta) {
 		verbose_a("off=");
-		verbose_snum(env, reg->delta);
+		bpf_verbose_snum(env, reg->delta);
 	}
 	if (type_is_pkt_pointer(t)) {
 		verbose_a("r=");
@@ -694,7 +683,7 @@ static void print_reg_state(struct bpf_verifier_env *env,
 		/* a pointer register with fixed offset */
 		if (reg->var_off.value) {
 			verbose_a("imm=");
-			verbose_snum(env, reg->var_off.value);
+			bpf_verbose_snum(env, reg->var_off.value);
 		}
 	} else {
 		print_scalar_ranges(env, reg, &sep);
@@ -704,6 +693,8 @@ static void print_reg_state(struct bpf_verifier_env *env,
 			tnum_strn(tn_buf, sizeof(tn_buf), reg->var_off);
 			verbose_a("var_off=%s", tn_buf);
 		}
+		if (reg->base != 0 || reg->step != 1)
+			verbose_a("step=%d+%d", reg->base, reg->step);
 	}
 	verbose(env, ")");
 }
@@ -727,7 +718,8 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 		verbose(env, "=");
 		print_reg_state(env, state, reg);
 	}
-	for (i = 0; i < state->allocated_stack / BPF_REG_SIZE; i++) {
+	for (i = 0; i < bpf_stack_nr_slots(state); i++) {
+		struct bpf_stack_state *slot = bpf_stack_slot(state, i);
 		char types_buf[BPF_REG_SIZE + 1];
 		const char *sep = "";
 		bool valid = false;
@@ -738,7 +730,7 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 			continue;
 
 		for (j = 0; j < BPF_REG_SIZE; j++) {
-			slot_type = state->stack[i].slot_type[j];
+			slot_type = slot->slot_type[j];
 			if (slot_type != STACK_INVALID && slot_type != STACK_POISON)
 				valid = true;
 			types_buf[j] = slot_type_char[slot_type];
@@ -747,12 +739,12 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 		if (!valid)
 			continue;
 
-		reg = &state->stack[i].spilled_ptr;
-		switch (state->stack[i].slot_type[BPF_REG_SIZE - 1]) {
+		reg = &slot->spilled_ptr;
+		switch (slot->slot_type[BPF_REG_SIZE - 1]) {
 		case STACK_SPILL:
 			/* print MISC/ZERO/INVALID slots above subreg spill */
 			for (j = 0; j < BPF_REG_SIZE; j++)
-				if (state->stack[i].slot_type[j] == STACK_SPILL)
+				if (slot->slot_type[j] == STACK_SPILL)
 					break;
 			types_buf[j] = '\0';
 
@@ -762,27 +754,25 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 		case STACK_DYNPTR:
 			/* skip to main dynptr slot */
 			i += BPF_DYNPTR_NR_SLOTS - 1;
-			reg = &state->stack[i].spilled_ptr;
+			reg = &bpf_stack_slot(state, i)->spilled_ptr;
 
 			verbose(env, " fp%d", (-i - 1) * BPF_REG_SIZE);
 			verbose(env, "=dynptr_%s(", dynptr_type_str(reg->dynptr.type));
 			if (reg->id)
 				verbose_a("id=%d", reg->id);
-			if (reg->ref_obj_id)
-				verbose_a("ref_id=%d", reg->ref_obj_id);
-			if (reg->dynptr_id)
-				verbose_a("dynptr_id=%d", reg->dynptr_id);
+			if (reg->parent_id)
+				verbose_a("parent_id=%d", reg->parent_id);
 			verbose(env, ")");
 			break;
 		case STACK_ITER:
-			/* only main slot has ref_obj_id set; skip others */
-			if (!reg->ref_obj_id)
+			/* only main slot has id set; skip others */
+			if (!reg->id)
 				continue;
 
-			verbose(env, " fp%d=iter_%s(ref_id=%d,state=%s,depth=%u)",
+			verbose(env, " fp%d=iter_%s(id=%d,state=%s,depth=%u)",
 				(-i - 1) * BPF_REG_SIZE,
 				iter_type_str(reg->iter.btf, reg->iter.btf_id),
-				reg->ref_obj_id, iter_state_str(reg->iter.state),
+				reg->id, iter_state_str(reg->iter.state),
 				reg->iter.depth);
 			break;
 		case STACK_MISC:
@@ -802,6 +792,11 @@ void print_verifier_state(struct bpf_verifier_env *env, const struct bpf_verifie
 		verbose(env, " cb");
 	if (state->in_async_callback_fn)
 		verbose(env, " async_cb");
+	if (state->loop_stack_cnt) {
+		verbose(env, " loop_stack=");
+		for (i = 0; i < state->loop_stack_cnt; i++)
+			verbose(env, "%s%d", i ? "," : "", state->loop_stack[i].loop_id);
+	}
 	verbose(env, "\n");
 	if (!print_all)
 		mark_verifier_state_clean(env);
@@ -824,4 +819,82 @@ void print_insn_state(struct bpf_verifier_env *env, const struct bpf_verifier_st
 		verbose(env, "%d:", env->insn_idx);
 	}
 	print_verifier_state(env, vstate, frameno, false);
+}
+
+int bpf_log_attr_init(struct bpf_log_attr *log, u64 log_buf, u32 log_size, u32 log_level,
+		      u32 offsetof_log_true_size, bpfptr_t uattr, struct bpf_common_attr *common,
+		      bpfptr_t uattr_common, u32 size_common)
+{
+	char __user *ubuf_common = u64_to_user_ptr(common->log_buf);
+	char __user *ubuf = u64_to_user_ptr(log_buf);
+
+	if (!bpf_verifier_log_attr_valid(common->log_level, ubuf_common, common->log_size) ||
+	    !bpf_verifier_log_attr_valid(log_level, ubuf, log_size))
+		return -EINVAL;
+
+	if (ubuf && ubuf_common && (ubuf != ubuf_common || log_size != common->log_size ||
+				    log_level != common->log_level))
+		return -EINVAL;
+
+	memset(log, 0, sizeof(*log));
+	log->ubuf = ubuf;
+	log->size = log_size;
+	log->level = log_level;
+	log->offsetof_true_size = offsetof_log_true_size;
+	log->uattr = uattr;
+
+	if (!ubuf && ubuf_common) {
+		log->ubuf = ubuf_common;
+		log->size = common->log_size;
+		log->level = common->log_level;
+		log->uattr = uattr_common;
+		log->offsetof_true_size = 0;
+		if (size_common >= offsetofend(struct bpf_common_attr, log_true_size))
+			log->offsetof_true_size = offsetof(struct bpf_common_attr, log_true_size);
+	}
+	return 0;
+}
+
+struct bpf_verifier_log *bpf_log_attr_create_vlog(struct bpf_log_attr *attr_log,
+						  struct bpf_common_attr *common, bpfptr_t uattr,
+						  u32 size)
+{
+	struct bpf_verifier_log *log;
+	int err;
+
+	memset(attr_log, 0, sizeof(*attr_log));
+	attr_log->uattr = uattr;
+	if (size >= offsetofend(struct bpf_common_attr, log_true_size))
+		attr_log->offsetof_true_size = offsetof(struct bpf_common_attr, log_true_size);
+
+	if (!size)
+		return NULL;
+
+	log = kzalloc_obj(*log);
+	if (!log)
+		return ERR_PTR(-ENOMEM);
+
+	err = bpf_vlog_init(log, common->log_level, u64_to_user_ptr(common->log_buf),
+			    common->log_size);
+	if (err) {
+		kfree(log);
+		return ERR_PTR(err);
+	}
+
+	return log;
+}
+
+int bpf_log_attr_finalize(struct bpf_log_attr *attr, struct bpf_verifier_log *log)
+{
+	u32 log_true_size;
+	int err;
+
+	err = bpf_vlog_finalize(log, &log_true_size);
+
+	if (attr->offsetof_true_size &&
+	    copy_to_bpfptr_offset(attr->uattr, attr->offsetof_true_size, &log_true_size,
+				  sizeof(log_true_size)))
+		return -EFAULT;
+
+	return err;
 }

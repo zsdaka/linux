@@ -945,10 +945,19 @@ static int cs530x_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
 				  val << CS530X_ASP_TDM_SLOT_SHIFT);
 }
 
+static const u64 cs530x_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_IF;
+
 static const struct snd_soc_dai_ops cs530x_dai_ops = {
 	.set_fmt = cs530x_set_fmt,
 	.hw_params = cs530x_hw_params,
 	.set_tdm_slot = cs530x_set_tdm_slot,
+	.auto_selectable_formats        = &cs530x_selectable_formats,
+	.num_auto_selectable_formats    = 1,
 };
 
 static const struct snd_soc_dai_driver cs530x_dai = {
@@ -1093,6 +1102,29 @@ static int cs530x_component_probe(struct snd_soc_component *component)
 	return 0;
 }
 
+static bool cs530x_mclk_freq_is_valid(struct cs530x_priv *cs530x,
+				      unsigned int freq)
+{
+	/*
+	 * All these chips support 48 kHz- and 44.1 kHz-related sample rates,
+	 * but they differ in what MCLK frequency is required for achieving
+	 * the sample rate.
+	 */
+	switch (cs530x->devtype) {
+	case CS4282:
+	case CS4302:
+	case CS4304:
+	case CS4308:
+		return freq == 49152000 || freq == 45158400;
+	case CS5302:
+	case CS5304:
+	case CS5308:
+		return freq == 24576000 || freq == 22579200;
+	}
+
+	return false;
+}
+
 static int cs530x_set_sysclk(struct snd_soc_component *component, int clk_id,
 			     int source, unsigned int freq, int dir)
 {
@@ -1101,11 +1133,7 @@ static int cs530x_set_sysclk(struct snd_soc_component *component, int clk_id,
 
 	switch (source) {
 	case CS530X_SYSCLK_SRC_MCLK:
-		switch (freq) {
-		case CS530X_SYSCLK_REF_45_1MHZ:
-		case CS530X_SYSCLK_REF_49_1MHZ:
-			break;
-		default:
+		if (!cs530x_mclk_freq_is_valid(cs530x, freq)) {
 			dev_err(component->dev, "Invalid MCLK source rate %d\n", freq);
 			return -EINVAL;
 		}

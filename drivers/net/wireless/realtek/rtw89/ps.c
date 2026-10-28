@@ -187,12 +187,7 @@ void rtw89_enter_lps(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif,
 
 	rtw89_fw_h2c_rf_ps_info(rtwdev, rtwvif);
 
-	if (RTW89_CHK_FW_FEATURE(LPS_CH_INFO, &rtwdev->fw))
-		rtw89_fw_h2c_lps_ch_info(rtwdev, rtwvif);
-	else if (RTW89_CHK_FW_FEATURE(LPS_ML_INFO_V1, &rtwdev->fw))
-		rtw89_fw_h2c_lps_ml_cmn_info_v1(rtwdev, rtwvif);
-	else
-		rtw89_fw_h2c_lps_ml_cmn_info(rtwdev, rtwvif);
+	rtw89_fw_h2c_lps_ch_ml_info_routing(rtwdev, rtwvif);
 
 	if (ps_mode && can_ps_mode)
 		__rtw89_enter_ps_mode(rtwdev);
@@ -234,7 +229,13 @@ void rtw89_enter_ips(struct rtw89_dev *rtwdev)
 {
 	struct rtw89_vif_link *rtwvif_link;
 	struct rtw89_vif *rtwvif;
+	struct rtw89_hal *hal = &rtwdev->hal;
 	unsigned int link_id;
+
+	if (hal->disabled_dm_bitmap & BIT(RTW89_DM_INACTIVE_PS)) {
+		rtw89_debug(rtwdev, RTW89_DBG_PS, "skip enter IPS due to disabled_dm\n");
+		return;
+	}
 
 	set_bit(RTW89_FLAG_INACTIVE_PS, rtwdev->flags);
 
@@ -357,15 +358,12 @@ void rtw89_recalc_lps(struct rtw89_dev *rtwdev)
 {
 	struct ieee80211_vif *vif, *found_vif = NULL;
 	struct rtw89_vif *rtwvif;
-	enum rtw89_entity_mode mode;
 	int count = 0;
-
-	mode = rtw89_get_entity_mode(rtwdev);
-	if (mode == RTW89_ENTITY_MODE_MCC)
-		goto disable_lps;
 
 	rtw89_for_each_rtwvif(rtwdev, rtwvif) {
 		vif = rtwvif_to_vif(rtwvif);
+		if (vif->type == NL80211_IFTYPE_P2P_DEVICE)
+			continue;
 
 		if (vif->type != NL80211_IFTYPE_STATION) {
 			count = 0;
@@ -381,7 +379,6 @@ void rtw89_recalc_lps(struct rtw89_dev *rtwdev)
 		return;
 	}
 
-disable_lps:
 	rtw89_leave_lps(rtwdev);
 	rtwdev->lps_enabled = false;
 }

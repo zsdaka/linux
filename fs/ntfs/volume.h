@@ -43,6 +43,7 @@
  * @mft_record_size: in bytes
  * @mft_record_size_mask: mft_record_size - 1
  * @mft_record_size_bits: log2(mft_record_size)
+ * @mft_write_supported: Whether the MFT write paths support the geometry.
  * @index_record_size: in bytes
  * @index_record_size_mask: index_record_size - 1
  * @index_record_size_bits: log2(index_record_size)
@@ -55,6 +56,10 @@
  * @attrdef_size: Size of the attribute definition table in bytes.
  * @attrdef: Table of attribute definitions. Obtained from FILE_AttrDef.
  * @mft_data_pos: Mft record number at which to allocate the next mft record.
+ * @mft_record_reserve_pos: First record in the in-memory MFT metadata reserve
+ *                         (protected by mftbmp_lock).
+ * @mft_record_reserve_end: First record beyond the MFT metadata reserve
+ *                         (protected by mftbmp_lock).
  * @mft_zone_start: First cluster of the mft zone.
  * @mft_zone_end: First cluster beyond the mft zone.
  * @mft_zone_pos: Current position in the mft zone.
@@ -72,16 +77,16 @@
  * @vol_flags: Volume flags.
  * @major_ver: Ntfs major version of volume.
  * @minor_ver: Ntfs minor version of volume.
+ * @volume_label_lock: protects @volume_label.
  * @volume_label: volume label.
  * @root_ino: The VFS inode of the root directory.
  * @secure_ino: The VFS inode of $Secure (NTFS3.0+ only, otherwise NULL).
  * @extend_ino: The VFS inode of $Extend (NTFS3.0+ only, otherwise NULL).
- * @quota_ino: The VFS inode of $Quota.
- * @quota_q_ino: Attribute inode for $Quota/$Q.
  * @nls_map: NLS (National Language Support) table.
  * @nls_utf8: NLS table for UTF-8.
  * @free_waitq: Wait queue for threads waiting for free clusters or MFT records.
  * @free_clusters: Track the number of free clusters.
+ * @bad_clusters: Number of clusters recorded in $BadClus:$Bad.
  * @free_mft_records: Track the free mft records.
  * @dirty_clusters: Number of clusters that are dirty.
  * @sparse_compression_unit: Size of compression/sparse unit in clusters.
@@ -108,10 +113,18 @@ struct ntfs_volume {
 	u32 mft_record_size;
 	u32 mft_record_size_mask;
 	u8 mft_record_size_bits;
+	bool mft_write_supported;
+	/*
+	 * Unit size used for MFT I/O. This is the MFT record size when
+	 * it is at least as large as the device logical block, or the
+	 * containing device logical block when the record is smaller.
+	 */
+	u32 mft_io_unit_size;
 	u32 index_record_size;
 	u32 index_record_size_mask;
 	u8 index_record_size_bits;
 	s64 nr_clusters;
+	s64 bad_clusters;
 	s64 mft_lcn;
 	s64 mftmirr_lcn;
 	u64 serial_no;
@@ -120,6 +133,8 @@ struct ntfs_volume {
 	s32 attrdef_size;
 	struct attr_def *attrdef;
 	s64 mft_data_pos;
+	s64 mft_record_reserve_pos;
+	s64 mft_record_reserve_end;
 	s64 mft_zone_start;
 	s64 mft_zone_end;
 	s64 mft_zone_pos;
@@ -133,6 +148,7 @@ struct ntfs_volume {
 	struct inode *logfile_ino;
 	struct inode *lcnbmp_ino;
 	struct rw_semaphore lcnbmp_lock;
+	struct mutex volume_label_lock;
 	struct inode *vol_ino;
 	__le16 vol_flags;
 	u8 major_ver;
@@ -141,8 +157,6 @@ struct ntfs_volume {
 	struct inode *root_ino;
 	struct inode *secure_ino;
 	struct inode *extend_ino;
-	struct inode *quota_ino;
-	struct inode *quota_q_ino;
 	struct nls_table *nls_map;
 	bool nls_utf8;
 	wait_queue_head_t free_waitq;
@@ -165,7 +179,6 @@ struct ntfs_volume {
  *				Otherwise be case insensitive but still
  *				create file names in POSIX namespace.
  * NV_LogFileEmpty		LogFile journal is empty.
- * NV_QuotaOutOfDate		Quota is out of date.
  * NV_UsnJrnlStamped		UsnJrnl has been stamped.
  * NV_ReadOnly			Volume is mounted read-only.
  * NV_Compression		Volume supports compression.
@@ -178,15 +191,19 @@ struct ntfs_volume {
  *				Windows-reserved names (CON, AUX, NUL, COM1,
  *				LPT1, etc.) or invalid characters.
  *
+ * NV_Hibernated		Windows is hibernated on the volume; the sync
+ *				paths must not write the volume flags.
  * NV_Discard			Issue discard/TRIM commands for freed clusters.
  * NV_DisableSparse		Disable creation of sparse regions.
+ * NV_NativeSymlinkRel		Translate absolute Windows reparse targets (native_symlink=rel).
+ * NV_MftBootstrap		Mount is still assembling $MFT's own runlist.
+ * NV_StreamsWindows		Interpret the final path component as file:stream.
  */
 enum {
 	NV_Errors,
 	NV_ShowSystemFiles,
 	NV_CaseSensitive,
 	NV_LogFileEmpty,
-	NV_QuotaOutOfDate,
 	NV_UsnJrnlStamped,
 	NV_ReadOnly,
 	NV_Compression,
@@ -196,8 +213,13 @@ enum {
 	NV_ShowHiddenFiles,
 	NV_HideDotFiles,
 	NV_CheckWindowsNames,
+	NV_Hibernated,
 	NV_Discard,
 	NV_DisableSparse,
+	NV_NativeSymlinkRel,
+	NV_SymlinkNative,
+	NV_MftBootstrap,
+	NV_StreamsWindows,
 };
 
 /*
@@ -223,7 +245,6 @@ DEFINE_NVOL_BIT_OPS(Errors)
 DEFINE_NVOL_BIT_OPS(ShowSystemFiles)
 DEFINE_NVOL_BIT_OPS(CaseSensitive)
 DEFINE_NVOL_BIT_OPS(LogFileEmpty)
-DEFINE_NVOL_BIT_OPS(QuotaOutOfDate)
 DEFINE_NVOL_BIT_OPS(UsnJrnlStamped)
 DEFINE_NVOL_BIT_OPS(ReadOnly)
 DEFINE_NVOL_BIT_OPS(Compression)
@@ -233,8 +254,13 @@ DEFINE_NVOL_BIT_OPS(SysImmutable)
 DEFINE_NVOL_BIT_OPS(ShowHiddenFiles)
 DEFINE_NVOL_BIT_OPS(HideDotFiles)
 DEFINE_NVOL_BIT_OPS(CheckWindowsNames)
+DEFINE_NVOL_BIT_OPS(Hibernated)
 DEFINE_NVOL_BIT_OPS(Discard)
 DEFINE_NVOL_BIT_OPS(DisableSparse)
+DEFINE_NVOL_BIT_OPS(NativeSymlinkRel)
+DEFINE_NVOL_BIT_OPS(SymlinkNative)
+DEFINE_NVOL_BIT_OPS(MftBootstrap)
+DEFINE_NVOL_BIT_OPS(StreamsWindows)
 
 static inline void ntfs_inc_free_clusters(struct ntfs_volume *vol, s64 nr)
 {
@@ -252,17 +278,11 @@ static inline void ntfs_dec_free_clusters(struct ntfs_volume *vol, s64 nr)
 
 static inline void ntfs_inc_free_mft_records(struct ntfs_volume *vol, s64 nr)
 {
-	if (!NVolFreeClusterKnown(vol))
-		return;
-
 	atomic64_add(nr, &vol->free_mft_records);
 }
 
 static inline void ntfs_dec_free_mft_records(struct ntfs_volume *vol, s64 nr)
 {
-	if (!NVolFreeClusterKnown(vol))
-		return;
-
 	atomic64_sub(nr, &vol->free_mft_records);
 }
 

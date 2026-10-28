@@ -5,7 +5,6 @@
  * Copyright (C) 2013 Cogent Embedded, Inc.
  * Copyright (C) 2013 Renesas Solutions Corp.
  */
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/errno.h>
@@ -771,6 +770,7 @@ static int adv7180_get_pad_format(struct v4l2_subdev *sd,
 }
 
 static int adv7180_set_pad_format(struct v4l2_subdev *sd,
+				  const struct v4l2_subdev_client_info *ci,
 				  struct v4l2_subdev_state *sd_state,
 				  struct v4l2_subdev_format *format)
 {
@@ -808,7 +808,7 @@ static int adv7180_init_state(struct v4l2_subdev *sd,
 		: V4L2_SUBDEV_FORMAT_ACTIVE,
 	};
 
-	return adv7180_set_pad_format(sd, sd_state, &fmt);
+	return adv7180_set_pad_format(sd, NULL, sd_state, &fmt);
 }
 
 static int adv7180_get_mbus_config(struct v4l2_subdev *sd,
@@ -1455,6 +1455,7 @@ static int adv7180_probe(struct i2c_client *client)
 	if (state == NULL)
 		return -ENOMEM;
 
+	mutex_init(&state->mutex);
 	state->client = client;
 	state->field = V4L2_FIELD_ALTERNATE;
 	state->chip_info = i2c_get_match_data(client);
@@ -1498,7 +1499,6 @@ static int adv7180_probe(struct i2c_client *client)
 	}
 
 	state->irq = client->irq;
-	mutex_init(&state->mutex);
 	state->curr_norm = V4L2_STD_NTSC;
 
 	state->input = 0;
@@ -1626,18 +1626,18 @@ static SIMPLE_DEV_PM_OPS(adv7180_pm_ops, adv7180_suspend, adv7180_resume);
 #endif
 
 static const struct i2c_device_id adv7180_id[] = {
-	{ "adv7180", (kernel_ulong_t)&adv7180_info },
-	{ "adv7180cp", (kernel_ulong_t)&adv7180_info },
-	{ "adv7180st", (kernel_ulong_t)&adv7180_info },
-	{ "adv7182", (kernel_ulong_t)&adv7182_info },
-	{ "adv7280", (kernel_ulong_t)&adv7280_info },
-	{ "adv7280-m", (kernel_ulong_t)&adv7280_m_info },
-	{ "adv7281", (kernel_ulong_t)&adv7281_info },
-	{ "adv7281-m", (kernel_ulong_t)&adv7281_m_info },
-	{ "adv7281-ma", (kernel_ulong_t)&adv7281_ma_info },
-	{ "adv7282", (kernel_ulong_t)&adv7282_info },
-	{ "adv7282-m", (kernel_ulong_t)&adv7282_m_info },
-	{}
+	{ .name = "adv7180", .driver_data = (kernel_ulong_t)&adv7180_info },
+	{ .name = "adv7180cp", .driver_data = (kernel_ulong_t)&adv7180_info },
+	{ .name = "adv7180st", .driver_data = (kernel_ulong_t)&adv7180_info },
+	{ .name = "adv7182", .driver_data = (kernel_ulong_t)&adv7182_info },
+	{ .name = "adv7280", .driver_data = (kernel_ulong_t)&adv7280_info },
+	{ .name = "adv7280-m", .driver_data = (kernel_ulong_t)&adv7280_m_info },
+	{ .name = "adv7281", .driver_data = (kernel_ulong_t)&adv7281_info },
+	{ .name = "adv7281-m", .driver_data = (kernel_ulong_t)&adv7281_m_info },
+	{ .name = "adv7281-ma", .driver_data = (kernel_ulong_t)&adv7281_ma_info },
+	{ .name = "adv7282", .driver_data = (kernel_ulong_t)&adv7282_info },
+	{ .name = "adv7282-m", .driver_data = (kernel_ulong_t)&adv7282_m_info },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, adv7180_id);
 

@@ -241,6 +241,14 @@ static void of_gpio_try_fixup_polarity(const struct device_node *np,
 		 */
 		{ "ti,tsc2005",		"reset-gpios",	false },
 #endif
+#if IS_ENABLED(CONFIG_SND_SOC_WSA881X)
+		/*
+		 * WSA881 powerdown is always active low, but some device trees
+		 * missed this when first contributed. It also has a very strange
+		 * compatible.
+		 */
+		{ "sdw10217201000",	"powerdown-gpios", false },
+#endif
 	};
 	unsigned int i;
 
@@ -780,12 +788,12 @@ static int of_gpio_notify(struct notifier_block *nb, unsigned long action,
 		if (!of_property_read_bool(rd->dn, "gpio-hog"))
 			return NOTIFY_DONE;	/* not for us */
 
-		if (of_node_test_and_set_flag(rd->dn, OF_POPULATED))
-			return NOTIFY_DONE;
-
 		gdev = of_find_gpio_device_by_node(rd->dn->parent);
 		if (!gdev)
 			return NOTIFY_DONE;	/* not for us */
+
+		if (of_node_test_and_set_flag(rd->dn, OF_POPULATED))
+			return NOTIFY_DONE;
 
 		ret = gpiochip_add_hog(gpio_device_get_chip(gdev), of_fwnode_handle(rd->dn));
 		if (ret < 0) {
@@ -1065,11 +1073,6 @@ int of_gpiochip_add(struct gpio_chip *chip)
 		return ret;
 
 	of_node_get(np);
-
-	for_each_available_child_of_node_scoped(np, child) {
-		if (of_property_read_bool(child, "gpio-hog"))
-			of_node_set_flag(child, OF_POPULATED);
-	}
 
 	return ret;
 }

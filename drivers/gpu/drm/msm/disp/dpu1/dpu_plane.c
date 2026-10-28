@@ -1049,7 +1049,7 @@ static bool dpu_plane_get_single_pipe_in_stage(struct dpu_plane_state *pstate,
 }
 
 static int dpu_plane_atomic_check_sspp(struct drm_plane *plane,
-				       struct drm_atomic_state *state,
+				       struct drm_atomic_commit *state,
 				       const struct drm_crtc_state *crtc_state)
 {
 	struct drm_plane_state *new_plane_state =
@@ -1170,7 +1170,7 @@ static int dpu_plane_try_multirect_shared(struct dpu_plane_state *pstate,
 }
 
 static int dpu_plane_atomic_check(struct drm_plane *plane,
-				  struct drm_atomic_state *state)
+				  struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *plane_state =
 		drm_atomic_get_plane_state(state, plane);
@@ -1250,7 +1250,7 @@ static int dpu_plane_assign_resource_in_stage(struct dpu_sw_pipe *pipe,
 
 static int dpu_plane_virtual_assign_resources(struct drm_crtc *crtc,
 					      struct dpu_global_state *global_state,
-					      struct drm_atomic_state *state,
+					      struct drm_atomic_commit *state,
 					      struct drm_plane_state *plane_state,
 					      const struct drm_crtc_state *crtc_state,
 					      struct drm_plane_state **prev_adjacent_plane_state)
@@ -1311,7 +1311,7 @@ static int dpu_plane_virtual_assign_resources(struct drm_crtc *crtc,
 
 static int dpu_plane_assign_resources(struct drm_crtc *crtc,
 				      struct dpu_global_state *global_state,
-				      struct drm_atomic_state *state,
+				      struct drm_atomic_commit *state,
 				      struct drm_plane_state *plane_state,
 				      const struct drm_crtc_state *crtc_state)
 {
@@ -1349,7 +1349,7 @@ static int dpu_plane_assign_resources(struct drm_crtc *crtc,
 }
 
 int dpu_assign_plane_resources(struct dpu_global_state *global_state,
-			       struct drm_atomic_state *state,
+			       struct drm_atomic_commit *state,
 			       struct drm_crtc *crtc,
 			       struct drm_plane_state **states,
 			       unsigned int num_planes)
@@ -1617,7 +1617,7 @@ static void _dpu_plane_atomic_disable(struct drm_plane *plane)
 }
 
 static void dpu_plane_atomic_update(struct drm_plane *plane,
-				struct drm_atomic_state *state)
+				struct drm_atomic_commit *state)
 {
 	struct dpu_plane *pdpu = to_dpu_plane(plane);
 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state,
@@ -1728,32 +1728,28 @@ static void dpu_plane_atomic_print_state(struct drm_printer *p,
 	}
 }
 
-static void dpu_plane_reset(struct drm_plane *plane)
+static struct drm_plane_state *dpu_plane_create_state(struct drm_plane *plane)
 {
 	struct dpu_plane *pdpu;
 	struct dpu_plane_state *pstate;
 
 	if (!plane) {
 		DPU_ERROR("invalid plane\n");
-		return;
+		return ERR_PTR(-EINVAL);
 	}
 
 	pdpu = to_dpu_plane(plane);
 	DPU_DEBUG_PLANE(pdpu, "\n");
 
-	/* remove previous state, if present */
-	if (plane->state) {
-		dpu_plane_destroy_state(plane, plane->state);
-		plane->state = NULL;
-	}
-
 	pstate = kzalloc_obj(*pstate);
 	if (!pstate) {
 		DPU_ERROR_PLANE(pdpu, "failed to allocate state\n");
-		return;
+		return ERR_PTR(-ENOMEM);
 	}
 
-	__drm_atomic_helper_plane_reset(plane, &pstate->base);
+	__drm_atomic_helper_plane_state_init(&pstate->base, plane);
+
+	return &pstate->base;
 }
 
 #ifdef CONFIG_DEBUG_FS
@@ -1781,8 +1777,7 @@ static bool dpu_plane_format_mod_supported(struct drm_plane *plane,
 		uint32_t format, uint64_t modifier)
 {
 	struct dpu_kms *dpu_kms = _dpu_plane_get_kms(plane);
-	bool has_no_ubwc = (dpu_kms->mdss->ubwc_enc_version == 0) &&
-			   (dpu_kms->mdss->ubwc_dec_version == 0);
+	bool has_no_ubwc = (dpu_kms->mdss->ubwc_enc_version == 0);
 
 	if (modifier == DRM_FORMAT_MOD_LINEAR)
 		return true;
@@ -1797,7 +1792,7 @@ static bool dpu_plane_format_mod_supported(struct drm_plane *plane,
 static const struct drm_plane_funcs dpu_plane_funcs = {
 		.update_plane = drm_atomic_helper_update_plane,
 		.disable_plane = drm_atomic_helper_disable_plane,
-		.reset = dpu_plane_reset,
+		.atomic_create_state = dpu_plane_create_state,
 		.atomic_duplicate_state = dpu_plane_duplicate_state,
 		.atomic_destroy_state = dpu_plane_destroy_state,
 		.atomic_print_state = dpu_plane_atomic_print_state,

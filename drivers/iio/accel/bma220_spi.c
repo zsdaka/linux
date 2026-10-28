@@ -5,7 +5,6 @@
  * Copyright (c) 2016,2020 Intel Corporation.
  */
 
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/regmap.h>
 #include <linux/types.h>
@@ -26,15 +25,16 @@ static int bma220_spi_probe(struct spi_device *spi)
 }
 
 static const struct spi_device_id bma220_spi_id[] = {
-	{ "bma220", 0 },
+	{ .name = "bma220" },
 	{ }
 };
+MODULE_DEVICE_TABLE(spi, bma220_spi_id);
 
 static const struct acpi_device_id bma220_acpi_id[] = {
 	{ "BMA0220", 0 },
 	{ }
 };
-MODULE_DEVICE_TABLE(spi, bma220_spi_id);
+MODULE_DEVICE_TABLE(acpi, bma220_acpi_id);
 
 static const struct of_device_id bma220_of_spi_match[] = {
 	{ .compatible = "bosch,bma220" },

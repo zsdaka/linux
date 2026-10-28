@@ -1509,6 +1509,10 @@ static void iwl_mvm_report_wakeup_reasons(struct iwl_mvm *mvm,
 		if (WARN_ON_ONCE(truncated < 0))
 			truncated = 0;
 
+		/* this would be a firmware bug */
+		if (WARN_ON_ONCE(pktsize < sizeof(*hdr)))
+			return;
+
 		if (ieee80211_is_data(hdr->frame_control)) {
 			int hdrlen = ieee80211_hdrlen(hdr->frame_control);
 			int ivlen = 0, icvlen = 4; /* also FCS */
@@ -1516,10 +1520,6 @@ static void iwl_mvm_report_wakeup_reasons(struct iwl_mvm *mvm,
 			pkt = alloc_skb(pktsize, GFP_KERNEL);
 			if (!pkt)
 				goto report;
-
-			skb_put_data(pkt, pktdata, hdrlen);
-			pktdata += hdrlen;
-			pktsize -= hdrlen;
 
 			if (ieee80211_has_protected(hdr->frame_control)) {
 				/*
@@ -1539,13 +1539,24 @@ static void iwl_mvm_report_wakeup_reasons(struct iwl_mvm *mvm,
 
 			/* if truncated, FCS/ICV is (partially) gone */
 			if (truncated >= icvlen) {
-				icvlen = 0;
 				truncated -= icvlen;
+				icvlen = 0;
 			} else {
 				icvlen -= truncated;
 				truncated = 0;
 			}
 
+			if (IWL_FW_CHECK(mvm,
+					 pktsize <= hdrlen + ivlen + icvlen,
+					 "pktsize is too small %d\n",
+					 pktsize)) {
+				kfree_skb(pkt);
+				return;
+			}
+
+			skb_put_data(pkt, pktdata, hdrlen);
+			pktdata += hdrlen;
+			pktsize -= hdrlen;
 			pktsize -= ivlen + icvlen;
 			pktdata += ivlen;
 
@@ -1876,7 +1887,8 @@ static bool iwl_mvm_gtk_rekey(struct iwl_wowlan_status_data *status,
 
 		key = ieee80211_gtk_rekey_add(vif, status->gtk[i].id,
 					      status->gtk[i].key,
-					      sizeof(status->gtk[i].key), -1);
+					      sizeof(status->gtk[i].key), -1,
+					      false);
 		if (IS_ERR(key)) {
 			/* FW may send also the old keys */
 			if (PTR_ERR(key) == -EALREADY)
@@ -1911,7 +1923,8 @@ iwl_mvm_d3_igtk_bigtk_rekey_add(struct iwl_wowlan_status_data *status,
 		return true;
 
 	key_config = ieee80211_gtk_rekey_add(vif, keyidx, key_data->key,
-					     sizeof(key_data->key), -1);
+					     sizeof(key_data->key), -1,
+					     false);
 	if (IS_ERR(key_config)) {
 		/* FW may send also the old keys */
 		return PTR_ERR(key_config) == -EALREADY;
@@ -2123,15 +2136,15 @@ static void iwl_mvm_parse_wowlan_info_notif(struct iwl_mvm *mvm,
 					    struct iwl_wowlan_status_data *status,
 					    u32 len)
 {
-	if (IWL_FW_CHECK(mvm, data->num_mlo_link_keys,
-			 "MLO is not supported, shouldn't receive MLO keys\n"))
-		return;
-
 	if (len < sizeof(*data)) {
 		IWL_ERR(mvm, "Invalid WoWLAN info notification!\n");
 		status = NULL;
 		return;
 	}
+
+	if (IWL_FW_CHECK(mvm, data->num_mlo_link_keys,
+			 "MLO is not supported, shouldn't receive MLO keys\n"))
+		return;
 
 	if (mvm->fast_resume)
 		return;
@@ -2427,6 +2440,12 @@ struct iwl_mvm_nd_results {
 	u8 matches[ND_QUERY_BUF_LEN];
 };
 
+static bool iwl_mvm_nd_match_info_v3(struct iwl_mvm *mvm)
+{
+	return iwl_fw_lookup_notif_ver(mvm->fw, LEGACY_GROUP,
+				       SCAN_OFFLOAD_PROFILES_QUERY_CMD, 0) >= 4;
+}
+
 static int
 iwl_mvm_netdetect_query_results(struct iwl_mvm *mvm,
 				struct iwl_mvm_nd_results *results)
@@ -2446,15 +2465,22 @@ iwl_mvm_netdetect_query_results(struct iwl_mvm *mvm,
 		return ret;
 	}
 
-	if (fw_has_api(&mvm->fw->ucode_capa,
-		       IWL_UCODE_TLV_API_SCAN_OFFLOAD_CHANS)) {
-		query_len = sizeof(struct iwl_scan_offload_match_info);
+	if (iwl_mvm_nd_match_info_v3(mvm)) {
 		matches_len = sizeof(struct iwl_scan_offload_profile_match) *
 			max_profiles;
+		query_len = offsetof(struct iwl_scan_offload_match_info,
+				     matches) + matches_len;
+	} else if (fw_has_api(&mvm->fw->ucode_capa,
+			      IWL_UCODE_TLV_API_SCAN_OFFLOAD_CHANS)) {
+		matches_len = sizeof(struct iwl_scan_offload_profile_match_v2) *
+			max_profiles;
+		query_len = offsetof(struct iwl_scan_offload_match_info,
+				     matches) + matches_len;
 	} else {
-		query_len = sizeof(struct iwl_scan_offload_profiles_query_v1);
 		matches_len = sizeof(struct iwl_scan_offload_profile_match_v1) *
 			max_profiles;
+		query_len = sizeof(struct iwl_scan_offload_profiles_query_v1) +
+			matches_len;
 	}
 
 	len = iwl_rx_packet_payload_len(cmd.resp_pkt);
@@ -2484,12 +2510,18 @@ static int iwl_mvm_query_num_match_chans(struct iwl_mvm *mvm,
 {
 	int n_chans = 0, i;
 
-	if (fw_has_api(&mvm->fw->ucode_capa,
-		       IWL_UCODE_TLV_API_SCAN_OFFLOAD_CHANS)) {
+	if (iwl_mvm_nd_match_info_v3(mvm)) {
 		struct iwl_scan_offload_profile_match *matches =
 			(void *)results->matches;
 
 		for (i = 0; i < SCAN_OFFLOAD_MATCHING_CHANNELS_LEN; i++)
+			n_chans += hweight8(matches[idx].matching_channels[i]);
+	} else if (fw_has_api(&mvm->fw->ucode_capa,
+			      IWL_UCODE_TLV_API_SCAN_OFFLOAD_CHANS)) {
+		struct iwl_scan_offload_profile_match_v2 *matches =
+			(void *)results->matches;
+
+		for (i = 0; i < SCAN_OFFLOAD_MATCHING_CHANNELS_LEN_V2; i++)
 			n_chans += hweight8(matches[idx].matching_channels[i]);
 	} else {
 		struct iwl_scan_offload_profile_match_v1 *matches =
@@ -2502,34 +2534,58 @@ static int iwl_mvm_query_num_match_chans(struct iwl_mvm *mvm,
 	return n_chans;
 }
 
+static void iwl_mvm_set_matching_freqs(struct iwl_mvm *mvm,
+				       const u8 *matching_channels,
+				       size_t num_bytes,
+				       struct cfg80211_wowlan_nd_match *match)
+{
+	int n_channels = 0;
+
+	for (int i = 0; i < num_bytes * 8; i++) {
+		if (!(matching_channels[i / 8] & BIT(i % 8)))
+			continue;
+		if (IWL_FW_CHECK(mvm, i >= mvm->n_nd_channels,
+				 "FW matched channel bit %d beyond n_nd_channels %d\n",
+				 i, mvm->n_nd_channels))
+			break;
+		match->channels[n_channels++] =
+			mvm->nd_channels[i]->center_freq;
+	}
+	/* We may have ended up with fewer channels than we allocated. */
+	match->n_channels = n_channels;
+}
+
 static void iwl_mvm_query_set_freqs(struct iwl_mvm *mvm,
 				    struct iwl_mvm_nd_results *results,
 				    struct cfg80211_wowlan_nd_match *match,
 				    int idx)
 {
-	int i;
-	int n_channels = 0;
-
-	if (fw_has_api(&mvm->fw->ucode_capa,
-		       IWL_UCODE_TLV_API_SCAN_OFFLOAD_CHANS)) {
+	if (iwl_mvm_nd_match_info_v3(mvm)) {
 		struct iwl_scan_offload_profile_match *matches =
 			 (void *)results->matches;
 
-		for (i = 0; i < SCAN_OFFLOAD_MATCHING_CHANNELS_LEN * 8; i++)
-			if (matches[idx].matching_channels[i / 8] & (BIT(i % 8)))
-				match->channels[n_channels++] =
-					mvm->nd_channels[i]->center_freq;
+		iwl_mvm_set_matching_freqs(mvm,
+					   matches[idx].matching_channels,
+					   sizeof(matches[idx].matching_channels),
+					   match);
+	} else if (fw_has_api(&mvm->fw->ucode_capa,
+			      IWL_UCODE_TLV_API_SCAN_OFFLOAD_CHANS)) {
+		struct iwl_scan_offload_profile_match_v2 *matches =
+			 (void *)results->matches;
+
+		iwl_mvm_set_matching_freqs(mvm,
+					   matches[idx].matching_channels,
+					   sizeof(matches[idx].matching_channels),
+					   match);
 	} else {
 		struct iwl_scan_offload_profile_match_v1 *matches =
 			 (void *)results->matches;
 
-		for (i = 0; i < SCAN_OFFLOAD_MATCHING_CHANNELS_LEN_V1 * 8; i++)
-			if (matches[idx].matching_channels[i / 8] & (BIT(i % 8)))
-				match->channels[n_channels++] =
-					mvm->nd_channels[i]->center_freq;
+		iwl_mvm_set_matching_freqs(mvm,
+					   matches[idx].matching_channels,
+					   sizeof(matches[idx].matching_channels),
+					   match);
 	}
-	/* We may have ended up with fewer channels than we allocated. */
-	match->n_channels = n_channels;
 }
 
 /**
@@ -2756,7 +2812,7 @@ static int iwl_mvm_wowlan_store_wake_pkt(struct iwl_mvm *mvm,
 					 struct iwl_wowlan_status_data *status,
 					 u32 len)
 {
-	u32 data_size, packet_len = le32_to_cpu(notif->wake_packet_length);
+	u32 data_size, packet_len;
 
 	if (len < sizeof(*notif)) {
 		IWL_ERR(mvm, "Invalid WoWLAN wake packet notification!\n");
@@ -2775,6 +2831,7 @@ static int iwl_mvm_wowlan_store_wake_pkt(struct iwl_mvm *mvm,
 		return -EIO;
 	}
 
+	packet_len = le32_to_cpu(notif->wake_packet_length);
 	data_size = len - offsetof(struct iwl_wowlan_wake_pkt_notif, wake_packet);
 
 	/* data_size got the padding from the notification, remove it. */
@@ -2801,13 +2858,20 @@ static void iwl_mvm_nd_match_info_handler(struct iwl_mvm *mvm,
 	struct iwl_wowlan_status_data *status = d3_data->status;
 	struct ieee80211_vif *vif = iwl_mvm_get_bss_vif(mvm);
 	struct iwl_mvm_nd_results *results = d3_data->nd_results;
-	size_t i, matches_len = sizeof(struct iwl_scan_offload_profile_match) *
-		iwl_umac_scan_get_max_profiles(mvm->fw);
+	size_t i, matches_len;
+
+	if (iwl_mvm_nd_match_info_v3(mvm))
+		matches_len = sizeof(struct iwl_scan_offload_profile_match) *
+			iwl_umac_scan_get_max_profiles(mvm->fw);
+	else
+		matches_len = sizeof(struct iwl_scan_offload_profile_match_v2) *
+			iwl_umac_scan_get_max_profiles(mvm->fw);
 
 	if (IS_ERR_OR_NULL(vif))
 		return;
 
-	if (len < sizeof(struct iwl_scan_offload_match_info) + matches_len) {
+	if (len < offsetof(struct iwl_scan_offload_match_info, matches) +
+		    matches_len) {
 		IWL_ERR(mvm, "Invalid scan match info notification\n");
 		return;
 	}
@@ -2941,6 +3005,11 @@ static bool iwl_mvm_wait_d3_notif(struct iwl_notif_wait_data *notif_wait,
 	}
 	case WIDE_ID(PROT_OFFLOAD_GROUP, D3_END_NOTIFICATION): {
 		struct iwl_d3_end_notif *notif = (void *)pkt->data;
+
+		if (len < sizeof(*notif)) {
+			IWL_ERR(mvm, "Invalid D3 end notification size\n");
+			break;
+		}
 
 		d3_data->d3_end_flags = __le32_to_cpu(notif->flags);
 		d3_data->notif_received |= IWL_D3_NOTIF_D3_END_NOTIF;

@@ -71,7 +71,6 @@
 #include "i915_drv.h"
 #include "i915_pvinfo.h"
 #include "i915_reg.h"
-#include "intel_mchbar_regs.h"
 #include "sched_policy.h"
 
 /* XXX FIXME i915 has changed PP_XXX definition */
@@ -1707,7 +1706,7 @@ static int mailbox_write(struct intel_vgpu *vgpu, unsigned int offset,
 {
 	u32 value = *(u32 *)p_data;
 	u32 cmd = value & 0xff;
-	u32 *data0 = &vgpu_vreg_t(vgpu, GEN6_PCODE_DATA);
+	u32 *data0 = &vgpu_vreg_t(vgpu, GEN6_PCODE_DATA0);
 
 	switch (cmd) {
 	case GEN9_PCODE_READ_MEM_LATENCY:

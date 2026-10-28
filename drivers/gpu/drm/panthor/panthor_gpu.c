@@ -19,8 +19,8 @@
 
 #include "panthor_device.h"
 #include "panthor_gpu.h"
+#include "panthor_gpu_regs.h"
 #include "panthor_hw.h"
-#include "panthor_regs.h"
 
 #define CREATE_TRACE_POINTS
 #include "panthor_trace.h"
@@ -29,6 +29,9 @@
  * struct panthor_gpu - GPU block management data.
  */
 struct panthor_gpu {
+	/** @iomem: CPU mapping of GPU_CONTROL iomem region */
+	void __iomem *iomem;
+
 	/** @irq: GPU irq. */
 	struct panthor_irq irq;
 
@@ -56,12 +59,13 @@ struct panthor_gpu {
 
 static void panthor_gpu_coherency_set(struct panthor_device *ptdev)
 {
-	gpu_write(ptdev, GPU_COHERENCY_PROTOCOL,
+	gpu_write(ptdev->gpu->iomem, GPU_COHERENCY_PROTOCOL,
 		  ptdev->gpu_info.selected_coherency);
 }
 
 static void panthor_gpu_l2_config_set(struct panthor_device *ptdev)
 {
+	struct panthor_gpu *gpu = ptdev->gpu;
 	const struct panthor_soc_data *data = ptdev->soc_data;
 	u32 l2_config;
 	u32 i;
@@ -75,26 +79,29 @@ static void panthor_gpu_l2_config_set(struct panthor_device *ptdev)
 	}
 
 	for (i = 0; i < ARRAY_SIZE(data->asn_hash); i++)
-		gpu_write(ptdev, GPU_ASN_HASH(i), data->asn_hash[i]);
+		gpu_write(gpu->iomem, GPU_ASN_HASH(i), data->asn_hash[i]);
 
-	l2_config = gpu_read(ptdev, GPU_L2_CONFIG);
+	l2_config = gpu_read(gpu->iomem, GPU_L2_CONFIG);
 	l2_config |= GPU_L2_CONFIG_ASN_HASH_ENABLE;
-	gpu_write(ptdev, GPU_L2_CONFIG, l2_config);
+	gpu_write(gpu->iomem, GPU_L2_CONFIG, l2_config);
 }
 
-static void panthor_gpu_irq_handler(struct panthor_device *ptdev, u32 status)
+static void panthor_gpu_irq_handler(struct panthor_irq *pirq, u32 status)
 {
-	gpu_write(ptdev, GPU_INT_CLEAR, status);
+	struct panthor_device *ptdev = pirq->ptdev;
+	struct panthor_gpu *gpu = ptdev->gpu;
+
+	gpu_write(gpu->irq.iomem, INT_CLEAR, status);
 
 	if (tracepoint_enabled(gpu_power_status) && (status & GPU_POWER_INTERRUPTS_MASK))
 		trace_gpu_power_status(ptdev->base.dev,
-				       gpu_read64(ptdev, SHADER_READY),
-				       gpu_read64(ptdev, TILER_READY),
-				       gpu_read64(ptdev, L2_READY));
+				       gpu_read64(gpu->iomem, SHADER_READY),
+				       gpu_read64(gpu->iomem, TILER_READY),
+				       gpu_read64(gpu->iomem, L2_READY));
 
 	if (status & GPU_IRQ_FAULT) {
-		u32 fault_status = gpu_read(ptdev, GPU_FAULT_STATUS);
-		u64 address = gpu_read64(ptdev, GPU_FAULT_ADDR);
+		u32 fault_status = gpu_read(gpu->iomem, GPU_FAULT_STATUS);
+		u64 address = gpu_read64(gpu->iomem, GPU_FAULT_ADDR);
 
 		drm_warn(&ptdev->base, "GPU Fault 0x%08x (%s) at 0x%016llx\n",
 			 fault_status, panthor_exception_name(ptdev, fault_status & 0xFF),
@@ -110,7 +117,11 @@ static void panthor_gpu_irq_handler(struct panthor_device *ptdev, u32 status)
 	}
 	spin_unlock(&ptdev->gpu->reqs_lock);
 }
-PANTHOR_IRQ_HANDLER(gpu, GPU, panthor_gpu_irq_handler);
+
+static irqreturn_t panthor_gpu_irq_threaded_handler(int irq, void *data)
+{
+	return panthor_irq_default_threaded_handler(data, panthor_gpu_irq_handler);
+}
 
 /**
  * panthor_gpu_unplug() - Called when the GPU is unplugged.
@@ -122,7 +133,7 @@ void panthor_gpu_unplug(struct panthor_device *ptdev)
 
 	/* Make sure the IRQ handler is not running after that point. */
 	if (!IS_ENABLED(CONFIG_PM) || pm_runtime_active(ptdev->base.dev))
-		panthor_gpu_irq_suspend(&ptdev->gpu->irq);
+		panthor_irq_suspend(&ptdev->gpu->irq);
 
 	/* Wake-up all waiters. */
 	spin_lock_irqsave(&ptdev->gpu->reqs_lock, flags);
@@ -147,6 +158,7 @@ int panthor_gpu_init(struct panthor_device *ptdev)
 	if (!gpu)
 		return -ENOMEM;
 
+	gpu->iomem = ptdev->iomem + GPU_CONTROL_BASE;
 	spin_lock_init(&gpu->reqs_lock);
 	init_waitqueue_head(&gpu->reqs_acked);
 	mutex_init(&gpu->cache_flush_lock);
@@ -162,10 +174,14 @@ int panthor_gpu_init(struct panthor_device *ptdev)
 	if (irq < 0)
 		return irq;
 
-	ret = panthor_request_gpu_irq(ptdev, &ptdev->gpu->irq, irq, GPU_INTERRUPTS_MASK);
+	ret = panthor_irq_request(ptdev, &ptdev->gpu->irq, irq,
+				  ptdev->iomem + GPU_INT_BASE, "gpu",
+				  panthor_gpu_irq_threaded_handler);
 	if (ret)
 		return ret;
 
+	panthor_irq_enable_events(&ptdev->gpu->irq, GPU_INTERRUPTS_MASK);
+	panthor_irq_resume(&ptdev->gpu->irq);
 	return 0;
 }
 
@@ -173,7 +189,7 @@ int panthor_gpu_power_changed_on(struct panthor_device *ptdev)
 {
 	guard(pm_runtime_active)(ptdev->base.dev);
 
-	panthor_gpu_irq_enable_events(&ptdev->gpu->irq, GPU_POWER_INTERRUPTS_MASK);
+	panthor_irq_enable_events(&ptdev->gpu->irq, GPU_POWER_INTERRUPTS_MASK);
 
 	return 0;
 }
@@ -182,7 +198,7 @@ void panthor_gpu_power_changed_off(struct panthor_device *ptdev)
 {
 	guard(pm_runtime_active)(ptdev->base.dev);
 
-	panthor_gpu_irq_disable_events(&ptdev->gpu->irq, GPU_POWER_INTERRUPTS_MASK);
+	panthor_irq_disable_events(&ptdev->gpu->irq, GPU_POWER_INTERRUPTS_MASK);
 }
 
 /**
@@ -201,10 +217,11 @@ int panthor_gpu_block_power_off(struct panthor_device *ptdev,
 				u32 pwroff_reg, u32 pwrtrans_reg,
 				u64 mask, u32 timeout_us)
 {
+	struct panthor_gpu *gpu = ptdev->gpu;
 	u32 val;
 	int ret;
 
-	ret = gpu_read64_relaxed_poll_timeout(ptdev, pwrtrans_reg, val,
+	ret = gpu_read64_relaxed_poll_timeout(gpu->iomem, pwrtrans_reg, val,
 					      !(mask & val), 100, timeout_us);
 	if (ret) {
 		drm_err(&ptdev->base,
@@ -213,9 +230,9 @@ int panthor_gpu_block_power_off(struct panthor_device *ptdev,
 		return ret;
 	}
 
-	gpu_write64(ptdev, pwroff_reg, mask);
+	gpu_write64(gpu->iomem, pwroff_reg, mask);
 
-	ret = gpu_read64_relaxed_poll_timeout(ptdev, pwrtrans_reg, val,
+	ret = gpu_read64_relaxed_poll_timeout(gpu->iomem, pwrtrans_reg, val,
 					      !(mask & val), 100, timeout_us);
 	if (ret) {
 		drm_err(&ptdev->base,
@@ -244,10 +261,11 @@ int panthor_gpu_block_power_on(struct panthor_device *ptdev,
 			       u32 pwron_reg, u32 pwrtrans_reg,
 			       u32 rdy_reg, u64 mask, u32 timeout_us)
 {
+	struct panthor_gpu *gpu = ptdev->gpu;
 	u32 val;
 	int ret;
 
-	ret = gpu_read64_relaxed_poll_timeout(ptdev, pwrtrans_reg, val,
+	ret = gpu_read64_relaxed_poll_timeout(gpu->iomem, pwrtrans_reg, val,
 					      !(mask & val), 100, timeout_us);
 	if (ret) {
 		drm_err(&ptdev->base,
@@ -256,9 +274,9 @@ int panthor_gpu_block_power_on(struct panthor_device *ptdev,
 		return ret;
 	}
 
-	gpu_write64(ptdev, pwron_reg, mask);
+	gpu_write64(gpu->iomem, pwron_reg, mask);
 
-	ret = gpu_read64_relaxed_poll_timeout(ptdev, rdy_reg, val,
+	ret = gpu_read64_relaxed_poll_timeout(gpu->iomem, rdy_reg, val,
 					      (mask & val) == val,
 					      100, timeout_us);
 	if (ret) {
@@ -305,6 +323,21 @@ int panthor_gpu_l2_power_on(struct panthor_device *ptdev)
 	return panthor_gpu_power_on(ptdev, L2, 1, 20000);
 }
 
+static inline void panthor_gpu_emit_flush_caches_tp(struct panthor_device *ptdev,
+						    u64 start, u32 l2, u32 lsc,
+						    u32 other, int ret)
+{
+	u32 duration;
+
+	if (!tracepoint_enabled(gpu_cache_flush) || !start)
+		return;
+
+	if (check_sub_overflow(ktime_get_ns(), start, &duration))
+		duration = U32_MAX;
+
+	trace_gpu_cache_flush(ptdev->base.dev, l2, lsc, other, duration, ret);
+}
+
 /**
  * panthor_gpu_flush_caches() - Flush caches
  * @ptdev: Device.
@@ -317,35 +350,40 @@ int panthor_gpu_l2_power_on(struct panthor_device *ptdev)
 int panthor_gpu_flush_caches(struct panthor_device *ptdev,
 			     u32 l2, u32 lsc, u32 other)
 {
-	unsigned long flags;
+	struct panthor_gpu *gpu = ptdev->gpu;
+	u64 start = 0;
 	int ret = 0;
 
 	/* Serialize cache flush operations. */
 	guard(mutex)(&ptdev->gpu->cache_flush_lock);
 
-	spin_lock_irqsave(&ptdev->gpu->reqs_lock, flags);
-	if (!(ptdev->gpu->pending_reqs & GPU_IRQ_CLEAN_CACHES_COMPLETED)) {
-		ptdev->gpu->pending_reqs |= GPU_IRQ_CLEAN_CACHES_COMPLETED;
-		gpu_write(ptdev, GPU_CMD, GPU_FLUSH_CACHES(l2, lsc, other));
-	} else {
-		ret = -EIO;
-	}
-	spin_unlock_irqrestore(&ptdev->gpu->reqs_lock, flags);
+	scoped_guard(spinlock, &ptdev->gpu->reqs_lock) {
+		if (tracepoint_enabled(gpu_cache_flush))
+			start = ktime_get_ns();
 
-	if (ret)
-		return ret;
+		if (!(ptdev->gpu->pending_reqs & GPU_IRQ_CLEAN_CACHES_COMPLETED)) {
+			ptdev->gpu->pending_reqs |= GPU_IRQ_CLEAN_CACHES_COMPLETED;
+			gpu_write(gpu->iomem, GPU_CMD, GPU_FLUSH_CACHES(l2, lsc, other));
+		} else {
+			panthor_gpu_emit_flush_caches_tp(ptdev, start, l2, lsc,
+							 other, -EIO);
+			return -EIO;
+		}
+	}
 
 	if (!wait_event_timeout(ptdev->gpu->reqs_acked,
 				!(ptdev->gpu->pending_reqs & GPU_IRQ_CLEAN_CACHES_COMPLETED),
 				msecs_to_jiffies(100))) {
-		spin_lock_irqsave(&ptdev->gpu->reqs_lock, flags);
-		if ((ptdev->gpu->pending_reqs & GPU_IRQ_CLEAN_CACHES_COMPLETED) != 0 &&
-		    !(gpu_read(ptdev, GPU_INT_RAWSTAT) & GPU_IRQ_CLEAN_CACHES_COMPLETED))
-			ret = -ETIMEDOUT;
-		else
-			ptdev->gpu->pending_reqs &= ~GPU_IRQ_CLEAN_CACHES_COMPLETED;
-		spin_unlock_irqrestore(&ptdev->gpu->reqs_lock, flags);
+		scoped_guard(spinlock, &ptdev->gpu->reqs_lock) {
+			if ((ptdev->gpu->pending_reqs & GPU_IRQ_CLEAN_CACHES_COMPLETED) != 0 &&
+			    !(gpu_read(gpu->irq.iomem, INT_RAWSTAT) & GPU_IRQ_CLEAN_CACHES_COMPLETED))
+				ret = -ETIMEDOUT;
+			else
+				ptdev->gpu->pending_reqs &= ~GPU_IRQ_CLEAN_CACHES_COMPLETED;
+		}
 	}
+
+	panthor_gpu_emit_flush_caches_tp(ptdev, start, l2, lsc, other, ret);
 
 	if (ret) {
 		panthor_device_schedule_reset(ptdev);
@@ -363,28 +401,28 @@ int panthor_gpu_flush_caches(struct panthor_device *ptdev,
  */
 int panthor_gpu_soft_reset(struct panthor_device *ptdev)
 {
+	struct panthor_gpu *gpu = ptdev->gpu;
 	bool timedout = false;
-	unsigned long flags;
 
-	spin_lock_irqsave(&ptdev->gpu->reqs_lock, flags);
-	if (!drm_WARN_ON(&ptdev->base,
-			 ptdev->gpu->pending_reqs & GPU_IRQ_RESET_COMPLETED)) {
-		ptdev->gpu->pending_reqs |= GPU_IRQ_RESET_COMPLETED;
-		gpu_write(ptdev, GPU_INT_CLEAR, GPU_IRQ_RESET_COMPLETED);
-		gpu_write(ptdev, GPU_CMD, GPU_SOFT_RESET);
+	scoped_guard(spinlock, &ptdev->gpu->reqs_lock) {
+		if (!drm_WARN_ON(&ptdev->base,
+				ptdev->gpu->pending_reqs & GPU_IRQ_RESET_COMPLETED)) {
+			ptdev->gpu->pending_reqs |= GPU_IRQ_RESET_COMPLETED;
+			gpu_write(gpu->irq.iomem, INT_CLEAR, GPU_IRQ_RESET_COMPLETED);
+			gpu_write(gpu->iomem, GPU_CMD, GPU_SOFT_RESET);
+		}
 	}
-	spin_unlock_irqrestore(&ptdev->gpu->reqs_lock, flags);
 
 	if (!wait_event_timeout(ptdev->gpu->reqs_acked,
 				!(ptdev->gpu->pending_reqs & GPU_IRQ_RESET_COMPLETED),
 				msecs_to_jiffies(100))) {
-		spin_lock_irqsave(&ptdev->gpu->reqs_lock, flags);
-		if ((ptdev->gpu->pending_reqs & GPU_IRQ_RESET_COMPLETED) != 0 &&
-		    !(gpu_read(ptdev, GPU_INT_RAWSTAT) & GPU_IRQ_RESET_COMPLETED))
-			timedout = true;
-		else
-			ptdev->gpu->pending_reqs &= ~GPU_IRQ_RESET_COMPLETED;
-		spin_unlock_irqrestore(&ptdev->gpu->reqs_lock, flags);
+		scoped_guard(spinlock, &ptdev->gpu->reqs_lock) {
+			if ((ptdev->gpu->pending_reqs & GPU_IRQ_RESET_COMPLETED) != 0 &&
+			    !(gpu_read(gpu->irq.iomem, INT_RAWSTAT) & GPU_IRQ_RESET_COMPLETED))
+				timedout = true;
+			else
+				ptdev->gpu->pending_reqs &= ~GPU_IRQ_RESET_COMPLETED;
+		}
 	}
 
 	if (timedout) {
@@ -392,7 +430,10 @@ int panthor_gpu_soft_reset(struct panthor_device *ptdev)
 		return -ETIMEDOUT;
 	}
 
-	ptdev->gpu->pending_reqs = 0;
+	scoped_guard(spinlock, &ptdev->gpu->reqs_lock) {
+		ptdev->gpu->pending_reqs = 0;
+	}
+
 	return 0;
 }
 
@@ -411,7 +452,7 @@ void panthor_gpu_suspend(struct panthor_device *ptdev)
 	else
 		panthor_hw_l2_power_off(ptdev);
 
-	panthor_gpu_irq_suspend(&ptdev->gpu->irq);
+	panthor_irq_suspend(&ptdev->gpu->irq);
 }
 
 /**
@@ -423,7 +464,47 @@ void panthor_gpu_suspend(struct panthor_device *ptdev)
  */
 void panthor_gpu_resume(struct panthor_device *ptdev)
 {
-	panthor_gpu_irq_resume(&ptdev->gpu->irq);
+	panthor_irq_resume(&ptdev->gpu->irq);
 	panthor_hw_l2_power_on(ptdev);
 }
 
+u64 panthor_gpu_get_timestamp(struct panthor_device *ptdev)
+{
+	return gpu_read64_counter(ptdev->gpu->iomem, GPU_TIMESTAMP);
+}
+
+u64 panthor_gpu_get_timestamp_offset(struct panthor_device *ptdev)
+{
+	return gpu_read64(ptdev->gpu->iomem, GPU_TIMESTAMP_OFFSET);
+}
+
+u64 panthor_gpu_get_cycle_count(struct panthor_device *ptdev)
+{
+	return gpu_read64_counter(ptdev->gpu->iomem, GPU_CYCLE_COUNT);
+}
+
+int panthor_gpu_coherency_init(struct panthor_device *ptdev)
+{
+	BUILD_BUG_ON(GPU_COHERENCY_NONE != DRM_PANTHOR_GPU_COHERENCY_NONE);
+	BUILD_BUG_ON(GPU_COHERENCY_ACE_LITE != DRM_PANTHOR_GPU_COHERENCY_ACE_LITE);
+	BUILD_BUG_ON(GPU_COHERENCY_ACE != DRM_PANTHOR_GPU_COHERENCY_ACE);
+
+	/* Start with no coherency, and update it if the device is flagged coherent. */
+	ptdev->gpu_info.selected_coherency = GPU_COHERENCY_NONE;
+	ptdev->coherent = device_get_dma_attr(ptdev->base.dev) == DEV_DMA_COHERENT;
+
+	if (!ptdev->coherent)
+		return 0;
+
+	/* Check if the ACE-Lite coherency protocol is actually supported by the GPU.
+	 * ACE protocol has never been supported for command stream frontend GPUs.
+	 */
+	if ((gpu_read(ptdev->gpu->iomem, GPU_COHERENCY_FEATURES) &
+		      GPU_COHERENCY_PROT_BIT(ACE_LITE))) {
+		ptdev->gpu_info.selected_coherency = GPU_COHERENCY_ACE_LITE;
+		return 0;
+	}
+
+	drm_err(&ptdev->base, "Coherency not supported by the device");
+	return -ENOTSUPP;
+}

@@ -13,6 +13,7 @@
 #include <linux/leds.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/machine.h>
+#include <linux/device-id/dmi.h>
 #include <linux/types.h>
 
 /* FIXME drop this once the I2C_DEV_NAME_FORMAT macro has been added to include/linux/i2c.h */
@@ -24,6 +25,8 @@
 #define INT3472_GPIO_TYPE_RESET					0x00
 #define INT3472_GPIO_TYPE_POWERDOWN				0x01
 #define INT3472_GPIO_TYPE_STROBE				0x02
+#define INT3472_GPIO_TYPE_POWER0				0x07
+#define INT3472_GPIO_TYPE_POWER1				0x08
 #define INT3472_GPIO_TYPE_POWER_ENABLE				0x0b
 #define INT3472_GPIO_TYPE_CLK_ENABLE				0x0c
 #define INT3472_GPIO_TYPE_PRIVACY_LED				0x0d
@@ -72,7 +75,6 @@
 	container_of(clk, struct int3472_discrete_device, clock)
 
 struct acpi_device;
-struct dmi_system_id;
 struct i2c_client;
 struct platform_device;
 

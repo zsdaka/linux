@@ -15,7 +15,7 @@
 
 #ifdef CONFIG_NVHE_EL2_TRACING
 #define HYPERVISOR_EVENT_IDS 					\
-	. = ALIGN(PAGE_SIZE);					\
+	. = ALIGN(SZ_8);					\
 	__hyp_event_ids_start = .;				\
 	*(HYP_SECTION_NAME(.event_ids))				\
 	__hyp_event_ids_end = .;
@@ -214,6 +214,14 @@ SECTIONS
 
 	HYPERVISOR_RODATA_SECTIONS
 
+#ifdef CONFIG_NVHE_EL2_TRACING
+	.rodata.hyp_string_fmts : {
+		__hyp_string_fmts_start = .;
+		*(_hyp_string_fmts)
+		__hyp_string_fmts_end = .;
+	}
+#endif
+
 	.got : { *(.got) }
 	/*
 	 * Make sure that the .got.plt is either completely empty or it
@@ -349,8 +357,14 @@ SECTIONS
 	_edata = .;
 
 	/* start of zero-init region */
-	BSS_SECTION(SBSS_ALIGN, 0, 0)
+	BSS_SECTION(SBSS_ALIGN, 0, PAGE_SIZE)
 	__pi___bss_start = __bss_start;
+
+	/* page table BSS starts here - preceding data/BSS is omitted from the linear map */
+	.pgtbl : ALIGN(PAGE_SIZE) {
+		*(.bss..pgtbl)
+	}
+	ASSERT(ADDR(.pgtbl) == __bss_stop, ".pgtbl must follow BSS")
 
 	. = ALIGN(PAGE_SIZE);
 	__pi_init_pg_dir = .;
@@ -368,6 +382,7 @@ SECTIONS
 
 	STABS_DEBUG
 	DWARF_DEBUG
+	PROPELLER_DATA
 	MODINFO
 	ELF_DETAILS
 

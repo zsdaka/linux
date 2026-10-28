@@ -200,7 +200,7 @@ static int cx20442_write(struct snd_soc_component *component, unsigned int reg,
  * Line discpline related code
  *
  * Any of the callback functions below can be used in two ways:
- * 1) registerd by a machine driver as one of line discipline operations,
+ * 1) registered by a machine driver as one of line discipline operations,
  * 2) called from a machine's provided line discipline callback function
  *    in case when extra machine specific code must be run as well.
  */
@@ -236,7 +236,8 @@ err:
 /* Line discipline .close() */
 static void v253_close(struct tty_struct *tty)
 {
-	struct snd_soc_component *component = tty->disc_data;
+	struct cx20442_codec *codec = tty->disc_data;
+	struct snd_soc_component *component = codec->component;
 	struct cx20442_priv *cx20442;
 
 	tty->disc_data = NULL;
@@ -248,7 +249,7 @@ static void v253_close(struct tty_struct *tty)
 
 	/* Prevent the codec driver from further accessing the modem */
 	cx20442->tty = NULL;
-	component->card->pop_time = 0;
+	codec->ready = false;
 }
 
 /* Line discipline .hangup() */
@@ -261,7 +262,8 @@ static void v253_hangup(struct tty_struct *tty)
 static void v253_receive(struct tty_struct *tty, const u8 *cp, const u8 *fp,
 			 size_t count)
 {
-	struct snd_soc_component *component = tty->disc_data;
+	struct cx20442_codec *codec = tty->disc_data;
+	struct snd_soc_component *component = codec->component;
 	struct cx20442_priv *cx20442;
 
 	if (!component)
@@ -274,7 +276,7 @@ static void v253_receive(struct tty_struct *tty, const u8 *cp, const u8 *fp,
 
 		/* Set up codec driver access to modem controls */
 		cx20442->tty = tty;
-		component->card->pop_time = 1;
+		codec->ready = true;
 	}
 }
 
@@ -375,7 +377,6 @@ static int cx20442_component_probe(struct snd_soc_component *component)
 	cx20442->tty = NULL;
 
 	snd_soc_component_set_drvdata(component, cx20442);
-	component->card->pop_time = 0;
 
 	return 0;
 }

@@ -8,6 +8,7 @@
 #include <linux/ioport.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/sysfs.h>
 #include <linux/ndctl.h>
 #include <linux/sched.h>
 #include <linux/libnvdimm.h>
@@ -1062,8 +1063,8 @@ static ssize_t health_bitmap_inject_show(struct device *dev,
 	struct nvdimm *dimm = to_nvdimm(dev);
 	struct papr_scm_priv *p = nvdimm_provider_data(dimm);
 
-	return sprintf(buf, "%#llx\n",
-		       READ_ONCE(p->health_bitmap_inject_mask));
+	return sysfs_emit(buf, "%#llx\n",
+			  READ_ONCE(p->health_bitmap_inject_mask));
 }
 
 static DEVICE_ATTR_ADMIN_RO(health_bitmap_inject);
@@ -1107,7 +1108,7 @@ static ssize_t perf_stats_show(struct device *dev,
 
 free_stats:
 	kfree(stats);
-	return rc ? rc : (ssize_t)seq_buf_used(&s);
+	return rc ?: (ssize_t)seq_buf_strlen(&s);
 }
 static DEVICE_ATTR_ADMIN_RO(perf_stats);
 
@@ -1146,10 +1147,10 @@ static ssize_t flags_show(struct device *dev,
 	if (health & PAPR_PMEM_SCRUBBED_AND_LOCKED)
 		seq_buf_printf(&s, "scrubbed locked ");
 
-	if (seq_buf_used(&s))
+	if (seq_buf_strlen(&s))
 		seq_buf_printf(&s, "\n");
 
-	return seq_buf_used(&s);
+	return seq_buf_strlen(&s);
 }
 DEVICE_ATTR_RO(flags);
 

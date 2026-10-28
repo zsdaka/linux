@@ -17,7 +17,6 @@
 #include <linux/errno.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
-#include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
@@ -364,6 +363,7 @@ static void t4ka3_get_vblank_limits(struct t4ka3_data *sensor,
 }
 
 static int t4ka3_set_pad_format(struct v4l2_subdev *sd,
+				const struct v4l2_subdev_client_info *ci,
 				struct v4l2_subdev_state *sd_state,
 				struct v4l2_subdev_format *format)
 {
@@ -627,6 +627,7 @@ static int t4ka3_disable_stream(struct v4l2_subdev *sd,
 }
 
 static int t4ka3_get_selection(struct v4l2_subdev *sd,
+			       const struct v4l2_subdev_client_info *ci,
 			       struct v4l2_subdev_state *state,
 			       struct v4l2_subdev_selection *sel)
 {
@@ -652,6 +653,7 @@ static int t4ka3_get_selection(struct v4l2_subdev *sd,
 }
 
 static int t4ka3_set_selection(struct v4l2_subdev *sd,
+			       const struct v4l2_subdev_client_info *ci,
 			       struct v4l2_subdev_state *state,
 			       struct v4l2_subdev_selection *sel)
 {
@@ -1035,7 +1037,6 @@ err_media_entity:
 
 err_pm_disable:
 	pm_runtime_disable(&client->dev);
-	pm_runtime_put_noidle(&client->dev);
 	t4ka3_pm_suspend(&client->dev);
 
 	return ret;

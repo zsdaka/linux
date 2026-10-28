@@ -40,9 +40,15 @@
 struct imsic_local_config {
 	phys_addr_t				msi_pa;
 	void __iomem				*msi_va;
+
+	/* Number of guest interrupt files per-HART */
+	u32					nr_guest_files;
 };
 
 struct imsic_global_config {
+	/* Device details */
+	struct fwnode_handle                    *fwnode;
+
 	/*
 	 * MSI Target Address Scheme
 	 *
@@ -68,7 +74,7 @@ struct imsic_global_config {
 	/* Number of guest interrupt identities */
 	u32					nr_guest_ids;
 
-	/* Number of guest interrupt files per core */
+	/* Number of guest interrupt files across all HARTs */
 	u32					nr_guest_files;
 
 	/* Per-CPU IMSIC addresses */

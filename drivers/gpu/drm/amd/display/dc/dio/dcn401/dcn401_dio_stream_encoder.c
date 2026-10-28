@@ -43,7 +43,7 @@
 
 #undef FN
 #define FN(reg_name, field_name) \
-	enc1->se_shift->field_name, enc1->se_mask->field_name
+	(uint8_t)enc1->se_shift->field_name, enc1->se_mask->field_name
 
 #define VBI_LINE_0 0
 #define HDMI_CLOCK_CHANNEL_RATE_MORE_340M 340000
@@ -793,6 +793,7 @@ void dcn401_dio_stream_encoder_construct(
 	enc1->se_shift = se_shift;
 	enc1->se_mask = se_mask;
 	enc1->base.stream_enc_inst = vpg->inst;
+	enc1->base.inst = enc1->base.stream_enc_inst;
 }
 
 void enc401_set_dynamic_metadata(struct stream_encoder *enc,

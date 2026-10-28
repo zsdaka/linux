@@ -138,11 +138,10 @@ static void inject_abt64(struct kvm_vcpu *vcpu, bool is_iabt, unsigned long addr
 		pend_sync_exception(vcpu);
 
 	/*
-	 * Build an {i,d}abort, depending on the level and the
-	 * instruction set. Report an external synchronous abort.
+	 * Build an {i,d}abort, depending on the level.
+	 * Report an external synchronous abort.
 	 */
-	if (kvm_vcpu_trap_il_is32bit(vcpu))
-		esr |= ESR_ELx_IL;
+	esr |= ESR_ELx_IL;
 
 	/*
 	 * Here, the guest runs in AArch64 mode when in EL1. If we get
@@ -170,14 +169,7 @@ void kvm_inject_sync(struct kvm_vcpu *vcpu, u64 esr)
 
 static void inject_undef64(struct kvm_vcpu *vcpu)
 {
-	u64 esr = (ESR_ELx_EC_UNKNOWN << ESR_ELx_EC_SHIFT);
-
-	/*
-	 * Build an unknown exception, depending on the instruction
-	 * set.
-	 */
-	if (kvm_vcpu_trap_il_is32bit(vcpu))
-		esr |= ESR_ELx_IL;
+	u64 esr = (ESR_ELx_EC_UNKNOWN << ESR_ELx_EC_SHIFT) | ESR_ELx_IL;
 
 	kvm_inject_sync(vcpu, esr);
 }
@@ -379,17 +371,17 @@ int kvm_inject_serror_esr(struct kvm_vcpu *vcpu, u64 esr)
 	}
 
 	/*
-	 * Emulate the exception entry if SErrors are unmasked. This is useful if
-	 * the vCPU is in a nested context w/ vSErrors enabled then we've already
-	 * delegated he hardware vSError context (i.e. HCR_EL2.VSE, VSESR_EL2,
-	 * VDISR_EL2) to the guest hypervisor.
+	 * With NV, emulate the exception entry if SErrors are unmasked: in a
+	 * nested context with vSErrors enabled, the hardware vSError context
+	 * (i.e. HCR_EL2.VSE, VSESR_EL2, VDISR_EL2) is delegated to the guest
+	 * hypervisor. Otherwise, HCR_EL2.VSE delivers it once it is unmasked.
 	 *
 	 * As we're emulating the SError injection we need to explicitly populate
 	 * ESR_ELx.EC because hardware will not do it on our behalf.
 	 */
-	if (!serror_is_masked(vcpu)) {
+	if (vcpu_has_nv(vcpu) && !serror_is_masked(vcpu)) {
 		pend_serror_exception(vcpu);
-		esr |= FIELD_PREP(ESR_ELx_EC_MASK, ESR_ELx_EC_SERROR);
+		esr |= FIELD_PREP(ESR_ELx_EC_MASK, ESR_ELx_EC_SERROR) | ESR_ELx_IL;
 		vcpu_write_sys_reg(vcpu, esr, exception_esr_elx(vcpu));
 		return 1;
 	}

@@ -31,6 +31,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/cleanup.h>
 #include <linux/etherdevice.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
@@ -430,7 +431,8 @@ static int set_ud_opcode(struct hns_roce_v2_ud_send_wqe *ud_sq_wqe,
 	return 0;
 }
 
-static int fill_ud_av(struct hns_roce_v2_ud_send_wqe *ud_sq_wqe,
+static int fill_ud_av(struct hns_roce_qp *qp,
+		      struct hns_roce_v2_ud_send_wqe *ud_sq_wqe,
 		      struct hns_roce_ah *ah)
 {
 	struct ib_device *ib_dev = ah->ibah.device;
@@ -440,7 +442,13 @@ static int fill_ud_av(struct hns_roce_v2_ud_send_wqe *ud_sq_wqe,
 	hr_reg_write(ud_sq_wqe, UD_SEND_WQE_HOPLIMIT, ah->av.hop_limit);
 	hr_reg_write(ud_sq_wqe, UD_SEND_WQE_TCLASS, ah->av.tclass);
 	hr_reg_write(ud_sq_wqe, UD_SEND_WQE_FLOW_LABEL, ah->av.flowlabel);
-	hr_reg_write(ud_sq_wqe, UD_SEND_WQE_SL, ah->av.sl);
+	if (!qp->ud_sl_set || qp->ibqp.qp_type == IB_QPT_GSI) {
+		qp->sl = qp->ibqp.qp_type == IB_QPT_GSI ?
+				hr_dev->gsi_sl : ah->av.sl;
+		qp->ud_sl_set = true;
+	}
+
+	hr_reg_write(ud_sq_wqe, UD_SEND_WQE_SL, qp->sl);
 
 	ud_sq_wqe->sgid_index = ah->av.gid_index;
 
@@ -490,11 +498,9 @@ static inline int set_ud_wqe(struct hns_roce_qp *qp,
 			  qp->qkey : ud_wr(wr)->remote_qkey);
 	hr_reg_write(ud_sq_wqe, UD_SEND_WQE_DQPN, ud_wr(wr)->remote_qpn);
 
-	ret = fill_ud_av(ud_sq_wqe, ah);
+	ret = fill_ud_av(qp, ud_sq_wqe, ah);
 	if (ret)
 		return ret;
-
-	qp->sl = to_hr_ah(ud_wr(wr)->ah)->av.sl;
 
 	set_extend_sge(qp, wr->sg_list, &curr_idx, valid_num_sge);
 
@@ -2415,8 +2421,7 @@ static void apply_func_caps(struct hns_roce_dev *hr_dev)
 					 caps->gmv_bt_num *
 					 (HNS_HW_PAGE_SIZE / caps->gmv_entry_sz));
 
-		caps->gmv_entry_num = caps->gmv_bt_num * (HNS_HW_PAGE_SIZE /
-							  caps->gmv_entry_sz);
+		caps->gmv_entry_num = caps->gid_table_len[0];
 	} else {
 		u32 func_num = max_t(u32, 1, hr_dev->func_num);
 
@@ -3823,7 +3828,8 @@ static void __hns_roce_v2_cq_clean(struct hns_roce_cq *hr_cq, u32 qpn,
 	 * Now backwards through the CQ, removing CQ entries
 	 * that match our QP by overwriting them with next entries.
 	 */
-	while ((int) --prod_index - (int) hr_cq->cons_index >= 0) {
+	while (prod_index != hr_cq->cons_index) {
+		--prod_index;
 		cqe = get_cqe_v2(hr_cq, prod_index & hr_cq->ib_cq.cqe);
 		if (hr_reg_read(cqe, CQE_LCL_QPN) == qpn) {
 			if (srq && hr_reg_read(cqe, CQE_S_R)) {
@@ -4352,18 +4358,39 @@ static int get_op_for_set_hem(struct hns_roce_dev *hr_dev, u32 type,
 static int config_gmv_ba_to_hw(struct hns_roce_dev *hr_dev, unsigned long obj,
 			       dma_addr_t base_addr)
 {
+	u32 obj_num_per_bt = HNS_HW_PAGE_SIZE / hr_dev->caps.gmv_entry_sz;
+	u32 chunk_size = 1 << (hr_dev->caps.gmv_buf_pg_sz + PAGE_SHIFT);
+	u32 bt_num_per_chunk = chunk_size / HNS_HW_PAGE_SIZE;
+	u32 first = obj / obj_num_per_bt;
+	u32 last = min(first + bt_num_per_chunk, hr_dev->caps.gmv_bt_num);
 	struct hns_roce_cmq_desc desc;
-	struct hns_roce_cmq_req *req = (struct hns_roce_cmq_req *)desc.data;
-	u32 idx = obj / (HNS_HW_PAGE_SIZE / hr_dev->caps.gmv_entry_sz);
-	u64 addr = to_hr_hw_page_addr(base_addr);
+	struct hns_roce_cmq_req *req;
+	u64 addr;
+	int ret;
+	u32 i;
 
-	hns_roce_cmq_setup_basic_desc(&desc, HNS_ROCE_OPC_CFG_GMV_BT, false);
+	/* The GMV BT entry of hardware covers a fixed 4K region, so a buffer
+	 * chunk larger than 4K must be registered to hardware with one BT
+	 * entry per 4K block, otherwise the GMV entries beyond the first
+	 * 4K of the chunk are unreachable.
+	 */
+	for (i = first; i < last; i++) {
+		hns_roce_cmq_setup_basic_desc(&desc, HNS_ROCE_OPC_CFG_GMV_BT,
+					      false);
+		req = (struct hns_roce_cmq_req *)desc.data;
 
-	hr_reg_write(req, CFG_GMV_BT_BA_L, lower_32_bits(addr));
-	hr_reg_write(req, CFG_GMV_BT_BA_H, upper_32_bits(addr));
-	hr_reg_write(req, CFG_GMV_BT_IDX, idx);
+		addr = to_hr_hw_page_addr(base_addr +
+					  (u64)(i - first) * HNS_HW_PAGE_SIZE);
+		hr_reg_write(req, CFG_GMV_BT_BA_L, lower_32_bits(addr));
+		hr_reg_write(req, CFG_GMV_BT_BA_H, upper_32_bits(addr));
+		hr_reg_write(req, CFG_GMV_BT_IDX, i);
 
-	return hns_roce_cmq_send(hr_dev, &desc, 1);
+		ret = hns_roce_cmq_send(hr_dev, &desc, 1);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int set_hem_to_hw(struct hns_roce_dev *hr_dev, int obj,
@@ -4392,7 +4419,7 @@ static int hns_roce_v2_set_hem(struct hns_roce_dev *hr_dev,
 	struct hns_roce_hem_mhop mhop;
 	struct hns_roce_hem *hem;
 	unsigned long mhop_obj = obj;
-	int i, j, k;
+	u64 i, j, k;
 	int ret = 0;
 	u64 hem_idx = 0;
 	u64 l1_idx = 0;
@@ -5326,7 +5353,7 @@ static int hns_roce_v2_set_path(struct ib_qp *ibqp,
 	hr_reg_clear(qpc_mask, QPC_VLAN_ID);
 
 	if (grh->sgid_index >= hr_dev->caps.gid_table_len[hr_port]) {
-		ibdev_err(ibdev, "sgid_index(%u) too large. max is %d\n",
+		ibdev_err(ibdev, "sgid_index(%u) too large. max is %u\n",
 			  grh->sgid_index, hr_dev->caps.gid_table_len[hr_port]);
 		return -EINVAL;
 	}
@@ -5602,6 +5629,7 @@ static void v2_set_flushed_fields(struct ib_qp *ibqp,
 	hr_reg_write(context, QPC_SQ_PRODUCER_IDX, hr_qp->sq.head);
 	hr_reg_clear(qpc_mask, QPC_SQ_PRODUCER_IDX);
 	hr_qp->state = IB_QPS_ERR;
+	hr_qp->ud_sl_set = false;
 	spin_unlock_irqrestore(&hr_qp->sq.lock, sq_flag);
 
 	if (ibqp->srq || ibqp->qp_type == IB_QPT_XRC_INI) /* no RQ */
@@ -6192,9 +6220,9 @@ static int hns_roce_v2_modify_srq(struct ib_srq *ibsrq,
 					HNS_ROCE_CMD_MODIFY_SRQC, srq->srqn);
 		hns_roce_free_cmd_mailbox(hr_dev, mailbox);
 		if (ret)
-			ibdev_err(&hr_dev->ib_dev,
-				  "failed to handle cmd of modifying SRQ, ret = %d.\n",
-				  ret);
+			ibdev_err_ratelimited(&hr_dev->ib_dev,
+					      "failed to handle cmd of modifying SRQ, ret = %d.\n",
+					      ret);
 	}
 
 out:
@@ -6220,9 +6248,9 @@ static int hns_roce_v2_query_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr)
 	ret = hns_roce_cmd_mbox(hr_dev, 0, mailbox->dma,
 				HNS_ROCE_CMD_QUERY_SRQC, srq->srqn);
 	if (ret) {
-		ibdev_err(&hr_dev->ib_dev,
-			  "failed to process cmd of querying SRQ, ret = %d.\n",
-			  ret);
+		ibdev_err_ratelimited(&hr_dev->ib_dev,
+				      "failed to process cmd of querying SRQ, ret = %d.\n",
+				      ret);
 		goto out;
 	}
 
@@ -6328,9 +6356,9 @@ static int hns_roce_v2_query_mpt(struct hns_roce_dev *hr_dev, u32 key,
 	ret = hns_roce_cmd_mbox(hr_dev, 0, mailbox->dma, HNS_ROCE_CMD_QUERY_MPT,
 				key_to_hw_index(key));
 	if (ret) {
-		ibdev_err(&hr_dev->ib_dev,
-			  "failed to process cmd when querying MPT, ret = %d.\n",
-			  ret);
+		ibdev_err_ratelimited(&hr_dev->ib_dev,
+				      "failed to process cmd when querying MPT, ret = %d.\n",
+				      ret);
 		goto err_mailbox;
 	}
 
@@ -6912,7 +6940,7 @@ static int alloc_eq_buf(struct hns_roce_dev *hr_dev, struct hns_roce_eq *eq)
 
 	err = hns_roce_mtr_create(hr_dev, &eq->mtr, &buf_attr,
 				  hr_dev->caps.eqe_ba_pg_sz + PAGE_SHIFT, NULL,
-				  0);
+				  0, false);
 	if (err)
 		dev_err(hr_dev->dev, "failed to alloc EQE mtr, err %d\n", err);
 
@@ -7196,6 +7224,57 @@ static void hns_roce_v2_cleanup_eq_table(struct hns_roce_dev *hr_dev)
 	kfree(eq_table->eq);
 }
 
+static const enum hns_roce_opcode_type scc_opcode[] = {
+	HNS_ROCE_OPC_CFG_DCQCN_PARAM,
+	HNS_ROCE_OPC_CFG_LDCP_PARAM,
+	HNS_ROCE_OPC_CFG_HC3_PARAM,
+	HNS_ROCE_OPC_CFG_DIP_PARAM,
+};
+
+static int hns_roce_v2_config_scc_param(struct hns_roce_dev *hr_dev,
+					enum hns_roce_scc_algo algo)
+{
+	struct hns_roce_scc_param *scc_param = &hr_dev->scc_param[algo];
+	struct hns_roce_cmq_desc desc;
+	int ret;
+
+	lockdep_assert_held(&scc_param->scc_mutex);
+
+	hns_roce_cmq_setup_basic_desc(&desc, scc_opcode[algo], false);
+	memcpy(&desc.data, scc_param->param, sizeof(scc_param->param));
+
+	ret = hns_roce_cmq_send(hr_dev, &desc, 1);
+	if (ret)
+		ibdev_err_ratelimited(&hr_dev->ib_dev,
+				      "failed to configure scc param, opcode: 0x%x, ret = %d.\n",
+				      le16_to_cpu(desc.opcode), ret);
+
+	return ret;
+}
+
+static int hns_roce_v2_query_scc_param(struct hns_roce_dev *hr_dev,
+				       enum hns_roce_scc_algo algo)
+{
+	struct hns_roce_scc_param *scc_param;
+	struct hns_roce_cmq_desc desc;
+	int ret;
+
+	hns_roce_cmq_setup_basic_desc(&desc, scc_opcode[algo], true);
+	ret = hns_roce_cmq_send(hr_dev, &desc, 1);
+	if (ret) {
+		ibdev_err_ratelimited(&hr_dev->ib_dev,
+				      "failed to query scc param, opcode: 0x%x, ret = %d.\n",
+				      le16_to_cpu(desc.opcode), ret);
+		return ret;
+	}
+
+	scc_param = &hr_dev->scc_param[algo];
+	scoped_guard(mutex, &scc_param->scc_mutex)
+		memcpy(scc_param->param, &desc.data, sizeof(scc_param->param));
+
+	return 0;
+}
+
 static const struct ib_device_ops hns_roce_v2_dev_ops = {
 	.destroy_qp = hns_roce_v2_destroy_qp,
 	.modify_cq = hns_roce_v2_modify_cq,
@@ -7246,19 +7325,35 @@ static const struct hns_roce_hw hns_roce_hw_v2 = {
 	.get_dscp = hns_roce_hw_v2_get_dscp,
 	.hns_roce_dev_ops = &hns_roce_v2_dev_ops,
 	.hns_roce_dev_srq_ops = &hns_roce_v2_dev_srq_ops,
+	.config_scc_param = hns_roce_v2_config_scc_param,
+	.query_scc_param = hns_roce_v2_query_scc_param,
 };
 
 static const struct pci_device_id hns_roce_hw_v2_pci_tbl[] = {
-	{PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_25GE_RDMA), 0},
-	{PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_25GE_RDMA_MACSEC), 0},
-	{PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_50GE_RDMA), 0},
-	{PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_50GE_RDMA_MACSEC), 0},
-	{PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_100G_RDMA_MACSEC), 0},
-	{PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_200G_RDMA), 0},
-	{PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_RDMA_DCB_PFC_VF),
-	 HNAE3_DEV_SUPPORT_ROCE_DCB_BITS},
+	{
+		PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_25GE_RDMA),
+		.driver_data = 0,
+	}, {
+		PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_25GE_RDMA_MACSEC),
+		.driver_data = 0,
+	}, {
+		PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_50GE_RDMA),
+		.driver_data = 0,
+	}, {
+		PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_50GE_RDMA_MACSEC),
+		.driver_data = 0,
+	}, {
+		PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_100G_RDMA_MACSEC),
+		.driver_data = 0,
+	}, {
+		PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_200G_RDMA),
+		.driver_data = 0,
+	}, {
+		PCI_VDEVICE(HUAWEI, HNAE3_DEV_ID_RDMA_DCB_PFC_VF),
+		.driver_data = HNAE3_DEV_SUPPORT_ROCE_DCB_BITS,
+	},
 	/* required last entry */
-	{0, }
+	{ }
 };
 
 MODULE_DEVICE_TABLE(pci, hns_roce_hw_v2_pci_tbl);
@@ -7586,8 +7681,8 @@ static int __init hns_roce_hw_v2_init(void)
 
 static void __exit hns_roce_hw_v2_exit(void)
 {
-	hns_roce_dealloc_bond_grp();
 	hnae3_unregister_client(&hns_roce_hw_v2_client);
+	hns_roce_dealloc_bond_grp();
 	hns_roce_cleanup_debugfs();
 }
 

@@ -617,7 +617,9 @@ bool hubbub401_dcc_support_swizzle(
 			swizzle_supported = true;
 		break;
 	case DC_ADDR3_SW_64KB_2D:
+	case DC_ADDR3_SW_64KB_2D_Z:
 	case DC_ADDR3_SW_256KB_2D:
+	case DC_ADDR3_SW_256KB_2D_Z:
 		swizzle_supported = true;
 		break;
 	default:
@@ -833,7 +835,7 @@ bool hubbub401_get_dcc_compression_cap(struct hubbub *hubbub,
 		struct dc_surface_dcc_cap *output)
 {
 	struct dc *dc = hubbub->ctx->dc;
-	const unsigned int max_dcc_plane_width = dc->caps.dcc_plane_width_limit;
+	const int max_dcc_plane_width = (int)dc->caps.dcc_plane_width_limit;
 	/* DCN4_Programming_Guide_DCHUB.docx, Section 5.11.2.2 */
 	enum dcc_control dcc_control;
 	unsigned int plane0_bpe, plane1_bpe;
@@ -1198,6 +1200,7 @@ bool dcn401_program_arbiter(struct hubbub *hubbub, struct dml2_display_arb_regs 
 
 	bool wm_pending = false;
 	uint32_t temp;
+	bool allow_sdpif_rate_limit_when_cstate_req = arb_regs->allow_sdpif_rate_limit_when_cstate_req != 0;
 
 	/* request backpressure and outstanding return threshold (unused)*/
 	//REG_UPDATE(DCHUBBUB_TIMEOUT_DETECTION_CTRL1, DCHUBBUB_TIMEOUT_REQ_STALL_THRESHOLD, arb_regs->req_stall_threshold);
@@ -1205,8 +1208,8 @@ bool dcn401_program_arbiter(struct hubbub *hubbub, struct dml2_display_arb_regs 
 	/* P-State stall threshold */
 	REG_UPDATE(DCHUBBUB_TIMEOUT_DETECTION_CTRL2, DCHUBBUB_TIMEOUT_PSTATE_STALL_THRESHOLD, arb_regs->pstate_stall_threshold);
 
-	if (safe_to_lower || arb_regs->allow_sdpif_rate_limit_when_cstate_req > hubbub2->allow_sdpif_rate_limit_when_cstate_req) {
-		hubbub2->allow_sdpif_rate_limit_when_cstate_req = arb_regs->allow_sdpif_rate_limit_when_cstate_req;
+	if (safe_to_lower || allow_sdpif_rate_limit_when_cstate_req > hubbub2->allow_sdpif_rate_limit_when_cstate_req) {
+		hubbub2->allow_sdpif_rate_limit_when_cstate_req = allow_sdpif_rate_limit_when_cstate_req;
 
 		/* only update the required bits */
 		REG_GET(DCHUBBUB_CTRL_STATUS, DCHUBBUB_HW_DEBUG, &temp);
@@ -1236,6 +1239,7 @@ static const struct hubbub_funcs hubbub4_01_funcs = {
 	.allow_self_refresh_control = hubbub1_allow_self_refresh_control,
 	.is_allow_self_refresh_enabled = hubbub1_is_allow_self_refresh_enabled,
 	.verify_allow_pstate_change_high = NULL,
+	.soft_reset = hubbub1_soft_reset,
 	.force_wm_propagate_to_pipes = hubbub32_force_wm_propagate_to_pipes,
 	.force_pstate_change_control = hubbub3_force_pstate_change_control,
 	.init_watermarks = hubbub401_init_watermarks,
@@ -1247,7 +1251,8 @@ static const struct hubbub_funcs hubbub4_01_funcs = {
 	.program_compbuf_segments = dcn401_program_compbuf_segments,
 	.wait_for_det_update = dcn401_wait_for_det_update,
 	.program_arbiter = dcn401_program_arbiter,
-	.hubbub_read_reg_state = hubbub3_read_reg_state
+	.hubbub_read_reg_state = hubbub3_read_reg_state,
+	.get_mall_en = hubbub32_get_mall_en
 };
 
 void hubbub401_construct(struct dcn20_hubbub *hubbub2,
@@ -1260,6 +1265,8 @@ void hubbub401_construct(struct dcn20_hubbub *hubbub2,
 	int config_return_buffer_size_kb)
 {
 	hubbub2->base.ctx = ctx;
+
+	hubbub2->base.inst = 0;
 	hubbub2->base.funcs = &hubbub4_01_funcs;
 	hubbub2->regs = hubbub_regs;
 	hubbub2->shifts = hubbub_shift;

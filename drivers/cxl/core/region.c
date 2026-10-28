@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright(c) 2022 Intel Corporation. All rights reserved. */
+#include <linux/acpi.h>
 #include <linux/memregion.h>
 #include <linux/genalloc.h>
 #include <linux/debugfs.h>
@@ -15,6 +16,7 @@
 #include <cxlmem.h>
 #include <cxl.h>
 #include "core.h"
+#include "mce.h"
 
 /**
  * DOC: cxl core region
@@ -682,8 +684,8 @@ static int alloc_hpa(struct cxl_region *cxlr, resource_size_t size)
 				    dev_name(&cxlr->dev));
 	if (IS_ERR(res)) {
 		dev_dbg(&cxlr->dev,
-			"HPA allocation error (%ld) for size:%pap in %s %pr\n",
-			PTR_ERR(res), &size, cxlrd->res->name, cxlrd->res);
+			"HPA allocation error (%pe) for size:%pap in %s %pr\n",
+			res, &size, cxlrd->res->name, cxlrd->res);
 		return PTR_ERR(res);
 	}
 
@@ -1148,6 +1150,19 @@ static int cxl_rr_assign_decoder(struct cxl_port *port, struct cxl_region *cxlr,
 static void cxl_region_setup_flags(struct cxl_region *cxlr,
 				   struct cxl_decoder *cxld)
 {
+	if (is_endpoint_decoder(&cxld->dev)) {
+		struct cxl_endpoint_decoder *cxled = to_cxl_endpoint_decoder(&cxld->dev);
+		struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+
+		/*
+		 * When a region's memdevs specify an @attach method the attach
+		 * provider is responsible for dispositioning the region for
+		 * both probe and userspace management
+		 */
+		if (cxlmd->attach)
+			set_bit(CXL_REGION_F_LOCK, &cxlr->flags);
+	}
+
 	if (cxld->flags & CXL_DECODER_F_LOCK) {
 		set_bit(CXL_REGION_F_LOCK, &cxlr->flags);
 		clear_bit(CXL_REGION_F_NEEDS_RESET, &cxlr->flags);
@@ -1224,8 +1239,6 @@ static int cxl_port_attach_region(struct cxl_port *port,
 			nr_targets_inc = true;
 		}
 	} else {
-		struct cxl_decoder *cxld;
-
 		cxld = cxl_port_pick_region_decoder(port, cxled, cxlr);
 		if (!cxld) {
 			dev_dbg(&cxlr->dev, "%s: no decoder available\n",
@@ -1355,7 +1368,8 @@ static int check_last_peer(struct cxl_endpoint_decoder *cxled,
 	/*
 	 * If this position wants to share a dport with the last endpoint mapped
 	 * then that endpoint, at index 'position - distance', must also be
-	 * mapped by this dport.
+	 * mapped by this dport. An endpoint that this port does not map at all
+	 * fails that requirement.
 	 */
 	if (pos < distance) {
 		dev_dbg(&cxlr->dev, "%s:%s: cannot host %s:%s at %d\n",
@@ -1366,7 +1380,7 @@ static int check_last_peer(struct cxl_endpoint_decoder *cxled,
 	cxled_peer = p->targets[pos - distance];
 	cxlmd_peer = cxled_to_memdev(cxled_peer);
 	ep_peer = cxl_ep_load(port, cxlmd_peer);
-	if (ep->dport != ep_peer->dport) {
+	if (!ep_peer || ep->dport != ep_peer->dport) {
 		dev_dbg(&cxlr->dev,
 			"%s:%s: %s:%s pos %d mismatched peer %s:%s\n",
 			dev_name(port->uport_dev), dev_name(&port->dev),
@@ -1848,8 +1862,21 @@ static int cxl_region_attach_auto(struct cxl_region *cxlr,
 	 * this means that userspace can view devices in the wrong position
 	 * before the region activates, and must be careful to understand when
 	 * it might be racing region autodiscovery.
+	 *
+	 * The endpoint decoder will be recorded into the first free slot of
+	 * the target array.
 	 */
-	pos = p->nr_targets;
+	for (pos = 0; pos < p->interleave_ways; pos++) {
+		if (!p->targets[pos])
+			break;
+	}
+
+	if (pos == p->interleave_ways) {
+		dev_err(&cxlr->dev, "%s: unable to find a free target slot\n",
+			dev_name(&cxled->cxld.dev));
+		return -ENXIO;
+	}
+
 	p->targets[pos] = cxled;
 	cxled->pos = pos;
 	cxled->state = CXL_DECODER_STATE_AUTO_STAGED;
@@ -1889,15 +1916,14 @@ static int find_pos_and_ways(struct cxl_port *port, struct range *range,
 {
 	struct cxl_switch_decoder *cxlsd;
 	struct cxl_port *parent;
-	struct device *dev;
 	int rc = -ENXIO;
 
 	parent = parent_port_of(port);
 	if (!parent)
 		return rc;
 
-	dev = device_find_child(&parent->dev, range,
-				match_switch_decoder_by_range);
+	struct device *dev __free(put_device) =
+		device_find_child(&parent->dev, range, match_switch_decoder_by_range);
 	if (!dev) {
 		dev_err(port->uport_dev,
 			"failed to find decoder mapping %#llx-%#llx\n",
@@ -1914,14 +1940,11 @@ static int find_pos_and_ways(struct cxl_port *port, struct range *range,
 			break;
 		}
 	}
-	put_device(dev);
-
 	if (rc)
 		dev_err(port->uport_dev,
 			"failed to find %s:%s in target list of %s\n",
 			dev_name(&port->dev),
-			dev_name(port->parent_dport->dport_dev),
-			dev_name(&cxlsd->cxld.dev));
+			dev_name(port->parent_dport->dport_dev), dev_name(dev));
 
 	return rc;
 }
@@ -2011,8 +2034,9 @@ static int cxl_region_sort_targets(struct cxl_region *cxlr)
 		cxled->pos = cxl_calc_interleave_pos(cxled, &cxlr->hpa_range);
 		/*
 		 * Record that sorting failed, but still continue to calc
-		 * cxled->pos so that follow-on code paths can reliably
-		 * do p->targets[cxled->pos] to self-reference their entry.
+		 * cxled->pos so that cxl_calc_interleave_pos() emits its
+		 * dev_dbg() for every member. which is useful for auto
+		 * discovery debug.
 		 */
 		if (cxled->pos < 0)
 			rc = -ENXIO;
@@ -2090,7 +2114,7 @@ static int cxl_region_attach(struct cxl_region *cxlr,
 		return -ENXIO;
 	}
 
-	if (!cxled->dpa_res) {
+	if (cxled_empty(cxled)) {
 		dev_dbg(&cxlr->dev, "%s:%s: missing DPA allocation.\n",
 			dev_name(&cxlmd->dev), dev_name(&cxled->cxld.dev));
 		return -ENXIO;
@@ -2189,31 +2213,44 @@ static int cxl_region_attach(struct cxl_region *cxlr,
 	 * will fail when presented as CXL_REGION_F_AUTO.
 	 */
 	for (int i = 0; i < p->nr_targets; i++) {
-		struct cxl_endpoint_decoder *cxled = p->targets[i];
+		struct cxl_endpoint_decoder *target = p->targets[i];
 		int test_pos;
 
-		test_pos = cxl_calc_interleave_pos(cxled, &cxlr->hpa_range);
-		dev_dbg(&cxled->cxld.dev,
-			"Test cxl_calc_interleave_pos(): %s test_pos:%d cxled->pos:%d\n",
-			(test_pos == cxled->pos) ? "success" : "fail",
-			test_pos, cxled->pos);
+		test_pos = cxl_calc_interleave_pos(target, &cxlr->hpa_range);
+		if (test_pos != target->pos)
+			dev_warn(&cxlr->dev,
+				 "%s: position mismatch: calculated:%d assigned:%d\n",
+				 dev_name(&target->cxld.dev), test_pos,
+				 target->pos);
 	}
 
 	return 0;
 }
 
-static int cxl_region_by_target(struct device *dev, const void *data)
+static int cxl_region_remove_target(struct device *dev, void *data)
 {
-	const struct cxl_endpoint_decoder *cxled = data;
+	struct cxl_endpoint_decoder *cxled = data;
 	struct cxl_region_params *p;
 	struct cxl_region *cxlr;
+	int i;
 
 	if (!is_cxl_region(dev))
 		return 0;
 
 	cxlr = to_cxl_region(dev);
 	p = &cxlr->params;
-	return p->targets[cxled->pos] == cxled;
+	for (i = 0; i < p->interleave_ways; i++) {
+		if (p->targets[i] == cxled) {
+			p->nr_targets--;
+			cxled->state = CXL_DECODER_STATE_AUTO;
+			cxled->pos = -1;
+			p->targets[i] = NULL;
+
+			return 1;
+		}
+	}
+
+	return 0;
 }
 
 /*
@@ -2222,25 +2259,10 @@ static int cxl_region_by_target(struct device *dev, const void *data)
  */
 static void cxl_cancel_auto_attach(struct cxl_endpoint_decoder *cxled)
 {
-	struct cxl_region_params *p;
-	struct cxl_region *cxlr;
-	int pos = cxled->pos;
-
 	if (cxled->state != CXL_DECODER_STATE_AUTO_STAGED)
 		return;
 
-	struct device *dev __free(put_device) =
-		bus_find_device(&cxl_bus_type, NULL, cxled, cxl_region_by_target);
-	if (!dev)
-		return;
-
-	cxlr = to_cxl_region(dev);
-	p = &cxlr->params;
-
-	p->nr_targets--;
-	cxled->state = CXL_DECODER_STATE_AUTO;
-	cxled->pos = -1;
-	p->targets[pos] = NULL;
+	bus_for_each_dev(&cxl_bus_type, NULL, cxled, cxl_region_remove_target);
 }
 
 static struct cxl_region *
@@ -2537,12 +2559,13 @@ static struct cxl_region *to_cxl_region(struct device *dev)
 	return container_of(dev, struct cxl_region, dev);
 }
 
-static void unregister_region(void *_cxlr)
+static void unregister_region(struct cxl_region *cxlr)
 {
-	struct cxl_region *cxlr = _cxlr;
+	struct cxl_root_decoder *cxlrd = to_cxl_root_decoder(cxlr->dev.parent);
 	struct cxl_region_params *p = &cxlr->params;
 	int i;
 
+	xa_erase(&cxlrd->regions, cxlr->id);
 	device_del(&cxlr->dev);
 
 	/*
@@ -2556,6 +2579,17 @@ static void unregister_region(void *_cxlr)
 	cxlr->hpa_range = DEFINE_RANGE(0, -1);
 
 	cxl_region_iomem_release(cxlr);
+	put_device(&cxlr->dev);
+}
+
+static void endpoint_unregister_region(void *_cxlr)
+{
+	struct cxl_region *cxlr = _cxlr;
+	struct cxl_root_decoder *cxlrd = to_cxl_root_decoder(cxlr->dev.parent);
+
+	guard(mutex)(&cxlrd->regions_lock);
+	if (xa_load(&cxlrd->regions, cxlr->id))
+		unregister_region(cxlr);
 	put_device(&cxlr->dev);
 }
 
@@ -2599,7 +2633,19 @@ static bool cxl_region_update_coordinates(struct cxl_region *cxlr, int nid)
 
 	for (int i = 0; i < ACCESS_COORDINATE_MAX; i++) {
 		if (cxlr->coord[i].read_bandwidth) {
-			node_update_perf_attrs(nid, &cxlr->coord[i], i);
+			/*
+			 * A CFMWS-only node (not backed by a real SRAT pxm)
+			 * has no HMAT memory_target, so hmat_callback()
+			 * never created the access attributes for it:
+			 * create them here instead of only updating them.
+			 * This is called at most once per node (see
+			 * nodemask_region_seen), so the attributes are not
+			 * created twice.
+			 */
+			if (!acpi_node_backed_by_real_pxm(nid))
+				node_set_perf_attrs(nid, &cxlr->coord[i], i);
+			else
+				node_update_perf_attrs(nid, &cxlr->coord[i], i);
 			cset++;
 		}
 	}
@@ -2673,6 +2719,19 @@ static int cxl_region_calculate_adistance(struct notifier_block *nb,
 	return NOTIFY_STOP;
 }
 
+/* unwind all remaining regions */
+void kill_regions(struct cxl_root_decoder *cxlrd)
+{
+	unsigned long index;
+	struct cxl_region *cxlr;
+
+	guard(mutex)(&cxlrd->regions_lock);
+	/* no more region creation */
+	cxlrd->dead = true;
+	xa_for_each(&cxlrd->regions, index, cxlr)
+		unregister_region(cxlr);
+}
+
 /**
  * devm_cxl_add_region - Adds a region to a decoder
  * @cxlrd: root decoder
@@ -2683,7 +2742,7 @@ static int cxl_region_calculate_adistance(struct notifier_block *nb,
  * This is the second step of region initialization. Regions exist within an
  * address space which is mapped by a @cxlrd.
  *
- * Return: 0 if the region was added to the @cxlrd, else returns negative error
+ * Return: the new region if it was added to the @cxlrd, else an ERR_PTR() with the error
  * code. The region will be named "regionZ" where Z is the unique region number.
  */
 static struct cxl_region *devm_cxl_add_region(struct cxl_root_decoder *cxlrd,
@@ -2711,14 +2770,15 @@ static struct cxl_region *devm_cxl_add_region(struct cxl_root_decoder *cxlrd,
 	if (rc)
 		goto err;
 
-	rc = devm_add_action_or_reset(port->uport_dev, unregister_region, cxlr);
-	if (rc)
+	rc = xa_insert(&cxlrd->regions, cxlr->id, cxlr, GFP_KERNEL);
+	if (rc) {
+		unregister_region(cxlr);
 		return ERR_PTR(rc);
+	}
 
 	dev_dbg(port->uport_dev, "%s: created %s\n",
 		dev_name(&cxlrd->cxlsd.cxld.dev), dev_name(dev));
 	return cxlr;
-
 err:
 	put_device(dev);
 	return ERR_PTR(rc);
@@ -2746,6 +2806,9 @@ static struct cxl_region *__create_region(struct cxl_root_decoder *cxlrd,
 					  enum cxl_decoder_type target_type)
 {
 	int rc;
+
+	if (cxlrd->dead)
+		return ERR_PTR(-ENXIO);
 
 	switch (mode) {
 	case CXL_PARTMODE_RAM:
@@ -2778,6 +2841,10 @@ static ssize_t create_region_store(struct device *dev, const char *buf,
 	rc = sscanf(buf, "region%d\n", &id);
 	if (rc != 1)
 		return -EINVAL;
+
+	ACQUIRE(mutex_intr, regions_lock)(&cxlrd->regions_lock);
+	if ((rc = ACQUIRE_ERR(mutex_intr, &regions_lock)))
+		return rc;
 
 	cxlr = __create_region(cxlrd, mode, id, CXL_DECODER_HOSTONLYMEM);
 	if (IS_ERR(cxlr))
@@ -2818,33 +2885,27 @@ static ssize_t region_show(struct device *dev, struct device_attribute *attr,
 }
 DEVICE_ATTR_RO(region);
 
-static struct cxl_region *
-cxl_find_region_by_name(struct cxl_root_decoder *cxlrd, const char *name)
-{
-	struct cxl_decoder *cxld = &cxlrd->cxlsd.cxld;
-	struct device *region_dev;
-
-	region_dev = device_find_child_by_name(&cxld->dev, name);
-	if (!region_dev)
-		return ERR_PTR(-ENODEV);
-
-	return to_cxl_region(region_dev);
-}
-
 static ssize_t delete_region_store(struct device *dev,
 				   struct device_attribute *attr,
 				   const char *buf, size_t len)
 {
 	struct cxl_root_decoder *cxlrd = to_cxl_root_decoder(dev);
-	struct cxl_port *port = to_cxl_port(dev->parent);
 	struct cxl_region *cxlr;
+	int rc, id;
 
-	cxlr = cxl_find_region_by_name(cxlrd, buf);
-	if (IS_ERR(cxlr))
-		return PTR_ERR(cxlr);
+	ACQUIRE(mutex_intr, regions_lock)(&cxlrd->regions_lock);
+	if ((rc = ACQUIRE_ERR(mutex_intr, &regions_lock)))
+		return rc;
 
-	devm_release_action(port->uport_dev, unregister_region, cxlr);
-	put_device(&cxlr->dev);
+	rc = sscanf(buf, "region%d\n", &id);
+	if (rc != 1)
+		return -EINVAL;
+
+	cxlr = xa_load(&cxlrd->regions, id);
+	if (!cxlr || !sysfs_streq(buf, dev_name(&cxlr->dev)))
+		return -ENODEV;
+
+	unregister_region(cxlr);
 
 	return len;
 }
@@ -2855,6 +2916,16 @@ struct cxl_poison_context {
 	int part;
 	u64 offset;
 };
+
+/*
+ * A device may answer a Get Poison List request with "physical address
+ * specified is invalid" (-EFAULT). That answer is tolerated for a RAM
+ * partition and the poison walk continues.
+ */
+static inline bool poison_efault_forgiven(int rc, enum cxl_partition_mode mode)
+{
+	return rc == -EFAULT && mode == CXL_PARTMODE_RAM;
+}
 
 static int cxl_get_poison_unmapped(struct cxl_memdev *cxlmd,
 				   struct cxl_poison_context *ctx)
@@ -2884,7 +2955,7 @@ static int cxl_get_poison_unmapped(struct cxl_memdev *cxlmd,
 		if (!length)
 			break;
 		rc = cxl_mem_get_poison(cxlmd, offset, length, NULL);
-		if (rc == -EFAULT && cxlds->part[i].mode == CXL_PARTMODE_RAM)
+		if (poison_efault_forgiven(rc, cxlds->part[i].mode))
 			continue;
 		if (rc)
 			break;
@@ -2901,36 +2972,39 @@ static int poison_by_decoder(struct device *dev, void *arg)
 	struct cxl_dev_state *cxlds;
 	struct cxl_memdev *cxlmd;
 	u64 offset, length;
-	int rc = 0;
+	int rc;
 
 	if (!is_endpoint_decoder(dev))
-		return rc;
+		return 0;
 
 	cxled = to_cxl_endpoint_decoder(dev);
 	if (!cxled->dpa_res)
-		return rc;
+		return 0;
 
-	cxlmd = cxled_to_memdev(cxled);
-	cxlds = cxlmd->cxlds;
-	mode = cxlds->part[cxled->part].mode;
+	/*
+	 * Handle the degenerate case of a device with only empty decoders. An
+	 * empty decoder can still map a non-zero skip range, so advance the
+	 * walk to commit_end either way.
+	 */
+	if (cxled->part >= 0) {
+		cxlmd = cxled_to_memdev(cxled);
+		cxlds = cxlmd->cxlds;
+		mode = cxlds->part[cxled->part].mode;
 
-	if (cxled->skip) {
-		offset = cxled->dpa_res->start - cxled->skip;
-		length = cxled->skip;
-		rc = cxl_mem_get_poison(cxlmd, offset, length, NULL);
-		if (rc == -EFAULT && mode == CXL_PARTMODE_RAM)
-			rc = 0;
-		if (rc)
+		if (cxled->skip) {
+			offset = cxled->dpa_res->start - cxled->skip;
+			length = cxled->skip;
+			rc = cxl_mem_get_poison(cxlmd, offset, length, NULL);
+			if (rc && !poison_efault_forgiven(rc, mode))
+				return rc;
+		}
+
+		offset = cxled->dpa_res->start;
+		length = cxled->dpa_res->end - offset + 1;
+		rc = cxl_mem_get_poison(cxlmd, offset, length, cxled->cxld.region);
+		if (rc && !poison_efault_forgiven(rc, mode))
 			return rc;
 	}
-
-	offset = cxled->dpa_res->start;
-	length = cxled->dpa_res->end - offset + 1;
-	rc = cxl_mem_get_poison(cxlmd, offset, length, cxled->cxld.region);
-	if (rc == -EFAULT && mode == CXL_PARTMODE_RAM)
-		rc = 0;
-	if (rc)
-		return rc;
 
 	/* Iterate until commit_end is reached */
 	if (cxled->cxld.id == ctx->port->commit_end) {
@@ -2953,9 +3027,17 @@ int cxl_get_poison_by_endpoint(struct cxl_port *port)
 	};
 
 	rc = device_for_each_child(&port->dev, &ctx, poison_by_decoder);
-	if (rc == 1)
+	if (rc == 1) {
+		/*
+		 * No decoder with a sized DPA reservation was walked
+		 * (every committed decoder is zero-size): scan all
+		 * partitions in full.
+		 */
+		if (ctx.part < 0)
+			ctx.part = 0;
 		rc = cxl_get_poison_unmapped(to_cxl_memdev(port->uport_dev),
 					     &ctx);
+	}
 
 	return rc;
 }
@@ -3060,7 +3142,7 @@ int cxl_validate_translation_params(u8 eiw, u16 eig, int pos)
 		return -EINVAL;
 	}
 	if (pos < 0 || pos >= ways) {
-		pr_debug("%s: invalid pos=%d for ways=%u\n", __func__, pos,
+		pr_debug("%s: invalid pos=%d for ways=%d\n", __func__, pos,
 			 ways);
 		return -EINVAL;
 	}
@@ -3106,7 +3188,7 @@ EXPORT_SYMBOL_FOR_MODULES(cxl_calculate_dpa_offset, "cxl_translate");
 
 int cxl_calculate_position(u64 hpa_offset, u8 eiw, u16 eig)
 {
-	unsigned int ways = 0;
+	int ways = 0;
 	u64 shifted, rem;
 	int pos, ret;
 
@@ -3709,10 +3791,12 @@ static struct cxl_region *construct_region(struct cxl_root_decoder *cxlrd,
 {
 	struct cxl_endpoint_decoder *cxled = ctx->cxled;
 	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
-	struct cxl_port *port = cxlrd_to_port(cxlrd);
 	struct cxl_dev_state *cxlds = cxlmd->cxlds;
 	int rc, part = READ_ONCE(cxled->part);
 	struct cxl_region *cxlr;
+
+	if (part < 0)
+		return ERR_PTR(-EBUSY);
 
 	do {
 		cxlr = __create_region(cxlrd, cxlds->part[part].mode,
@@ -3722,15 +3806,15 @@ static struct cxl_region *construct_region(struct cxl_root_decoder *cxlrd,
 
 	if (IS_ERR(cxlr)) {
 		dev_err(cxlmd->dev.parent,
-			"%s:%s: %s failed assign region: %ld\n",
+			"%s:%s: %s failed assign region: %pe\n",
 			dev_name(&cxlmd->dev), dev_name(&cxled->cxld.dev),
-			__func__, PTR_ERR(cxlr));
+			__func__, cxlr);
 		return cxlr;
 	}
 
 	rc = __construct_region(cxlr, ctx);
 	if (rc) {
-		devm_release_action(port->uport_dev, unregister_region, cxlr);
+		unregister_region(cxlr);
 		return ERR_PTR(rc);
 	}
 
@@ -3776,12 +3860,11 @@ int cxl_add_to_region(struct cxl_endpoint_decoder *cxled)
 	 * for the HPA range, one does the construction and the others
 	 * add to that.
 	 */
-	mutex_lock(&cxlrd->range_lock);
+	guard(mutex)(&cxlrd->regions_lock);
 	struct cxl_region *cxlr __free(put_cxl_region) =
 		cxl_find_region_by_range(cxlrd, &ctx.hpa_range);
 	if (!cxlr)
 		cxlr = construct_region(cxlrd, &ctx);
-	mutex_unlock(&cxlrd->range_lock);
 
 	rc = PTR_ERR_OR_ZERO(cxlr);
 	if (rc)
@@ -3808,34 +3891,6 @@ int cxl_add_to_region(struct cxl_endpoint_decoder *cxled)
 	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_add_to_region, "CXL");
-
-u64 cxl_port_get_spa_cache_alias(struct cxl_port *endpoint, u64 spa)
-{
-	struct cxl_region_ref *iter;
-	unsigned long index;
-
-	if (!endpoint)
-		return ~0ULL;
-
-	guard(rwsem_write)(&cxl_rwsem.region);
-
-	xa_for_each(&endpoint->regions, index, iter) {
-		struct cxl_region_params *p = &iter->region->params;
-
-		if (cxl_resource_contains_addr(p->res, spa)) {
-			if (!p->cache_size)
-				return ~0ULL;
-
-			if (spa >= p->res->start + p->cache_size)
-				return spa - p->cache_size;
-
-			return spa + p->cache_size;
-		}
-	}
-
-	return ~0ULL;
-}
-EXPORT_SYMBOL_NS_GPL(cxl_port_get_spa_cache_alias, "CXL");
 
 static int is_system_ram(struct resource *res, void *arg)
 {
@@ -4043,6 +4098,103 @@ static int cxl_region_can_probe(struct cxl_region *cxlr)
 	return 0;
 }
 
+static int first_mapped_decoder(struct device *dev, const void *data)
+{
+	struct cxl_endpoint_decoder *cxled;
+
+	if (!is_endpoint_decoder(dev))
+		return 0;
+
+	cxled = to_cxl_endpoint_decoder(dev);
+	if (cxled->cxld.region)
+		return 1;
+
+	return 0;
+}
+
+/*
+ * Runs in cxl_mem_probe context after successful endpoint probe, assumes the
+ * simple case of single mapped decoder per memdev.
+ */
+int cxl_memdev_attach_region(struct cxl_memdev *cxlmd)
+{
+	struct cxl_attach_region *attach =
+		container_of(cxlmd->attach, typeof(*attach), attach);
+	struct cxl_port *endpoint = cxlmd->endpoint;
+	struct cxl_endpoint_decoder *cxled;
+	struct cxl_region *cxlr;
+	int rc;
+
+	/* hold endpoint lock to setup autoremove of the region */
+	guard(device)(&endpoint->dev);
+	if (!endpoint->dev.driver)
+		return -ENXIO;
+	guard(rwsem_read)(&cxl_rwsem.region);
+	guard(rwsem_read)(&cxl_rwsem.dpa);
+
+	/*
+	 * TODO auto-instantiate a region, for now assume this will find an
+	 * auto-region
+	 */
+	struct device *dev __free(put_device) =
+		device_find_child(&endpoint->dev, NULL, first_mapped_decoder);
+
+	if (!dev) {
+		dev_dbg(cxlmd->cxlds->dev, "no region found for memdev %s\n",
+			dev_name(&cxlmd->dev));
+		return -ENXIO;
+	}
+
+	cxled = to_cxl_endpoint_decoder(dev);
+	cxlr = cxled->cxld.region;
+
+	if (cxlr->params.state < CXL_CONFIG_COMMIT) {
+		dev_dbg(cxlmd->cxlds->dev,
+			"region %s not committed for memdev %s\n",
+			dev_name(&cxlr->dev), dev_name(&cxlmd->dev));
+		return -ENXIO;
+	}
+
+	if (cxlr->params.nr_targets > 1) {
+		dev_dbg(cxlmd->cxlds->dev,
+			"Only attach to local non-interleaved region\n");
+		return -ENXIO;
+	}
+
+	/* Only teardown regions that pass validation, ignore the rest */
+	get_device(&cxlr->dev);
+	rc = devm_add_action_or_reset(&endpoint->dev,
+				      endpoint_unregister_region, cxlr);
+	if (rc)
+		return rc;
+
+	attach->hpa_range = (struct range) {
+		.start = cxlr->params.res->start,
+		.end = cxlr->params.res->end,
+	};
+	return 0;
+}
+EXPORT_SYMBOL_FOR_MODULES(cxl_memdev_attach_region, "cxl_mem");
+
+/*
+ * The presence of an attach method indicates that the region is designated for
+ * a purpose outside of CXL core memory expansion defaults.
+ */
+static bool cxl_region_has_memdev_attach(struct cxl_region *cxlr)
+{
+	struct cxl_region_params *p = &cxlr->params;
+
+	for (int i = 0; i < p->nr_targets; i++) {
+		struct cxl_endpoint_decoder *cxled = p->targets[i];
+		struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+
+		if (cxlmd->attach)
+			return true;
+	}
+
+	return false;
+}
+
 static int cxl_region_probe(struct device *dev)
 {
 	struct cxl_region *cxlr = to_cxl_region(dev);
@@ -4070,9 +4222,26 @@ static int cxl_region_probe(struct device *dev)
 	if (rc)
 		return rc;
 
+	/*
+	 * Regions fronted by an extended linear cache need the MCE notifier to
+	 * offline the aliased page on a memory error.
+	 */
+	if (p->cache_size) {
+		rc = devm_cxl_register_mce_notifier(&cxlr->dev,
+						    &cxlr->mce_notifier);
+		if (rc == -EOPNOTSUPP)
+			dev_warn(&cxlr->dev,
+				 "CONFIG_CXL_MCE disabled, MCE notifier not registered\n");
+		else if (rc)
+			return rc;
+	}
+
 	rc = cxl_region_setup_poison(cxlr);
 	if (rc)
 		return rc;
+
+	if (cxl_region_has_memdev_attach(cxlr))
+		return 0;
 
 	switch (cxlr->mode) {
 	case CXL_PARTMODE_PMEM:

@@ -889,8 +889,8 @@ static void otx2_handle_link_event(struct otx2_nic *pf)
 		netif_carrier_on(netdev);
 		netif_tx_start_all_queues(netdev);
 	} else {
-		netif_tx_stop_all_queues(netdev);
 		netif_carrier_off(netdev);
+		netif_tx_stop_all_queues(netdev);
 	}
 }
 
@@ -959,6 +959,7 @@ int otx2_mbox_up_handler_cgx_link_event(struct otx2_nic *pf,
 	otx2_handle_link_event(pf);
 	return 0;
 }
+EXPORT_SYMBOL(otx2_mbox_up_handler_cgx_link_event);
 
 static int otx2_process_mbox_msg_up(struct otx2_nic *pf,
 				    struct mbox_msghdr *req)
@@ -1053,7 +1054,6 @@ irqreturn_t otx2_pfaf_mbox_intr_handler(int irq, void *pf_irq)
 	/* Clear the IRQ */
 	otx2_write64(pf, RVU_PF_INT, BIT_ULL(0));
 
-
 	mbox_data = otx2_read64(pf, RVU_PF_PFAF_MBOX0);
 
 	if (mbox_data & MBOX_UP_MSG) {
@@ -1119,8 +1119,15 @@ int otx2_register_mbox_intr(struct otx2_nic *pf, bool probe_af)
 {
 	struct otx2_hw *hw = &pf->hw;
 	struct msg_req *req;
+	u64 mbox_int_mask;
 	char *irq_name;
 	int err;
+
+	mbox_int_mask = !is_cn20k(pf->pdev) ? BIT_ULL(0) :
+				BIT_ULL(0) | BIT_ULL(1);
+
+	/* Clear stale mailbox interrupt state before installing the handler. */
+	otx2_write64(pf, RVU_PF_INT, mbox_int_mask);
 
 	/* Register mailbox interrupt handler */
 	if (!is_cn20k(pf->pdev)) {
@@ -1147,17 +1154,8 @@ int otx2_register_mbox_intr(struct otx2_nic *pf, bool probe_af)
 		return err;
 	}
 
-	/* Enable mailbox interrupt for msgs coming from AF.
-	 * First clear to avoid spurious interrupts, if any.
-	 */
-	if (!is_cn20k(pf->pdev)) {
-		otx2_write64(pf, RVU_PF_INT, BIT_ULL(0));
-		otx2_write64(pf, RVU_PF_INT_ENA_W1S, BIT_ULL(0));
-	} else {
-		otx2_write64(pf, RVU_PF_INT, BIT_ULL(0) | BIT_ULL(1));
-		otx2_write64(pf, RVU_PF_INT_ENA_W1S, BIT_ULL(0) |
-			     BIT_ULL(1));
-	}
+	/* Enable mailbox interrupt for msgs coming from AF. */
+	otx2_write64(pf, RVU_PF_INT_ENA_W1S, mbox_int_mask);
 
 	if (!probe_af)
 		return 0;
@@ -1170,10 +1168,9 @@ int otx2_register_mbox_intr(struct otx2_nic *pf, bool probe_af)
 	}
 	err = otx2_sync_mbox_msg(&pf->mbox);
 	if (err) {
-		dev_warn(pf->dev,
-			 "AF not responding to mailbox, deferring probe\n");
 		otx2_disable_mbox_intr(pf);
-		return -EPROBE_DEFER;
+		return dev_err_probe(pf->dev, -EPROBE_DEFER,
+			 "AF not responding to mailbox, deferring probe\n");
 	}
 
 	return 0;
@@ -1527,6 +1524,34 @@ irqreturn_t otx2_cq_intr_handler(int irq, void *cq_irq)
 }
 EXPORT_SYMBOL(otx2_cq_intr_handler);
 
+static irqreturn_t otx2_nixlf_err_intr_handler(int irq, void *data)
+{
+	struct otx2_nic *pf = data;
+	u64 regval;
+
+	/* Clear interrupt */
+	regval = otx2_read64(pf, NIX_LF_ERR_INT);
+	otx2_write64(pf, NIX_LF_ERR_INT, regval);
+
+	dev_err_ratelimited(pf->dev, "NIXLF Error Interrupt: 0x%llx\n", regval);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t otx2_nixlf_poison_intr_handler(int irq, void *data)
+{
+	struct otx2_nic *pf = data;
+	u64 regval;
+
+	/* Clear interrupt */
+	regval = otx2_read64(pf, NIX_LF_RAS);
+	otx2_write64(pf, NIX_LF_RAS, regval);
+
+	dev_err_ratelimited(pf->dev, "NIXLF Poison Interrupt: 0x%llx\n", regval);
+
+	return IRQ_HANDLED;
+}
+
 void otx2_disable_napi(struct otx2_nic *pf)
 {
 	struct otx2_qset *qset = &pf->qset;
@@ -1571,14 +1596,15 @@ static void otx2_free_sq_res(struct otx2_nic *pf)
 	otx2_sq_free_sqbs(pf);
 	for (qidx = 0; qidx < otx2_get_total_tx_queues(pf); qidx++) {
 		sq = &qset->sq[qidx];
-		/* Skip freeing Qos queues if they are not initialized */
-		if (!sq->sqe)
-			continue;
-		qmem_free(pf->dev, sq->sqe);
-		qmem_free(pf->dev, sq->sqe_ring);
-		qmem_free(pf->dev, sq->cpt_resp);
-		qmem_free(pf->dev, sq->tso_hdrs);
-		kfree(sq->sg);
+		/* sq->sqe is not initialized for unused QoS queues */
+		if (sq->sqe) {
+			qmem_free(pf->dev, sq->sqe);
+			qmem_free(pf->dev, sq->sqe_ring);
+			qmem_free(pf->dev, sq->cpt_resp);
+			qmem_free(pf->dev, sq->tso_hdrs);
+			qmem_free(pf->dev, sq->timestamps);
+			kfree(sq->sg);
+		}
 		kfree(sq->sqb_ptrs);
 	}
 }
@@ -1713,13 +1739,12 @@ int otx2_init_hw_resources(struct otx2_nic *pf)
 	return err;
 
 err_free_nix_queues:
-	otx2_free_sq_res(pf);
 	otx2_free_cq_res(pf);
 	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_RQ, false);
 err_free_txsch:
 	otx2_txschq_stop(pf);
 err_free_sq_ptrs:
-	otx2_sq_free_sqbs(pf);
+	otx2_free_sq_res(pf);
 err_free_rq_ptrs:
 	otx2_free_aura_ptr(pf, AURA_NIX_RQ);
 	otx2_ctx_disable(mbox, NPA_AQ_CTYPE_POOL, true);
@@ -1729,7 +1754,7 @@ err_free_nix_lf:
 	mutex_lock(&mbox->lock);
 	free_req = otx2_mbox_alloc_msg_nix_lf_free(mbox);
 	if (free_req) {
-		free_req->flags = NIX_LF_DISABLE_FLOWS;
+		free_req->flags = NIX_LF_DISABLE_FLOWS | NIX_LF_DONT_FREE_DFT_IDXS;
 		if (otx2_sync_mbox_msg(mbox))
 			dev_err(pf->dev, "%s failed to free nixlf\n", __func__);
 	}
@@ -1803,7 +1828,7 @@ void otx2_free_hw_resources(struct otx2_nic *pf)
 	/* Reset NIX LF */
 	free_req = otx2_mbox_alloc_msg_nix_lf_free(mbox);
 	if (free_req) {
-		free_req->flags = NIX_LF_DISABLE_FLOWS;
+		free_req->flags = NIX_LF_DISABLE_FLOWS | NIX_LF_DONT_FREE_DFT_IDXS;
 		if (!(pf->flags & OTX2_FLAG_PF_SHUTDOWN))
 			free_req->flags |= NIX_LF_DONT_FREE_TX_VTAG;
 		if (otx2_sync_mbox_msg(mbox))
@@ -1925,7 +1950,6 @@ int otx2_alloc_queue_mem(struct otx2_nic *pf)
 {
 	struct otx2_qset *qset = &pf->qset;
 	struct otx2_cq_poll *cq_poll;
-
 
 	/* RQ and SQs are mapped to different CQs,
 	 * so find out max CQ IRQs (i.e CINTs) needed.
@@ -2084,6 +2108,34 @@ int otx2_open(struct net_device *netdev)
 
 	otx2_set_cints_affinity(pf);
 
+	/* Register NIXLF error IRQ handler */
+	vec = pf->hw.nix_msixoff + NIX_LF_ERR_VEC;
+	irq_name = &pf->hw.irq_name[vec * NAME_SIZE];
+	snprintf(irq_name, NAME_SIZE, "%s-nixlf-err", pf->netdev->name);
+	err = request_irq(pci_irq_vector(pf->pdev, vec),
+			  otx2_nixlf_err_intr_handler, 0, irq_name, pf);
+	if (err) {
+		dev_err(pf->dev,
+			"RVUPF%d: IRQ registration failed for NIXLF ERR vector\n",
+			rvu_get_pf(pf->pdev, pf->pcifunc));
+		goto err_free_cints;
+	}
+	otx2_write64(pf, NIX_LF_ERR_INT_ENA_W1S, NIX_LF_ERR_INT_MASK);
+
+	/* Register NIXLF POISON interrupt handler */
+	vec = pf->hw.nix_msixoff + NIX_LF_POISON_VEC;
+	irq_name = &pf->hw.irq_name[vec * NAME_SIZE];
+	snprintf(irq_name, NAME_SIZE, "%s-nixlf-poison", pf->netdev->name);
+	err = request_irq(pci_irq_vector(pf->pdev, vec),
+			  otx2_nixlf_poison_intr_handler, 0, irq_name, pf);
+	if (err) {
+		dev_err(pf->dev,
+			"RVUPF%d: IRQ registration failed for NIXLF POISON vector\n",
+			rvu_get_pf(pf->pdev, pf->pcifunc));
+		goto err_free_errint;
+	}
+	otx2_write64(pf, NIX_LF_RAS_ENA_W1S, NIX_LF_RAS_MASK);
+
 	if (pf->flags & OTX2_FLAG_RX_VLAN_SUPPORT)
 		otx2_enable_rxvlan(pf, true);
 
@@ -2136,6 +2188,16 @@ err_tx_stop_queues:
 	netif_tx_stop_all_queues(netdev);
 	netif_carrier_off(netdev);
 	pf->flags |= OTX2_FLAG_INTF_DOWN;
+	/* free NIXLF POISON irq */
+	vec = pci_irq_vector(pf->pdev,
+			     pf->hw.nix_msixoff + NIX_LF_POISON_VEC);
+	otx2_write64(pf, NIX_LF_RAS_ENA_W1C, NIX_LF_RAS_MASK);
+	free_irq(vec, pf);
+err_free_errint:
+	vec = pci_irq_vector(pf->pdev,
+			     pf->hw.nix_msixoff + NIX_LF_ERR_VEC);
+	otx2_write64(pf, NIX_LF_ERR_INT_ENA_W1C, NIX_LF_ERR_INT_MASK);
+	free_irq(vec, pf);
 err_free_cints:
 	otx2_free_cints(pf, qidx);
 	vec = pci_irq_vector(pf->pdev,
@@ -2174,6 +2236,18 @@ int otx2_stop(struct net_device *netdev)
 
 	/* Clear RSS enable flag */
 	pf->hw.rss_info.enable = false;
+
+	/* Cleanup NIXLF Poison IRQ */
+	vec = pci_irq_vector(pf->pdev,
+			     pf->hw.nix_msixoff + NIX_LF_POISON_VEC);
+	otx2_write64(pf, NIX_LF_RAS_ENA_W1C, NIX_LF_RAS_MASK);
+	free_irq(vec, pf);
+
+	/* Cleanup NIXLF Error IRQ */
+	vec = pci_irq_vector(pf->pdev,
+			     pf->hw.nix_msixoff + NIX_LF_ERR_VEC);
+	otx2_write64(pf, NIX_LF_ERR_INT_ENA_W1C, NIX_LF_ERR_INT_MASK);
+	free_irq(vec, pf);
 
 	/* Cleanup Queue IRQ */
 	vec = pci_irq_vector(pf->pdev,
@@ -2520,10 +2594,42 @@ EXPORT_SYMBOL(otx2_config_hwtstamp_set);
 
 static int otx2_do_set_vf_mac(struct otx2_nic *pf, int vf, const u8 *mac)
 {
+	struct npc_get_field_status_req *freq;
+	struct npc_get_field_status_rsp *frsp;
 	struct npc_install_flow_req *req;
 	int err;
 
 	mutex_lock(&pf->mbox.lock);
+
+	/* Skip installing the DMAC filter if the hardware parser profile
+	 * does not support DMAC extraction.
+	 */
+	freq = otx2_mbox_alloc_msg_npc_get_field_status(&pf->mbox);
+	if (!freq) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	freq->field = NPC_DMAC;
+	err = otx2_sync_mbox_msg(&pf->mbox);
+	if (err)
+		goto out;
+
+	frsp = (struct npc_get_field_status_rsp *)otx2_mbox_get_rsp
+	       (&pf->mbox.mbox, 0, &freq->hdr);
+	if (IS_ERR(frsp)) {
+		err = PTR_ERR(frsp);
+		goto out;
+	}
+
+	if (!frsp->enable) {
+		netdev_warn(pf->netdev,
+			    "VF %d MAC filter not installed: DMAC extraction not supported by parser profile\n",
+			    vf);
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
 	req = otx2_mbox_alloc_msg_npc_install_flow(&pf->mbox);
 	if (!req) {
 		err = -ENOMEM;
@@ -2562,13 +2668,12 @@ static int otx2_set_vf_mac(struct net_device *netdev, int vf, u8 *mac)
 	if (!is_valid_ether_addr(mac))
 		return -EINVAL;
 
-	config = &pf->vf_configs[vf];
-	ether_addr_copy(config->mac, mac);
-
 	ret = otx2_do_set_vf_mac(pf, vf, mac);
-	if (ret == 0)
-		dev_info(&pdev->dev,
-			 "Load/Reload VF driver\n");
+	if (ret == 0) {
+		config = &pf->vf_configs[vf];
+		ether_addr_copy(config->mac, mac);
+		dev_info(&pdev->dev, "Load/Reload VF driver\n");
+	}
 
 	return ret;
 }
@@ -2966,11 +3071,9 @@ int otx2_check_pf_usable(struct otx2_nic *nic)
 	 * otherwise this driver probe should be deferred
 	 * until AF driver comes up.
 	 */
-	if (!rev) {
-		dev_warn(nic->dev,
+	if (!rev)
+		return dev_err_probe(nic->dev, -EPROBE_DEFER,
 			 "AF is not initialized, deferring probe\n");
-		return -EPROBE_DEFER;
-	}
 	return 0;
 }
 
@@ -2979,11 +3082,15 @@ int otx2_realloc_msix_vectors(struct otx2_nic *pf)
 	struct otx2_hw *hw = &pf->hw;
 	int num_vec, err;
 
-	/* NPA interrupts are inot registered, so alloc only
-	 * upto NIX vector offset.
+	/* Skip NPA vectors. Representors only use CINT vectors, so limit
+	 * the budget to that range. For PF/VF, allocate the full NIX LF
+	 * interrupt range (QINT, CINT, GINT, ERR and POISON vectors).
 	 */
 	num_vec = hw->nix_msixoff;
-	num_vec += NIX_LF_CINT_VEC_START + hw->max_queues;
+	if (pf->flags & OTX2_FLAG_REP_MODE_ENABLED)
+		num_vec += NIX_LF_CINT_VEC_START + hw->max_queues;
+	else
+		num_vec += NIX_LF_POISON_VEC + 1;
 
 	otx2_disable_mbox_intr(pf);
 	pci_free_irq_vectors(hw->pdev);
@@ -2996,7 +3103,6 @@ int otx2_realloc_msix_vectors(struct otx2_nic *pf)
 
 	return otx2_register_mbox_intr(pf, false);
 }
-EXPORT_SYMBOL(otx2_realloc_msix_vectors);
 
 static int otx2_sriov_vfcfg_init(struct otx2_nic *pf)
 {
@@ -3473,7 +3579,7 @@ static void otx2_ndc_sync(struct otx2_nic *pf)
 	req->nix_lf_rx_sync = 1;
 	req->npa_lf_sync = 1;
 
-	if (!otx2_sync_mbox_msg(mbox))
+	if (otx2_sync_mbox_msg(mbox))
 		dev_err(pf->dev, "NDC sync operation failed\n");
 
 	mutex_unlock(&mbox->lock);

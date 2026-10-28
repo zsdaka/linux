@@ -453,7 +453,7 @@ static void tilcdc_crtc_enable(struct drm_crtc *crtc)
 }
 
 static void tilcdc_crtc_atomic_enable(struct drm_crtc *crtc,
-				      struct drm_atomic_state *state)
+				      struct drm_atomic_commit *state)
 {
 	tilcdc_crtc_enable(crtc);
 }
@@ -510,13 +510,13 @@ static void tilcdc_crtc_disable(struct drm_crtc *crtc)
 }
 
 static void tilcdc_crtc_atomic_disable(struct drm_crtc *crtc,
-				       struct drm_atomic_state *state)
+				       struct drm_atomic_commit *state)
 {
 	tilcdc_crtc_disable(crtc);
 }
 
 static void tilcdc_crtc_atomic_flush(struct drm_crtc *crtc,
-				     struct drm_atomic_state *state)
+				     struct drm_atomic_commit *state)
 {
 	if (!crtc->state->event)
 		return;
@@ -632,7 +632,7 @@ static bool tilcdc_crtc_mode_fixup(struct drm_crtc *crtc,
 }
 
 static int tilcdc_crtc_atomic_check(struct drm_crtc *crtc,
-				    struct drm_atomic_state *state)
+				    struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state,
 									  crtc);
@@ -685,13 +685,11 @@ static void tilcdc_crtc_disable_vblank(struct drm_crtc *crtc)
 	spin_unlock_irqrestore(&tilcdc_crtc->irq_lock, flags);
 }
 
-static void tilcdc_crtc_reset(struct drm_crtc *crtc)
+static void tilcdc_crtc_hw_reset(struct drm_crtc *crtc)
 {
 	struct tilcdc_crtc *tilcdc_crtc = to_tilcdc_crtc(crtc);
 	struct drm_device *dev = crtc->dev;
 	int ret;
-
-	drm_atomic_helper_crtc_reset(crtc);
 
 	/* Turn the raster off if it for some reason is on. */
 	pm_runtime_get_sync(dev->dev);
@@ -716,7 +714,7 @@ static void tilcdc_crtc_reset(struct drm_crtc *crtc)
 static const struct drm_crtc_funcs tilcdc_crtc_funcs = {
 	.set_config     = drm_atomic_helper_set_config,
 	.page_flip      = drm_atomic_helper_page_flip,
-	.reset		= tilcdc_crtc_reset,
+	.atomic_create_state = drm_atomic_helper_crtc_create_state,
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
 	.enable_vblank	= tilcdc_crtc_enable_vblank,
@@ -820,6 +818,7 @@ static const struct drm_crtc_helper_funcs tilcdc_crtc_helper_funcs = {
 	.atomic_enable	= tilcdc_crtc_atomic_enable,
 	.atomic_disable	= tilcdc_crtc_atomic_disable,
 	.atomic_flush	= tilcdc_crtc_atomic_flush,
+	.hw_reset	= tilcdc_crtc_hw_reset,
 };
 
 void tilcdc_crtc_update_clk(struct drm_crtc *crtc)
@@ -926,7 +925,7 @@ irqreturn_t tilcdc_crtc_irq(struct drm_crtc *crtc)
 				drm_err(dev,
 					"%s(0x%08x): Sync lost flood detected, recovering",
 					__func__, stat);
-				queue_work(system_wq,
+				queue_work(system_percpu_wq,
 					   &tilcdc_crtc->recover_work);
 				tilcdc_write(dev, LCDC_INT_ENABLE_CLR_REG,
 					     LCDC_SYNC_LOST);

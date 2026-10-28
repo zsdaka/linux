@@ -213,10 +213,10 @@ static int mlx4_devlink_crdump_snapshot_set(struct devlink *devlink, u32 id,
 
 static int
 mlx4_devlink_max_macs_validate(struct devlink *devlink, u32 id,
-			       union devlink_param_value val,
+			       union devlink_param_value *val,
 			       struct netlink_ext_ack *extack)
 {
-	u32 value = val.vu32;
+	u32 value = val->vu32;
 
 	if (value < 1 || value > 128)
 		return -ERANGE;
@@ -266,27 +266,27 @@ static void mlx4_devlink_set_params_init_values(struct devlink *devlink)
 	value.vbool = !!mlx4_internal_err_reset;
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_INT_ERR_RESET,
-					value);
+					&value);
 
 	value.vu32 = 1UL << log_num_mac;
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_MAX_MACS,
-					value);
+					&value);
 
 	value.vbool = enable_64b_cqe_eqe;
 	devl_param_driverinit_value_set(devlink,
 					MLX4_DEVLINK_PARAM_ID_ENABLE_64B_CQE_EQE,
-					value);
+					&value);
 
 	value.vbool = enable_4k_uar;
 	devl_param_driverinit_value_set(devlink,
 					MLX4_DEVLINK_PARAM_ID_ENABLE_4K_UAR,
-					value);
+					&value);
 
 	value.vbool = false;
 	devl_param_driverinit_value_set(devlink,
 					DEVLINK_PARAM_GENERIC_ID_REGION_SNAPSHOT,
-					value);
+					&value);
 }
 
 static inline void mlx4_set_num_reserved_uars(struct mlx4_dev *dev,
@@ -3863,12 +3863,8 @@ static int __mlx4_init_one(struct pci_dev *pdev, int pci_dev_data,
 
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
 	if (err) {
-		dev_warn(&pdev->dev, "Warning: couldn't set 64-bit PCI DMA mask\n");
-		err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-		if (err) {
-			dev_err(&pdev->dev, "Can't set PCI DMA mask, aborting\n");
-			goto err_release_regions;
-		}
+		dev_err(&pdev->dev, "Can't set PCI DMA mask, aborting\n");
+		goto err_release_regions;
 	}
 
 	/* Allow large DMA segments, up to the firmware limit of 1 GB */
@@ -4274,9 +4270,9 @@ int mlx4_restart_one(struct pci_dev *pdev)
 	return mlx4_restart_one_up(pdev, false, NULL);
 }
 
-#define MLX_SP(id) { PCI_VDEVICE(MELLANOX, id), MLX4_PCI_DEV_FORCE_SENSE_PORT }
-#define MLX_VF(id) { PCI_VDEVICE(MELLANOX, id), MLX4_PCI_DEV_IS_VF }
-#define MLX_GN(id) { PCI_VDEVICE(MELLANOX, id), 0 }
+#define MLX_SP(id) { PCI_VDEVICE(MELLANOX, id), .driver_data = MLX4_PCI_DEV_FORCE_SENSE_PORT }
+#define MLX_VF(id) { PCI_VDEVICE(MELLANOX, id), .driver_data = MLX4_PCI_DEV_IS_VF }
+#define MLX_GN(id) { PCI_VDEVICE(MELLANOX, id), .driver_data = 0 }
 
 static const struct pci_device_id mlx4_pci_table[] = {
 #ifdef CONFIG_MLX4_CORE_GEN2

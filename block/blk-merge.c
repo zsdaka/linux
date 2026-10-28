@@ -9,6 +9,7 @@
 #include <linux/blk-integrity.h>
 #include <linux/part_stat.h>
 #include <linux/blk-cgroup.h>
+#include <linux/dma-buf-io.h>
 
 #include <trace/events/block.h>
 
@@ -33,7 +34,7 @@ static inline void bio_get_last_bvec(struct bio *bio, struct bio_vec *bv)
 
 	bio_advance_iter(bio, &iter, iter.bi_size);
 
-	if (!iter.bi_bvec_done)
+	if (!iter.bi_offset)
 		idx = iter.bi_idx - 1;
 	else	/* in the middle of bvec */
 		idx = iter.bi_idx;
@@ -41,11 +42,11 @@ static inline void bio_get_last_bvec(struct bio *bio, struct bio_vec *bv)
 	*bv = bio->bi_io_vec[idx];
 
 	/*
-	 * iter.bi_bvec_done records actual length of the last bvec
+	 * iter.bi_offset records actual length of the last bvec
 	 * if this bio ends in the middle of one io vector
 	 */
-	if (iter.bi_bvec_done)
-		bv->bv_len = iter.bi_bvec_done;
+	if (iter.bi_offset)
+		bv->bv_len = iter.bi_offset;
 }
 
 static inline bool bio_will_gap(struct request_queue *q,
@@ -122,8 +123,7 @@ struct bio *bio_submit_split_bioset(struct bio *bio, unsigned int split_sectors,
 	struct bio *split = bio_split(bio, split_sectors, GFP_NOIO, bs);
 
 	if (IS_ERR(split)) {
-		bio->bi_status = errno_to_blk_status(PTR_ERR(split));
-		bio_endio(bio);
+		bio_endio_status(bio, errno_to_blk_status(PTR_ERR(split)));
 		return NULL;
 	}
 
@@ -143,8 +143,7 @@ EXPORT_SYMBOL_GPL(bio_submit_split_bioset);
 static struct bio *bio_submit_split(struct bio *bio, int split_sectors)
 {
 	if (unlikely(split_sectors < 0)) {
-		bio->bi_status = errno_to_blk_status(split_sectors);
-		bio_endio(bio);
+		bio_endio_status(bio, errno_to_blk_status(split_sectors));
 		return NULL;
 	}
 
@@ -321,6 +320,41 @@ static inline unsigned int bvec_seg_gap(struct bio_vec *bvprv,
 	return bv->bv_offset | (bvprv->bv_offset + bvprv->bv_len);
 }
 
+static inline int bio_split_io_at_dmabuf(struct bio *bio,
+		const struct queue_limits *lim, unsigned *segs,
+		unsigned max_bytes, unsigned len_align_mask,
+		unsigned start_align_mask)
+{
+	unsigned bytes = min(bio->bi_iter.bi_size, max_bytes);
+	unsigned seg_shift = bio->bi_dmabuf_map->min_seg_shift;
+	unsigned offset = bio->bi_iter.bi_offset & ((1U << seg_shift) - 1);
+	u64 max_segs_bytes;
+
+	/*
+	 * dma-buf maps don't expose the underlying segmentation, but they're
+	 * guaranteed to not have alignment gaps, we only need to check the
+	 * start and length alignment.
+	 */
+	if ((bio->bi_iter.bi_offset & start_align_mask) ||
+	    (bio->bi_iter.bi_size & len_align_mask))
+		return -EINVAL;
+
+	/* Presented as a single contiguous range into the dma-buf */
+	*segs = 1;
+
+	/*
+	 * Limit by the number of segments by using the minimal segment size.
+	 * Any I/O consisting of N full segments should be able to cover at
+	 * least N multiplied by the segment size. It's stricter than walking
+	 * the segments and might cause extra splitting.
+	 */
+	max_segs_bytes = (u64)lim->max_segments << seg_shift;
+	bytes = min_t(u64, bytes, max_segs_bytes - offset);
+	if (bytes != bio->bi_iter.bi_size)
+		return bytes;
+	return 0;
+}
+
 /**
  * bio_split_io_at - check if and where to split a bio
  * @bio:  [in] bio to be split
@@ -346,6 +380,19 @@ int bio_split_io_at(struct bio *bio, const struct queue_limits *lim,
 	if (bc) {
 		start_align_mask |= (bc->bc_key->crypto_cfg.data_unit_size - 1);
 		len_align_mask |= (bc->bc_key->crypto_cfg.data_unit_size - 1);
+	}
+
+	if (op_is_dmabuf(bio->bi_opf)) {
+		int ret;
+
+		ret = bio_split_io_at_dmabuf(bio, lim, &nsegs, max_bytes,
+					     len_align_mask, start_align_mask);
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			goto out;
+		bytes = ret;
+		goto split;
 	}
 
 	bio_for_each_bvec(bv, bio, iter) {
@@ -378,6 +425,7 @@ int bio_split_io_at(struct bio *bio, const struct queue_limits *lim,
 		bvprvp = &bvprv;
 	}
 
+out:
 	*segs = nsegs;
 	bio->bi_bvec_gap_bit = ffs(gaps);
 	return 0;
@@ -495,6 +543,8 @@ unsigned int blk_recalc_rq_segments(struct request *rq)
 
 	if (!rq->bio)
 		return 0;
+	if (op_is_dmabuf(rq->bio->bi_opf))
+		return 1;
 
 	switch (bio_op(rq->bio)) {
 	case REQ_OP_DISCARD:
@@ -547,7 +597,7 @@ static inline int ll_new_hw_segment(struct request *req, struct bio *bio,
 	if (!blk_cgroup_mergeable(req, bio))
 		goto no_merge;
 
-	if (blk_integrity_merge_bio(req->q, req, bio) == false)
+	if (unlikely(!blk_integrity_merge_bio(req->q, req, bio)))
 		goto no_merge;
 
 	/* discard request merge won't add new segment */
@@ -649,7 +699,7 @@ static int ll_merge_requests_fn(struct request_queue *q, struct request *req,
 	if (!blk_cgroup_mergeable(req, next->bio))
 		return 0;
 
-	if (blk_integrity_merge_rq(q, req, next) == false)
+	if (unlikely(!blk_integrity_merge_rq(q, req, next)))
 		return 0;
 
 	if (!bio_crypt_ctx_merge_rq(req, next))
@@ -723,8 +773,7 @@ static void blk_account_io_merge_request(struct request *req)
 	if (req->rq_flags & RQF_IO_STAT) {
 		part_stat_lock();
 		part_stat_inc(req->part, merges[op_stat_group(req_op(req))]);
-		part_stat_local_dec(req->part,
-				    in_flight[op_is_write(req_op(req))]);
+		bdev_dec_in_flight(req->part, req_op(req));
 		part_stat_unlock();
 	}
 }
@@ -905,7 +954,7 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 
 	if (!blk_cgroup_mergeable(rq, bio))
 		return false;
-	if (blk_integrity_merge_bio(rq->q, rq, bio) == false)
+	if (unlikely(!blk_integrity_merge_bio(rq->q, rq, bio)))
 		return false;
 	if (!bio_crypt_rq_ctx_compatible(rq, bio))
 		return false;
@@ -915,7 +964,7 @@ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
 		return false;
 	if (rq->bio->bi_ioprio != bio->bi_ioprio)
 		return false;
-	if (blk_atomic_write_mergeable_rq_bio(rq, bio) == false)
+	if (unlikely(!blk_atomic_write_mergeable_rq_bio(rq, bio)))
 		return false;
 
 	return true;

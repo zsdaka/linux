@@ -35,7 +35,6 @@
 #include "dc_stream_priv.h"
 #include "dcn35/dcn35_hwseq.h"
 #include "dcn42/dcn42_hwseq.h"
-#include "dce/dmub_hw_lock_mgr.h"
 #include "dio/dcn10/dcn10_dio.h"
 
 #define DC_LOGGER \
@@ -65,12 +64,13 @@ void dcn42_init_hw(struct dc *dc)
 	struct dce_hwseq *hws = dc->hwseq;
 	struct dc_bios *dcb = dc->ctx->dc_bios;
 	struct resource_pool *res_pool = dc->res_pool;
-	int i;
+	unsigned int i;
 	unsigned int edp_num;
 	uint32_t backlight = MAX_BACKLIGHT_LEVEL;
 	uint32_t user_level = MAX_BACKLIGHT_LEVEL;
 	bool dchub_ref_freq_changed;
 	int current_dchub_ref_freq = 0;
+	uint8_t dcfclk_gate_dis_value = 0;
 
 	if (dc->clk_mgr && dc->clk_mgr->funcs && dc->clk_mgr->funcs->init_clocks) {
 		dc->clk_mgr->funcs->init_clocks(dc->clk_mgr);
@@ -244,7 +244,13 @@ void dcn42_init_hw(struct dc *dc)
 		/* enable all DCN clock gating */
 		REG_WRITE(DCCG_GATE_DISABLE_CNTL, 0);
 
-		REG_UPDATE(DCFCLK_CNTL, DCFCLK_GATE_DIS, 0);
+		/* Temporary workaround for IOMMU mismatch issue.
+		 * Fine grain control via bit0 of debug flag.
+		 */
+		if (dc->debug.iommu_mismatch_temp_wka & 0x1)
+			dcfclk_gate_dis_value = 1;
+
+		REG_UPDATE(DCFCLK_CNTL, DCFCLK_GATE_DIS, dcfclk_gate_dis_value);
 	}
 
 	dcn401_setup_hpo_hw_control(hws, true);
@@ -275,6 +281,8 @@ void dcn42_init_hw(struct dc *dc)
 		dc->caps.dmub_caps.psr = dc->ctx->dmub_srv->dmub->feature_caps.psr;
 		dc->caps.dmub_caps.mclk_sw = dc->ctx->dmub_srv->dmub->feature_caps.fw_assisted_mclk_switch_ver > 0;
 		dc->caps.dmub_caps.fams_ver = dc->ctx->dmub_srv->dmub->feature_caps.fw_assisted_mclk_switch_ver;
+		dc->caps.dmub_caps.aux_backlight_support =
+			dc->ctx->dmub_srv->dmub->feature_caps.abm_aux_backlight_support;
 
 		/* sw and fw FAMS versions must match for support */
 		dc->debug.fams2_config.bits.enable &=
@@ -349,7 +357,7 @@ void dcn42_update_mpcc(struct dc *dc, struct pipe_ctx *pipe_ctx)
 	mpcc_id = hubp->inst;
 
 	/* If there is no full update, don't need to touch MPC tree*/
-	if (!pipe_ctx->plane_state->update_flags.bits.full_update &&
+	if (!pipe_ctx->plane_state->update_bits.full_update &&
 		!pipe_ctx->update_flags.bits.mpcc) {
 		mpc->funcs->update_blending(mpc, &blnd_cfg, mpcc_id);
 		dc->hwss.update_visual_confirm_color(dc, pipe_ctx, mpcc_id);
@@ -394,131 +402,249 @@ void dcn42_program_cm_hist(
 			plane_state->cm_hist_control, plane_state->color_space);
 }
 
-static bool dc_is_rmcm_3dlut_supported(struct hubp *hubp, struct mpc *mpc)
+/* RMCM is per-pipe and reloads through its own HUBP, unlike MCM which is shared by
+ * the plane's pipes and always reloads through the primary one.
+ */
+void dcn42_trigger_3dlut_dma_load(struct pipe_ctx *pipe_ctx)
 {
-	if (mpc->funcs->rmcm.power_on_shaper_3dlut &&
-		mpc->funcs->rmcm.fl_3dlut_configure &&
-		hubp->funcs->hubp_program_3dlut_fl_config)
-		return true;
+	struct hubp *hubp;
+	bool use_rmcm = pipe_ctx->plane_state && pipe_ctx->plane_state->cm.flags.bits.rmcm_enable;
 
-	return false;
-}
+	if (use_rmcm) {
+		hubp = pipe_ctx->plane_res.hubp;
+	} else {
+		const struct pipe_ctx *primary_dpp_pipe_ctx = resource_get_primary_dpp_pipe(pipe_ctx);
 
-bool dcn42_program_rmcm_luts(
-	struct hubp *hubp,
-	struct pipe_ctx *pipe_ctx,
-	const struct dc_plane_cm *cm,
-	struct mpc *mpc,
-	int mpcc_id)
-{
-	struct dpp *dpp_base = pipe_ctx->plane_res.dpp;
-	union mcm_lut_params m_lut_params = {0};
-
-	struct dc *dc = hubp->ctx->dc;
-	struct mpc_fl_3dlut_config mpc_fl_config;
-
-	struct dc_stream_state *stream = pipe_ctx->stream;
-	bool bypass_rmcm_shaper = false;
-	// true->false when it can be allocated at DI time
-	struct dc_rmcm_3dlut *rmcm_3dlut = dc_stream_get_3dlut_for_stream(dc, stream, false);
-
-	bool lut_bank_a = true; // TODO get from HW
-
-	//check to see current pipe is part of a stream with allocated rmcm 3dlut
-	if (!rmcm_3dlut)
-		return false;
-
-	/* Shaper */
-	if (cm->flags.bits.shaper_enable) {
-		memset(&m_lut_params, 0, sizeof(m_lut_params));
-
-		if (cm->shaper_func.type == TF_TYPE_HWPWL) {
-			m_lut_params.pwl = &cm->shaper_func.pwl;
-		} else if (cm->shaper_func.type == TF_TYPE_DISTRIBUTED_POINTS) {
-			ASSERT(false);
-			cm_helper_translate_curve_to_hw_format(
-					dc->ctx,
-					&cm->shaper_func,
-					&dpp_base->shaper_params, true);
-			m_lut_params.pwl = &dpp_base->shaper_params;
-		}
-		if (m_lut_params.pwl) {
-			if (mpc->funcs->rmcm.populate_lut)
-				mpc->funcs->rmcm.populate_lut(mpc, m_lut_params, lut_bank_a, mpcc_id);
-			if (mpc->funcs->rmcm.program_lut_mode)
-				mpc->funcs->rmcm.program_lut_mode(mpc, !bypass_rmcm_shaper, lut_bank_a, mpcc_id);
-		} else {
-			//RMCM 3dlut won't work without its shaper
-			return false;
-		}
+		hubp = primary_dpp_pipe_ctx ? primary_dpp_pipe_ctx->plane_res.hubp : NULL;
 	}
 
-	/* 3DLUT */
-	if (!cm->flags.bits.lut3d_dma_enable) {
-		memset(&m_lut_params, 0, sizeof(m_lut_params));
-		// Don't know what to do in this case.
+	if (hubp && hubp->funcs->hubp_enable_3dlut_fl)
+		hubp->funcs->hubp_enable_3dlut_fl(hubp, true);
+}
+
+/* Takes the MCM out of the pipe. The caller programs the HUBP fast load afterwards. */
+void dcn42_disable_mcm_luts(struct mpc *mpc, int mpcc_id)
+{
+	if (!mpc || !mpc->funcs->program_lut_mode)
+		return;
+
+	mpc->funcs->program_lut_mode(mpc, MCM_LUT_1DLUT, false, false, CM_LUT_SIZE_NONE, mpcc_id);
+	mpc->funcs->program_lut_mode(mpc, MCM_LUT_SHAPER, false, false, CM_LUT_SIZE_NONE, mpcc_id);
+	mpc->funcs->program_lut_mode(mpc, MCM_LUT_3DLUT, false, false, CM_LUT_SIZE_NONE, mpcc_id);
+}
+
+static void dcn42_detach_rmcm(struct rmcm *rmcm)
+{
+	if (rmcm->funcs->update_3dlut_fast_load_select)
+		rmcm->funcs->update_3dlut_fast_load_select(rmcm, rmcm->inst, RMCM_FL_HUBP_IDX_NONE);
+
+	if (rmcm->funcs->connect_mpcc)
+		rmcm->funcs->connect_mpcc(rmcm, rmcm->inst, RMCM_MPCC_ID_NONE);
+}
+
+/* MPC makes an MPCC bypass RMCM once more than one instance is bound to it, so drop every
+ * instance that could still point at this MPCC. One the driver has not programmed yet counts,
+ * as its MPC_RMCM_CNTL may still hold a boot value.
+ */
+void dcn42_release_rmcm_from_mpcc(struct dc *dc, int mpcc_id, const struct rmcm *keep)
+{
+	int i;
+
+	for (i = 0; i < dc->res_pool->res_cap->num_rmcm && i < MAX_RMCM_INST; i++) {
+		struct rmcm *rmcm = dc->res_pool->rmcm[i];
+
+		if (!rmcm || !rmcm->funcs)
+			continue;
+
+		if (rmcm == keep)
+			continue;
+
+		/* An instance the driver has not programmed yet counts as bound, because its
+		 * MPC_RMCM_CNTL may still hold a boot value.
+		 */
+		if (rmcm->mpcc_id == mpcc_id || rmcm->mpcc_id == RMCM_MPCC_ID_UNKNOWN)
+			dcn42_detach_rmcm(rmcm);
+	}
+}
+
+/* Leaves mpcc_id with no RMCM in its path. A NULL hubp keeps the shared 3DLUT fast load
+ * untouched, for when another block already owns that HUBP.
+ */
+void dcn42_disable_rmcm_luts(struct dc *dc, struct rmcm *rmcm, struct hubp *hubp, int mpcc_id)
+{
+	if (rmcm && rmcm->funcs) {
+		/* HW blocks 3DLUT writes until FL mode is cleared from HUBP on VUpdate, so
+		 * tear fast load down while the HUBP is still clocked.
+		 */
+		if (hubp && hubp->funcs->hubp_enable_3dlut_fl) {
+			hubp->funcs->hubp_enable_3dlut_fl(hubp, false);
+		}
+
+		dcn42_detach_rmcm(rmcm);
+	}
+
+	dcn42_release_rmcm_from_mpcc(dc, mpcc_id, NULL);
+}
+
+bool dcn42_set_rmcm_luts(struct set_input_transfer_func_params *params)
+{
+	struct dpp *dpp_base = params->dpp;
+	struct hubp *hubp = params->hubp;
+	const struct dc_plane_cm *cm = &params->plane_state->cm;
+	struct rmcm *rmcm = params->rmcm;
+	int rmcm_inst;
+	union rmcm_lut_params m_lut_params = {0};
+	struct dc_3dlut_dma lut3d_dma;
+	bool lut_enable;
+	bool lut_bank_a;
+	bool rval;
+	bool result = true;
+
+	/* No RMCM on this plane, so there is nothing to program */
+	if (!rmcm || !rmcm->funcs) {
+		return true;
+	}
+
+	rmcm_inst = rmcm->inst;
+
+	/* decide LUT bank based on current in use */
+	if (rmcm->funcs->get_lut_mode) {
+		rmcm->funcs->get_lut_mode(rmcm, MCM_LUT_SHAPER, rmcm_inst, &lut_enable, &lut_bank_a);
+		if (!lut_enable) {
+			rmcm->funcs->get_lut_mode(rmcm, MCM_LUT_3DLUT, rmcm_inst, &lut_enable, &lut_bank_a);
+		}
 	} else {
-		if (!dc_is_rmcm_3dlut_supported(hubp, mpc))
-			return false;
+		lut_enable = false;
+		lut_bank_a = true;
+	}
 
-		//seems to be only for the MCM
-		mpc_fl_config.enabled			= cm->flags.bits.lut3d_enable;
-		mpc_fl_config.size	            = cm->lut3d_dma.size;
-		mpc_fl_config.select_lut_bank_a = lut_bank_a;
-		mpc_fl_config.bit_depth		    = 0;
-		mpc_fl_config.hubp_index		= hubp->inst;
-		mpc_fl_config.bias	= cm->lut3d_dma.bias;
-		mpc_fl_config.scale	= cm->lut3d_dma.scale;
+	/* switch to the next bank */
+	if (lut_enable) {
+		lut_bank_a = !lut_bank_a;
+	}
 
-		//1. power down the block
-		mpc->funcs->rmcm.power_on_shaper_3dlut(mpc, mpcc_id, false);
+	/* Shaper */
+	lut_enable = cm->flags.bits.shaper_enable != 0;
+	if (lut_enable) {
+		memset(&m_lut_params, 0, sizeof(m_lut_params));
+		if (cm->shaper_func.type == TF_TYPE_HWPWL)
+			m_lut_params.pwl = &cm->shaper_func.pwl;
+		else if (cm->shaper_func.type == TF_TYPE_DISTRIBUTED_POINTS) {
+			ASSERT(false);
+			rval = cm_helper_translate_curve_to_hw_format(params->plane_state->ctx,
+					&cm->shaper_func,
+					&dpp_base->shaper_params,
+					true);
+			m_lut_params.pwl = rval ? &dpp_base->shaper_params : NULL;
+		}
+		if (!m_lut_params.pwl) {
+			lut_enable = false;
+		}
+	} else {
+		lut_enable = false;
+	}
 
-		//2. program RMCM - 3dlut reg programming
-		mpc->funcs->rmcm.fl_3dlut_configure(mpc, &mpc_fl_config, mpcc_id);
+	if (rmcm->funcs->program_lut_mode)
+		rmcm->funcs->program_lut_mode(rmcm, MCM_LUT_SHAPER, lut_enable, lut_bank_a,
+			CM_LUT_SIZE_NONE, 0, 0, rmcm_inst);
+	if (lut_enable && rmcm->funcs->populate_lut)
+		rmcm->funcs->populate_lut(rmcm, MCM_LUT_SHAPER, m_lut_params, lut_bank_a, rmcm_inst);
+
+	/* NOTE: Toggling from DMA->Host is not supported atomically as hardware
+	 * blocks writes until 3DLUT FL mode is cleared from HUBP on VUpdate.
+	 * Expectation is either option is used consistently.
+	*/
+
+	/* 3DLUT */
+	lut_enable = cm->flags.bits.lut3d_enable != 0;
+	if (lut_enable && cm->flags.bits.lut3d_dma_enable) {
+		/* Fast (DMA) Load Mode */
+		if (rmcm->funcs->program_lut_mode)
+			rmcm->funcs->program_lut_mode(rmcm, MCM_LUT_3DLUT, lut_enable, lut_bank_a,
+				cm->lut3d_dma.size,
+				cm->lut3d_dma.bias, cm->lut3d_dma.scale,
+				rmcm_inst);
+
+		if (rmcm->funcs->program_lut_read_write_control)
+			rmcm->funcs->program_lut_read_write_control(rmcm, MCM_LUT_3DLUT, lut_bank_a, true, rmcm_inst);
+
+		if (rmcm->funcs->update_3dlut_fast_load_select)
+			rmcm->funcs->update_3dlut_fast_load_select(rmcm, rmcm_inst, hubp->inst);
 
 		/* HUBP */
 		if (hubp->funcs->hubp_program_3dlut_fl_config)
 			hubp->funcs->hubp_program_3dlut_fl_config(hubp, &cm->lut3d_dma);
 
+		if (hubp->funcs->hubp_program_3dlut_fl_crossbar)
+			hubp->funcs->hubp_program_3dlut_fl_crossbar(hubp, cm->lut3d_dma.format);
+
 		if (hubp->funcs->hubp_program_3dlut_fl_addr)
 			hubp->funcs->hubp_program_3dlut_fl_addr(hubp, &cm->lut3d_dma.addr);
 
-		//3. power on the block
-		mpc->funcs->rmcm.power_on_shaper_3dlut(mpc, mpcc_id, true);
+		if (hubp->funcs->hubp_enable_3dlut_fl) {
+			hubp->funcs->hubp_enable_3dlut_fl(hubp, true);
+		} else {
+			/* GPU memory only supports fast load path */
+			BREAK_TO_DEBUGGER();
+			lut_enable = false;
+			result = false;
+		}
+	} else {
+		/* RMCM has no host load path - its 3DLUT can only be fetched by HUBP fast
+		 * load, so asking for one without DMA is a programming error.
+		 */
+		ASSERT(!lut_enable);
+		result = !lut_enable;
+		lut_enable = false;
+
+		if (rmcm->funcs->program_lut_mode)
+			rmcm->funcs->program_lut_mode(rmcm, MCM_LUT_3DLUT, lut_enable, lut_bank_a,
+				CM_LUT_SIZE_NONE, 0, 0, rmcm_inst);
+
+		if (rmcm->funcs->update_3dlut_fast_load_select)
+			rmcm->funcs->update_3dlut_fast_load_select(rmcm, rmcm_inst, RMCM_FL_HUBP_IDX_NONE);
+
+		/* HUBP */
+		memset(&lut3d_dma, 0, sizeof(lut3d_dma));
+		if (hubp->funcs->hubp_program_3dlut_fl_config)
+			hubp->funcs->hubp_program_3dlut_fl_config(hubp, &lut3d_dma);
+
+		if (hubp->funcs->hubp_enable_3dlut_fl)
+			hubp->funcs->hubp_enable_3dlut_fl(hubp, false);
 	}
 
-	return true;
+	/* Connect to the MPCC only once the LUTs are loaded. Teardown is done by
+	 * disable_rmcm_luts, at plane teardown or when the plane switches back to MCM.
+	 */
+	dcn42_release_rmcm_from_mpcc(params->dc, params->mpcc_id, rmcm);
+
+	if (rmcm->funcs->connect_mpcc)
+		rmcm->funcs->connect_mpcc(rmcm, rmcm_inst, params->mpcc_id);
+
+	return result;
 }
 
-bool dcn42_set_mcm_luts(struct pipe_ctx *pipe_ctx,
-				const struct dc_plane_state *plane_state)
+bool dcn42_set_mcm_luts(struct dc *dc, struct dpp *dpp, struct hubp *hubp,
+				struct hubp *primary_hubp, struct mpc *mpc, int mpcc_id,
+				struct dc_stream_state *stream,
+				struct dc_plane_state *plane_state)
 {
-	struct dc *dc = pipe_ctx->plane_res.hubp->ctx->dc;
-	struct hubp *hubp = pipe_ctx->plane_res.hubp;
-	const struct dc_plane_cm *cm = &plane_state->cm;
-	struct mpc *mpc = dc->res_pool->mpc;
-	int mpcc_id = hubp->inst;
 	bool result;
 
 	/* MCM */
-	result = dcn401_set_mcm_luts(pipe_ctx, plane_state);
-
-	/* RMCM */
-	if (cm->flags.bits.rmcm_enable && cm->flags.bits.lut3d_dma_enable) {
-		/* TODO - move RMCM to its own block */
-		dcn42_program_rmcm_luts(
-			hubp,
-			pipe_ctx,
-			cm,
-			mpc,
-			mpcc_id);
-	}
+	result = dcn401_set_mcm_luts(dc, dpp, hubp, primary_hubp, mpc, mpcc_id,
+			stream, plane_state);
 
 	return result;
 }
 void dcn42_hardware_release(struct dc *dc)
 {
+	if (dc->clk_mgr && dc->clk_mgr->funcs && dc->clk_mgr->funcs->notify_cstate_disable)
+		dc->clk_mgr->funcs->notify_cstate_disable(dc->clk_mgr, true);
+
 	dcn35_hardware_release(dc);
+
+	dc_dmub_srv_release_hw(dc);
 
 }
 static int count_active_streams(const struct dc *dc)
@@ -540,11 +666,20 @@ void dcn42_calc_blocks_to_gate(struct dc *dc, struct dc_state *context,
 {
 	bool hpo_frl_stream_enc_acquired = false;
 	bool hpo_dp_stream_enc_acquired = false;
-	int i = 0, j = 0;
+	unsigned int i = 0;
+	int j = 0;
 
 	memset(update_state, 0, sizeof(struct pg_block_update));
 
 	update_state->pg_res_update[PG_DIO] = true;
+
+	for (i = 0; i < dc->res_pool->hpo_frl_stream_enc_count; i++) {
+		if (context->res_ctx.is_hpo_frl_stream_enc_acquired[i] &&
+				dc->res_pool->hpo_frl_stream_enc[i]) {
+			hpo_frl_stream_enc_acquired = true;
+			break;
+		}
+	}
 
 	for (i = 0; i < dc->res_pool->hpo_dp_stream_enc_count; i++) {
 		if (context->res_ctx.is_hpo_dp_stream_enc_acquired[i] &&
@@ -591,11 +726,14 @@ void dcn42_calc_blocks_to_gate(struct dc *dc, struct dc_state *context,
 		if (pipe_ctx->link_res.dio_link_enc) {
 			update_state->pg_res_update[PG_DIO] = false;
 		}
-		if (pipe_ctx->link_res.hpo_dp_link_enc) {
+		if (pipe_ctx->link_res.hpo_dp_link_enc
+		    || pipe_ctx->link_res.hpo_frl_link_enc) {
 			update_state->pg_res_update[PG_HPO] = false;
 		}
 	}
 
+	if (hpo_frl_stream_enc_acquired)
+		update_state->pg_pipe_res_update[PG_HDMISTREAM][0] = false;
 
 	for (i = 0; i < dc->link_count; i++) {
 		update_state->pg_pipe_res_update[PG_PHYSYMCLK][dc->links[i]->link_enc_hw_inst] = true;
@@ -615,6 +753,12 @@ void dcn42_calc_blocks_to_gate(struct dc *dc, struct dc_state *context,
 		}
 	}
 
+	for (i = 0; i < dc->res_pool->hpo_frl_stream_enc_count; i++) {
+		if (dc->current_state->res_ctx.is_hpo_frl_stream_enc_acquired[i]) {
+			update_state->pg_res_update[PG_HPO] = false;
+			break;
+		}
+	}
 }
 
 void dcn42_prepare_bandwidth(
@@ -635,6 +779,12 @@ void dcn42_prepare_bandwidth(
 	}
 
 	dcn401_prepare_bandwidth(dc, context);
+
+	/* valid C-state watermarks have now been committed to HW, so it
+	 * is safe to vote "allow" to PMFW.
+	 */
+	if (dc->clk_mgr->funcs->notify_cstate_disable)
+		dc->clk_mgr->funcs->notify_cstate_disable(dc->clk_mgr, false);
 }
 
 void dcn42_optimize_bandwidth(struct dc *dc, struct dc_state *context)
@@ -662,8 +812,10 @@ void dcn42_optimize_bandwidth(struct dc *dc, struct dc_state *context)
 void dcn42_calc_blocks_to_ungate(struct dc *dc, struct dc_state *context,
 	struct pg_block_update *update_state)
 {
+	bool hpo_frl_stream_enc_acquired = false;
 	bool hpo_dp_stream_enc_acquired = false;
-	int i = 0, j = 0;
+	unsigned int i = 0;
+	int j = 0;
 
 	memset(update_state, 0, sizeof(struct pg_block_update));
 
@@ -747,6 +899,14 @@ void dcn42_calc_blocks_to_ungate(struct dc *dc, struct dc_state *context,
 			break;
 		}
 	}
+	for (i = 0; i < dc->res_pool->hpo_frl_stream_enc_count; i++) {
+		if (context->res_ctx.is_hpo_frl_stream_enc_acquired[i] &&
+				dc->res_pool->hpo_frl_stream_enc[i]) {
+			hpo_frl_stream_enc_acquired = true;
+			break;
+		}
+	}
+
 	for (i = 0; i < dc->res_pool->hpo_dp_stream_enc_count; i++) {
 		if (context->res_ctx.is_hpo_dp_stream_enc_acquired[i] &&
 				dc->res_pool->hpo_dp_stream_enc[i]) {
@@ -755,9 +915,11 @@ void dcn42_calc_blocks_to_ungate(struct dc *dc, struct dc_state *context,
 		}
 	}
 
-	if (hpo_dp_stream_enc_acquired)
+	if (hpo_frl_stream_enc_acquired || hpo_dp_stream_enc_acquired)
 		update_state->pg_res_update[PG_HPO] = true;
 
+	if (hpo_frl_stream_enc_acquired)
+		update_state->pg_pipe_res_update[PG_HDMISTREAM][0] = true;
 	if (count_active_streams(dc) > 0) {
 		update_state->pg_res_update[PG_DCCG] = true;
 		update_state->pg_res_update[PG_DCIO] = true;
@@ -795,6 +957,7 @@ void dcn42_calc_blocks_to_ungate(struct dc *dc, struct dc_state *context,
 	struct pg_block_update *update_state)
 {
 	int i = 0;
+	int pipe_count = dc->res_pool->pipe_count;
 	struct pg_cntl *pg_cntl = dc->res_pool->pg_cntl;
 	bool block_disabled = true;
 
@@ -808,7 +971,7 @@ void dcn42_calc_blocks_to_ungate(struct dc *dc, struct dc_state *context,
 			pg_cntl->funcs->hpo_pg_control(pg_cntl, false);
 	}
 
-	for (i = dc->res_pool->pipe_count - 1; i >= 0; i--) {
+	for (i = pipe_count - 1; i >= 0; i--) {
 		if (update_state->pg_pipe_res_update[PG_HUBP][i] &&
 			update_state->pg_pipe_res_update[PG_DPP][i]) {
 			if (pg_cntl->funcs->hubp_dpp_pg_control)
@@ -828,7 +991,7 @@ void dcn42_calc_blocks_to_ungate(struct dc *dc, struct dc_state *context,
 		}
 	}
 
-	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+	for (i = 0; i < pipe_count; i++) {
 		if (!update_state->pg_pipe_res_update[PG_MPCC][i] ||
 			!update_state->pg_pipe_res_update[PG_OPP][i] ||
 			!update_state->pg_pipe_res_update[PG_OPTC][i]) {
@@ -883,7 +1046,7 @@ void dcn42_calc_blocks_to_ungate(struct dc *dc, struct dc_state *context,
 void dcn42_hw_block_power_up(struct dc *dc,
 	struct pg_block_update *update_state)
 {
-	int i = 0;
+	unsigned int i = 0;
 	struct pg_cntl *pg_cntl = dc->res_pool->pg_cntl;
 	bool block_enabled = false;
 
@@ -917,7 +1080,7 @@ void dcn42_hw_block_power_up(struct dc *dc,
 			pg_cntl->funcs->plane_otg_pg_control(pg_cntl, true);
 	}
 
-	for (i = 0; i < dc->res_pool->res_cap->num_dsc; i++) {
+	for (i = 0; i < (unsigned int)dc->res_pool->res_cap->num_dsc; i++) {
 		if (update_state->pg_pipe_res_update[PG_DSC][i]) {
 			if (pg_cntl->funcs->dsc_pg_control)
 				pg_cntl->funcs->dsc_pg_control(pg_cntl, i, true);
@@ -944,7 +1107,7 @@ void dcn42_hw_block_power_up(struct dc *dc,
 void dcn42_root_clock_control(struct dc *dc,
 	struct pg_block_update *update_state, bool power_on)
 {
-	int i = 0;
+	unsigned int i = 0;
 	struct pg_cntl *pg_cntl = dc->res_pool->pg_cntl;
 
 	if (!pg_cntl)
@@ -967,8 +1130,11 @@ void dcn42_root_clock_control(struct dc *dc,
 				if (dc->hwseq->funcs.physymclk_root_clock_control)
 					dc->hwseq->funcs.physymclk_root_clock_control(dc->hwseq, i, power_on);
 
+		if (update_state->pg_pipe_res_update[PG_HDMISTREAM][0])
+			if (dc->hwseq->funcs.hdmistream_root_clock_control)
+				dc->hwseq->funcs.hdmistream_root_clock_control(dc->hwseq, power_on);
 	}
-	for (i = 0; i < dc->res_pool->res_cap->num_dsc; i++) {
+	for (i = 0; i < (unsigned int)dc->res_pool->res_cap->num_dsc; i++) {
 		if (update_state->pg_pipe_res_update[PG_DSC][i]) {
 			if (power_on) {
 				if (dc->res_pool->dccg->funcs->enable_dsc)
@@ -997,6 +1163,9 @@ void dcn42_root_clock_control(struct dc *dc,
 				if (dc->hwseq->funcs.physymclk_root_clock_control)
 					dc->hwseq->funcs.physymclk_root_clock_control(dc->hwseq, i, power_on);
 
+		if (update_state->pg_pipe_res_update[PG_HDMISTREAM][0])
+			if (dc->hwseq->funcs.hdmistream_root_clock_control)
+				dc->hwseq->funcs.hdmistream_root_clock_control(dc->hwseq, power_on);
 	}
 }
 void dcn42_setup_stereo(struct pipe_ctx *pipe_ctx, struct dc *dc)
@@ -1019,41 +1188,34 @@ void dcn42_setup_stereo(struct pipe_ctx *pipe_ctx, struct dc *dc)
 
 	return;
 }
-void dcn42_dmub_hw_control_lock(struct dc *dc, struct dc_state *context, bool lock)
+bool dcn42_dmub_hw_control_lock(struct dc *dc, struct dc_state *context, bool lock)
 {
 
 	union dmub_inbox0_cmd_lock_hw hw_lock_cmd = { 0 };
 
 	if (!dc->ctx || !dc->ctx->dmub_srv)
-		return;
+		return false;
 
 	/* Use helper to check PSR/Replay for all streams in context */
 
-	if (!dc->debug.fams2_config.bits.enable && !dc_dmub_srv_is_cursor_offload_enabled(dc)
-		&& !dmub_hw_lock_mgr_does_context_require_lock(dc, context))
-		return;
+	if (lock) {
+		if (!dc->debug.fams2_config.bits.enable && !dc_dmub_srv_is_cursor_offload_enabled(dc)
+			&& !dmub_hw_lock_mgr_does_context_require_lock(dc, context))
+			return false;
+	}
 
 	hw_lock_cmd.bits.command_code = DMUB_INBOX0_CMD__HW_LOCK;
 	hw_lock_cmd.bits.hw_lock_client = HW_LOCK_CLIENT_DRIVER;
 	hw_lock_cmd.bits.lock = lock;
 	hw_lock_cmd.bits.should_release = !lock;
 	dmub_hw_lock_mgr_inbox0_cmd(dc->ctx->dmub_srv, hw_lock_cmd);
+	return true;
 }
 
-void dcn42_dmub_hw_control_lock_fast(union block_sequence_params *params)
+bool dcn42_is_dmub_hw_lock_supported(const struct dc *dc)
 {
-	struct dc *dc = params->dmub_hw_control_lock_fast_params.dc;
-	bool lock = params->dmub_hw_control_lock_fast_params.lock;
-
-	/* Use helper to check PSR/Replay for the given stream in fast path */
-	if (params->dmub_hw_control_lock_fast_params.is_required) {
-		union dmub_inbox0_cmd_lock_hw hw_lock_cmd = { 0 };
-		hw_lock_cmd.bits.command_code = DMUB_INBOX0_CMD__HW_LOCK;
-		hw_lock_cmd.bits.hw_lock_client = HW_LOCK_CLIENT_DRIVER;
-		hw_lock_cmd.bits.lock = lock;
-		hw_lock_cmd.bits.should_release = !lock;
-		dmub_hw_lock_mgr_inbox0_cmd(dc->ctx->dmub_srv, hw_lock_cmd);
-	}
+	/* Inbox0 HW lock is unconditionally available on this generation. */
+	return dc && dc->ctx && dc->ctx->dmub_srv && dc->ctx->dmub_srv->dmub;
 }
 
 /* In headless boot cases, DIG may be turned

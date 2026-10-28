@@ -376,6 +376,47 @@ void vtime_task_switch(struct task_struct *prev)
 		acct->starttime = acct0->starttime;
 	}
 }
+
+/**
+ * vtime_reset - Fast forward vtime entry clocks
+ *
+ * Called from dynticks idle IRQ entry to fast-forward the clocks to current time
+ * so that the IRQ time is still accounted by vtime while nohz cputime is paused.
+ */
+void vtime_reset(void)
+{
+	struct cpu_accounting_data *acct = get_accounting(current);
+
+	acct->starttime = mftb();
+#ifdef CONFIG_ARCH_HAS_SCALED_CPUTIME
+	acct->startspurr = read_spurr(acct->starttime);
+#endif
+}
+
+#ifdef CONFIG_NO_HZ_COMMON
+/**
+ * vtime_dyntick_start - Inform vtime about entry to idle-dynticks
+ *
+ * Called when idle enters in dyntick mode. The idle cputime that elapsed so far
+ * is accumulated and the tick subsystem takes over the idle cputime accounting.
+ */
+void vtime_dyntick_start(void)
+{
+	vtime_account_idle(current);
+}
+
+/**
+ * vtime_dyntick_stop - Inform vtime about exit from idle-dynticks
+ *
+ * Called when idle exits from dyntick mode. The vtime entry clocks are
+ * fast-forward to current time so that idle accounting restarts elapsing from
+ * now.
+ */
+void vtime_dyntick_stop(void)
+{
+	vtime_reset();
+}
+#endif /* CONFIG_NO_HZ_COMMON */
 #endif /* CONFIG_VIRT_CPU_ACCOUNTING_NATIVE */
 
 void __no_kcsan __delay(unsigned long loops)
@@ -574,13 +615,13 @@ DEFINE_INTERRUPT_HANDLER_ASYNC(timer_interrupt)
 	now = get_tb();
 	if (now >= *next_tb) {
 		evt->event_handler(evt);
-		__this_cpu_inc(irq_stat.timer_irqs_event);
+		inc_irq_stat(LOC_TIMER);
 	} else {
 		now = *next_tb - now;
 		if (now > decrementer_max)
 			now = decrementer_max;
 		set_dec_or_work(now);
-		__this_cpu_inc(irq_stat.timer_irqs_others);
+		inc_irq_stat(OTHER_TIMER);
 	}
 
 	trace_timer_interrupt_exit(regs);
@@ -593,7 +634,7 @@ EXPORT_SYMBOL(timer_interrupt);
 void timer_broadcast_interrupt(void)
 {
 	tick_receive_broadcast();
-	__this_cpu_inc(irq_stat.broadcast_irqs_event);
+	inc_irq_stat(BCT_TIMER);
 }
 #endif
 
@@ -892,6 +933,7 @@ static void __init set_decrementer_max(void)
 static void __init init_decrementer_clockevent(void)
 {
 	register_decrementer_clockevent(smp_processor_id());
+	vtime_reset();
 }
 
 void secondary_cpu_time_init(void)
@@ -907,6 +949,7 @@ void secondary_cpu_time_init(void)
 	/* FIME: Should make unrelated change to move snapshot_timebase
 	 * call here ! */
 	register_decrementer_clockevent(smp_processor_id());
+	vtime_reset();
 }
 
 /*

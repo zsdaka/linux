@@ -78,9 +78,11 @@ int ili9806e_probe(struct device *dev, void *transport,
 	bool set_prepare_prev_first = false;
 	int ret;
 
-	ctx = devm_kzalloc(dev, sizeof(struct ili9806e), GFP_KERNEL);
-	if (!ctx)
-		return -ENOMEM;
+	ctx = devm_drm_panel_alloc(dev, __typeof(*ctx), panel,
+				  funcs, connector_type);
+
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
 
 	dev_set_drvdata(dev, ctx);
 	ctx->transport = transport;
@@ -103,8 +105,6 @@ int ili9806e_probe(struct device *dev, void *transport,
 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
 				     "Failed to get reset-gpios\n");
 
-	drm_panel_init(&ctx->panel, dev, funcs, connector_type);
-
 	ret = drm_panel_of_backlight(&ctx->panel);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to get backlight\n");
@@ -112,20 +112,10 @@ int ili9806e_probe(struct device *dev, void *transport,
 	if (set_prepare_prev_first)
 		ctx->panel.prepare_prev_first = true;
 
-	drm_panel_add(&ctx->panel);
-
-	return 0;
+	return devm_drm_panel_add(dev, &ctx->panel);
 
 }
 EXPORT_SYMBOL_GPL(ili9806e_probe);
-
-void ili9806e_remove(struct device *dev)
-{
-	struct ili9806e *ctx = dev_get_drvdata(dev);
-
-	drm_panel_remove(&ctx->panel);
-}
-EXPORT_SYMBOL_GPL(ili9806e_remove);
 
 MODULE_AUTHOR("Dario Binacchi <dario.binacchi@amarulasolutions.com>");
 MODULE_AUTHOR("Gunnar Dibbern <gunnar.dibbern@lht.dlh.de>");

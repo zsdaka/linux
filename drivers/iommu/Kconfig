@@ -195,6 +195,7 @@ config MSM_IOMMU
 source "drivers/iommu/amd/Kconfig"
 source "drivers/iommu/arm/Kconfig"
 source "drivers/iommu/intel/Kconfig"
+source "drivers/iommu/hyperv/Kconfig"
 source "drivers/iommu/iommufd/Kconfig"
 source "drivers/iommu/riscv/Kconfig"
 
@@ -303,7 +304,7 @@ config SPAPR_TCE_IOMMU
 
 config APPLE_DART
 	tristate "Apple DART IOMMU Support"
-	depends on ARCH_APPLE || COMPILE_TEST
+	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
 	depends on !GENERIC_ATOMIC64	# for IOMMU_IO_PGTABLE_DART
 	select IOMMU_API
 	select IOMMU_IO_PGTABLE_DART
@@ -351,15 +352,6 @@ config MTK_IOMMU_V1
 
 	  if unsure, say N here.
 
-config HYPERV_IOMMU
-	bool "Hyper-V IRQ Handling"
-	depends on HYPERV && X86
-	select IOMMU_API
-	default HYPERV
-	help
-	  Stub IOMMU driver to handle IRQs to support Hyper-V Linux
-	  guest and root partitions.
-
 config VIRTIO_IOMMU
 	tristate "Virtio IOMMU driver"
 	depends on VIRTIO
@@ -383,6 +375,32 @@ config SPRD_IOMMU
 	  ISP(image), and CPP(camera pixel processor), etc.
 
 	  Say Y here if you want to use the multimedia devices listed above.
+
+config VSI_IOMMU
+	tristate "Verisilicon IOMMU Support"
+	depends on (ARCH_ROCKCHIP && ARM64) || COMPILE_TEST
+	select IOMMU_API
+	help
+	  Support for IOMMUs used by Verisilicon sub-systems like video
+	  decoders or encoder hardware blocks.
+
+	  Say Y here if you want to use this IOMMU in front of these
+	  hardware blocks.
+
+config BCM2712_IOMMU
+	bool "BCM2712 IOMMU driver"
+	depends on (ARCH_BCM2835 && ARM64) || COMPILE_TEST
+	select IOMMU_API
+	select GENERIC_PT
+	select IOMMU_PT
+	select IOMMU_PT_BCM2712
+	help
+	  Support for IOMMU on BCM2712 SoC. This IOMMU can be used by the
+	  display controller and various multimedia devices to perform
+	  efficient memory management.
+
+	  Say Y here if you want to use this IOMMU in front of these
+	  hardware blocks.
 
 config IOMMU_DEBUG_PAGEALLOC
 	bool "Debug IOMMU mappings against page allocations"

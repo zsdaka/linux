@@ -6,6 +6,13 @@
 #include <linux/linkage.h>
 #include <linux/init.h>
 
+#define __VDSO_PAGES	6
+
+#define VDSO_NR_VCLOCK_PAGES	2
+#define VDSO_VCLOCK_PAGES_START(_b)	((_b) + (__VDSO_PAGES - VDSO_NR_VCLOCK_PAGES) * PAGE_SIZE)
+#define VDSO_PAGE_PVCLOCK_OFFSET	0
+#define VDSO_PAGE_HVCLOCK_OFFSET	1
+
 #ifndef __ASSEMBLER__
 
 #include <linux/mm_types.h>
@@ -24,6 +31,10 @@ struct vdso_image {
 	long sym_int80_landing_pad;
 	long sym_vdso32_sigreturn_landing_pad;
 	long sym_vdso32_rt_sigreturn_landing_pad;
+	long sym___futex_list64_try_unlock_cs_start;
+	long sym___futex_list64_try_unlock_cs_end;
+	long sym___futex_list32_try_unlock_cs_start;
+	long sym___futex_list32_try_unlock_cs_end;
 };
 
 extern const struct vdso_image vdso64_image;

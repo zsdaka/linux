@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2012-2014, 2018-2025 Intel Corporation
+ * Copyright (C) 2012-2014, 2018-2026 Intel Corporation
  * Copyright (C) 2013-2015 Intel Mobile Communications GmbH
  * Copyright (C) 2016-2017 Intel Deutschland GmbH
  */
@@ -263,7 +263,7 @@ static bool iwl_wait_phy_db_entry(struct iwl_notif_wait_data *notif_wait,
 static void iwl_mvm_print_pd_notification(struct iwl_mvm *mvm)
 {
 #define IWL_FW_PRINT_REG_INFO(reg_name) \
-	IWL_ERR(mvm, #reg_name ": 0x%x\n", iwl_read_umac_prph(trans, reg_name))
+	IWL_ERR(mvm, #reg_name ": 0x%x\n", iwl_trans_read_umac_prph(trans, reg_name))
 
 	struct iwl_trans *trans = mvm->trans;
 	enum iwl_device_family device_family = trans->mac_cfg->device_family;
@@ -332,13 +332,13 @@ static int iwl_mvm_load_ucode_wait_alive(struct iwl_mvm *mvm,
 	    IWL_DEVICE_FAMILY_AX210) {
 		/* print these registers regardless of alive fail/success */
 		IWL_INFO(mvm, "WFPM_UMAC_PD_NOTIFICATION: 0x%x\n",
-			 iwl_read_umac_prph(mvm->trans, WFPM_ARC1_PD_NOTIFICATION));
+			 iwl_trans_read_umac_prph(mvm->trans, WFPM_ARC1_PD_NOTIFICATION));
 		IWL_INFO(mvm, "WFPM_LMAC2_PD_NOTIFICATION: 0x%x\n",
-			 iwl_read_umac_prph(mvm->trans, WFPM_LMAC2_PD_NOTIFICATION));
+			 iwl_trans_read_umac_prph(mvm->trans, WFPM_LMAC2_PD_NOTIFICATION));
 		IWL_INFO(mvm, "WFPM_AUTH_KEY_0: 0x%x\n",
-			 iwl_read_umac_prph(mvm->trans, SB_MODIFY_CFG_FLAG));
+			 iwl_trans_read_umac_prph(mvm->trans, SB_MODIFY_CFG_FLAG));
 		IWL_INFO(mvm, "CNVI_SCU_SEQ_DATA_DW9: 0x%x\n",
-			 iwl_read_prph(mvm->trans, CNVI_SCU_SEQ_DATA_DW9));
+			 iwl_trans_read_prph(mvm->trans, CNVI_SCU_SEQ_DATA_DW9));
 	}
 
 	if (ret) {
@@ -349,15 +349,15 @@ static int iwl_mvm_load_ucode_wait_alive(struct iwl_mvm *mvm,
 					IWL_DEVICE_FAMILY_22000) {
 			IWL_ERR(mvm,
 				"SecBoot CPU1 Status: 0x%x, CPU2 Status: 0x%x\n",
-				iwl_read_umac_prph(trans, UMAG_SB_CPU_1_STATUS),
-				iwl_read_umac_prph(trans,
-						   UMAG_SB_CPU_2_STATUS));
+				iwl_trans_read_umac_prph(trans, UMAG_SB_CPU_1_STATUS),
+				iwl_trans_read_umac_prph(trans,
+							 UMAG_SB_CPU_2_STATUS));
 		} else if (trans->mac_cfg->device_family >=
 			   IWL_DEVICE_FAMILY_8000) {
 			IWL_ERR(mvm,
 				"SecBoot CPU1 Status: 0x%x, CPU2 Status: 0x%x\n",
-				iwl_read_prph(trans, SB_CPU_1_STATUS),
-				iwl_read_prph(trans, SB_CPU_2_STATUS));
+				iwl_trans_read_prph(trans, SB_CPU_1_STATUS),
+				iwl_trans_read_prph(trans, SB_CPU_2_STATUS));
 		}
 
 		iwl_mvm_print_pd_notification(mvm);
@@ -374,15 +374,15 @@ static int iwl_mvm_load_ucode_wait_alive(struct iwl_mvm *mvm,
 		} else if (trans->mac_cfg->device_family >=
 					IWL_DEVICE_FAMILY_9000) {
 			IWL_ERR(mvm, "UMAC PC: 0x%x\n",
-				iwl_read_umac_prph(trans,
-						   UREG_UMAC_CURRENT_PC));
+				iwl_trans_read_umac_prph(trans,
+							 UREG_UMAC_CURRENT_PC));
 			IWL_ERR(mvm, "LMAC PC: 0x%x\n",
-				iwl_read_umac_prph(trans,
-						   UREG_LMAC1_CURRENT_PC));
+				iwl_trans_read_umac_prph(trans,
+							 UREG_LMAC1_CURRENT_PC));
 			if (iwl_mvm_is_cdb_supported(mvm))
 				IWL_ERR(mvm, "LMAC2 PC: 0x%x\n",
-					iwl_read_umac_prph(trans,
-						UREG_LMAC2_CURRENT_PC));
+					iwl_trans_read_umac_prph(trans,
+								 UREG_LMAC2_CURRENT_PC));
 		}
 
 		if (ret == -ETIMEDOUT && !mvm->fw_product_reset)
@@ -459,9 +459,14 @@ static void iwl_mvm_phy_filter_init(struct iwl_mvm *mvm,
 
 static void iwl_mvm_uats_init(struct iwl_mvm *mvm)
 {
+	struct iwl_mcc_allowed_ap_type_cmd_v1 *cmd __free(kfree) = NULL;
 	int cmd_id = WIDE_ID(REGULATORY_AND_NVM_GROUP,
 			     MCC_ALLOWED_AP_TYPE_CMD);
-	struct iwl_mcc_allowed_ap_type_cmd_v1 cmd = {};
+	struct iwl_host_cmd hcmd = {
+		.id = cmd_id,
+		.len[0] = sizeof(*cmd),
+		.dataflags[0] = IWL_HCMD_DFL_NOCOPY,
+	};
 	u8 cmd_ver;
 	int ret;
 
@@ -485,14 +490,25 @@ static void iwl_mvm_uats_init(struct iwl_mvm *mvm)
 	if (!mvm->fwrt.ap_type_cmd_valid)
 		return;
 
-	BUILD_BUG_ON(sizeof(mvm->fwrt.ap_type_cmd.mcc_to_ap_type_map) !=
-		     sizeof(cmd.mcc_to_ap_type_map));
+	/* Since we free the command immediately after iwl_mvm_send_cmd, we
+	 * must send this command in SYNC mode.
+	 */
+	lockdep_assert_held(&mvm->mutex);
 
-	memcpy(cmd.mcc_to_ap_type_map,
+	cmd = kzalloc_obj(*cmd);
+	if (!cmd)
+		return;
+
+	BUILD_BUG_ON(sizeof(mvm->fwrt.ap_type_cmd.mcc_to_ap_type_map) !=
+		     sizeof(cmd->mcc_to_ap_type_map));
+
+	memcpy(cmd->mcc_to_ap_type_map,
 	       mvm->fwrt.ap_type_cmd.mcc_to_ap_type_map,
 	       sizeof(mvm->fwrt.ap_type_cmd.mcc_to_ap_type_map));
 
-	ret = iwl_mvm_send_cmd_pdu(mvm, cmd_id, 0, sizeof(cmd), &cmd);
+	hcmd.data[0] = cmd;
+
+	ret = iwl_mvm_send_cmd(mvm, &hcmd);
 	if (ret < 0)
 		IWL_ERR(mvm, "failed to send MCC_ALLOWED_AP_TYPE_CMD (%d)\n",
 			ret);
@@ -600,7 +616,7 @@ static int iwl_run_unified_mvm_ucode(struct iwl_mvm *mvm)
 	mvm->rfkill_safe_init_done = false;
 
 	if (mvm->trans->mac_cfg->device_family == IWL_DEVICE_FAMILY_AX210) {
-		sb_cfg = iwl_read_umac_prph(mvm->trans, SB_MODIFY_CFG_FLAG);
+		sb_cfg = iwl_trans_read_umac_prph(mvm->trans, SB_MODIFY_CFG_FLAG);
 		/* if needed, we'll reset this on our way out later */
 		mvm->fw_product_reset = sb_cfg == SB_CFG_RESIDES_IN_ROM;
 		if (mvm->fw_product_reset && iwl_mei_pldr_req())
@@ -624,8 +640,7 @@ static int iwl_run_unified_mvm_ucode(struct iwl_mvm *mvm)
 		/* if we needed reset then fail here, but notify and remove */
 		if (mvm->fw_product_reset) {
 			iwl_mei_alive_notif(false);
-			iwl_trans_pcie_reset(mvm->trans,
-					     IWL_RESET_MODE_RESCAN);
+			iwl_trans_reset(mvm->trans, IWL_RESET_MODE_RESCAN);
 		}
 
 		goto error;
@@ -895,7 +910,8 @@ int iwl_mvm_sar_select_profile(struct iwl_mvm *mvm, int prof_a, int prof_b)
 
 	ret = iwl_sar_fill_profile(&mvm->fwrt, per_chain,
 				   IWL_NUM_CHAIN_TABLES,
-				   n_subbands, prof_a, prof_b);
+				   n_subbands, prof_a, prof_b,
+				   mvm->fwrt.sar_profiles, false);
 
 	/* return on error or if the profile is disabled (positive number) */
 	if (ret)
@@ -948,12 +964,22 @@ int iwl_mvm_get_sar_geo_profile(struct iwl_mvm *mvm)
 		return ret;
 	}
 
+	if (IWL_FW_CHECK(mvm,
+			 iwl_rx_packet_payload_len(cmd.resp_pkt) !=
+			 sizeof(*resp),
+			 "Wrong size for iwl_geo_tx_power_profiles_resp: %d\n",
+			 iwl_rx_packet_payload_len(cmd.resp_pkt))) {
+		ret = -EIO;
+		goto out;
+	}
+
 	resp = (void *)cmd.resp_pkt->data;
 	ret = le32_to_cpu(resp->profile_idx);
 
 	if (WARN_ON(ret > BIOS_GEO_MAX_PROFILE_NUM))
 		ret = -EIO;
 
+out:
 	iwl_free_resp(&cmd);
 	return ret;
 }
@@ -1491,12 +1517,48 @@ static int iwl_mvm_fill_lari_config(struct iwl_fw_runtime *fwrt,
 	return 0;
 }
 
+static void iwl_mvm_send_lari_cfg_extension(struct iwl_mvm *mvm)
+{
+	struct iwl_fw_runtime *fwrt = &mvm->fwrt;
+	struct iwl_lari_config_extension_cmd cmd = {};
+	u32 cmd_id = WIDE_ID(REGULATORY_AND_NVM_GROUP,
+			     LARI_CONFIG_EXTENSION);
+	u32 value;
+	int ret;
+
+	if (iwl_fw_lookup_cmd_ver(mvm->fw, cmd_id, 0) != 1)
+		return;
+
+	ret = iwl_bios_get_dsm(fwrt, DSM_FUNC_REGULATORY_CONFIG, &value);
+	if (ret)
+		return;
+
+	cmd.dsm_table_hdr.table_source = fwrt->dsm_source;
+	cmd.dsm_table_hdr.table_revision = fwrt->dsm_revision;
+	cmd.oem_uhb_allow_extension_bitmap = cpu_to_le32(value);
+
+	IWL_DEBUG_RADIO(mvm,
+			"sending LARI_CONFIG_EXTENSION, oem_uhb_allow_extension_bitmap=0x%x\n",
+			le32_to_cpu(cmd.oem_uhb_allow_extension_bitmap));
+	ret = iwl_mvm_send_cmd_pdu(mvm, cmd_id, 0, sizeof(cmd), &cmd);
+	if (ret < 0)
+		IWL_DEBUG_RADIO(mvm,
+				"Failed to send LARI_CONFIG_EXTENSION (%d)\n",
+				ret);
+}
+
 static void iwl_mvm_lari_cfg(struct iwl_mvm *mvm)
 {
 	struct iwl_lari_config_change_cmd cmd;
 	size_t cmd_size;
 	int ret;
 
+	/*
+	 * LARI_CONFIG_CHANGE triggers a profile update, so send
+	 * LARI_CONFIG_EXTENSION first to make sure its data is applied
+	 * in the same update.
+	 */
+	iwl_mvm_send_lari_cfg_extension(mvm);
 	ret = iwl_mvm_fill_lari_config(&mvm->fwrt, &cmd, &cmd_size);
 	if (!ret) {
 		ret = iwl_mvm_send_cmd_pdu(mvm,
@@ -1514,7 +1576,7 @@ void iwl_mvm_get_bios_tables(struct iwl_mvm *mvm)
 {
 	int ret;
 
-	iwl_acpi_get_guid_lock_status(&mvm->fwrt);
+	iwl_bios_get_guid_lock_status(&mvm->fwrt);
 
 	/* read PPAG table */
 	ret = iwl_bios_get_ppag_table(&mvm->fwrt);

@@ -34,6 +34,7 @@ static const struct dsc_funcs dcn35_dsc_funcs = {
 	.dsc_read_state = dsc2_read_state,
 	.dsc_read_reg_state = dsc2_read_reg_state,
 	.dsc_validate_stream = dsc2_validate_stream,
+	.dsc_prepare_config = dsc2_prepare_config,
 	.dsc_set_config = dsc2_set_config,
 	.dsc_get_packed_pps = dsc2_get_packed_pps,
 	.dsc_enable = dsc35_enable,
@@ -79,9 +80,9 @@ void dsc35_construct(struct dcn20_dsc *dsc,
 static void dsc35_enable(struct display_stream_compressor *dsc, int opp_pipe)
 {
 	struct dcn20_dsc *dsc20 = TO_DCN20_DSC(dsc);
-	int dsc_clock_en;
-	int dsc_fw_config;
-	int enabled_opp_pipe;
+	uint32_t dsc_clock_en;
+	uint32_t dsc_fw_config;
+	uint32_t enabled_opp_pipe;
 
 	DC_LOG_DSC("enable DSC %d at opp pipe %d", dsc->inst, opp_pipe);
 
@@ -96,7 +97,7 @@ static void dsc35_enable(struct display_stream_compressor *dsc, int opp_pipe)
 	REG_GET(DSC_TOP_CONTROL, DSC_CLOCK_EN, &dsc_clock_en);
 	REG_GET_2(DSCRM_DSC_FORWARD_CONFIG, DSCRM_DSC_FORWARD_EN, &dsc_fw_config, DSCRM_DSC_OPP_PIPE_SOURCE, &enabled_opp_pipe);
 	if ((dsc_clock_en || dsc_fw_config) && enabled_opp_pipe != opp_pipe) {
-		DC_LOG_DSC("ERROR: DSC %d at opp pipe %d already enabled!", dsc->inst, enabled_opp_pipe);
+		DC_LOG_DSC("ERROR: DSC %d at opp pipe %u already enabled!", dsc->inst, enabled_opp_pipe);
 		ASSERT(0);
 	}
 

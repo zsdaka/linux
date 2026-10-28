@@ -3,7 +3,7 @@
  *
  * Name: actbl2.h - ACPI Table Definitions
  *
- * Copyright (C) 2000 - 2025, Intel Corp.
+ * Copyright (C) 2000 - 2026, Intel Corp.
  *
  *****************************************************************************/
 
@@ -919,6 +919,13 @@ struct acpi_iovt_iommu {
 	u32 device_entry_offset;
 };
 
+/* Masks for Flags field above */
+#define ACPI_IOVT_IOMMU_PCI_DEVICE		(1<<0)
+#define ACPI_IOVT_IOMMU_PXM_VALID		(1<<1)
+#define ACPI_IOVT_IOMMU_MAGAGE_BY_SEGMENT	(1<<2)
+#define ACPI_IOVT_IOMMU_HW_CAP_SUPPORT		(1<<3)
+#define ACPI_IOVT_IOMMU_MSI_INT_BYPASS		(1<<4)
+
 struct acpi_iovt_device_entry {
 	u8 type;
 	u8 length;
@@ -1524,7 +1531,7 @@ struct acpi_madt_generic_translator {
 
 #define ACPI_MADT_ITS_NON_COHERENT      (1)
 
-/* 16: Multiprocessor wakeup (ACPI 6.4) */
+/* 16: Multiprocessor wakeup (ACPI 6.6) */
 
 struct acpi_madt_multiproc_wakeup {
 	struct acpi_subtable_header header;

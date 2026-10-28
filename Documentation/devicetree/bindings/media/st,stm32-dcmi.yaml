@@ -47,10 +47,10 @@ properties:
     maxItems: 1
 
   sram:
-    $ref: /schemas/types.yaml#/definitions/phandle
+    maxItems: 1
     description:
-      phandle to a reserved SRAM region which is used as temporary
-      storage memory between DMA and MDMA engines.
+      SRAM region which is used as temporary storage memory between DMA and
+      MDMA engines.
 
   port:
     $ref: /schemas/graph.yaml#/$defs/port-base
@@ -120,14 +120,14 @@ examples:
         dma-names = "tx";
 
         port {
-             dcmi_0: endpoint {
-                   remote-endpoint = <&ov5640_0>;
-                   bus-type = <MEDIA_BUS_TYPE_PARALLEL>;
-                   bus-width = <8>;
-                   hsync-active = <0>;
-                   vsync-active = <0>;
-                   pclk-sample = <1>;
-             };
+            dcmi_0: endpoint {
+                remote-endpoint = <&ov5640_0>;
+                bus-type = <MEDIA_BUS_TYPE_PARALLEL>;
+                bus-width = <8>;
+                hsync-active = <0>;
+                vsync-active = <0>;
+                pclk-sample = <1>;
+            };
         };
     };
 

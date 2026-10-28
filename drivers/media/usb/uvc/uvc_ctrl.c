@@ -385,6 +385,99 @@ static const struct uvc_control_info uvc_ctrls[] = {
 				| UVC_CTRL_FLAG_GET_RANGE
 				| UVC_CTRL_FLAG_RESTORE,
 	},
+	/*
+	 * Allows the control of pan/tilt motor movements for camera models
+	 * that support mechanical pan/tilt.
+	 *
+	 * Bits 0 to 15 control pan, bits 16 to 31 control tilt.
+	 * The unit of the pan/tilt values is 1/64th of a degree and the
+	 * resolution is 1 degree.
+	 */
+	{
+		.entity         = UVC_GUID_LOGITECH_MOTOR_CONTROL_V1,
+		.selector       = 1,
+		.index          = 0,
+		.size           = 4,
+		.flags          = UVC_CTRL_FLAG_GET_DEF
+				| UVC_CTRL_FLAG_GET_MAX
+				| UVC_CTRL_FLAG_GET_MIN
+				| UVC_CTRL_FLAG_SET_CUR,
+	},
+	/*
+	 * Reset the pan/tilt motors to their original position for camera
+	 * models that support mechanical pan/tilt.
+	 *
+	 * Setting bit 0 resets the pan position.
+	 * Setting bit 1 resets the tilt position.
+	 *
+	 * Both bits can be set at the same time to reset both, pan and tilt,
+	 * at the same time.
+	 */
+	{
+		.entity         = UVC_GUID_LOGITECH_MOTOR_CONTROL_V1,
+		.selector       = 2,
+		.index          = 1,
+		.size           = 1,
+		.flags          = UVC_CTRL_FLAG_GET_DEF
+				| UVC_CTRL_FLAG_GET_MAX
+				| UVC_CTRL_FLAG_GET_MIN
+				| UVC_CTRL_FLAG_SET_CUR,
+	},
+	/*
+	 * Allows the control of focus motor movements for camera models that
+	 * support mechanical focus.
+	 *
+	 * Bits 0 to 7 allow selection of the desired lens position.
+	 * There are no physical units, instead, the focus range is spread over
+	 * 256 logical units with 0 representing infinity focus and 255 being
+	 * macro focus.
+	 */
+	{
+		.entity         = UVC_GUID_LOGITECH_MOTOR_CONTROL_V1,
+		.selector       = 3,
+		.index          = 2,
+		.size           = 6,
+		.flags          = UVC_CTRL_FLAG_GET_CUR
+				| UVC_CTRL_FLAG_GET_DEF
+				| UVC_CTRL_FLAG_GET_MAX
+				| UVC_CTRL_FLAG_GET_MIN
+				| UVC_CTRL_FLAG_SET_CUR,
+	},
+	/*
+	 * Allows the control of pan/tilt motor movements for camera models
+	 * that support mechanical pan/tilt.
+	 *
+	 * Bits 0 to 15 control pan, bits 16 to 31 control tilt.
+	 */
+	{
+		.entity         = UVC_GUID_LOGITECH_PERIPHERAL,
+		.selector       = 1,
+		.index          = 0,
+		.size           = 4,
+		.flags          = UVC_CTRL_FLAG_GET_DEF
+				| UVC_CTRL_FLAG_GET_MAX
+				| UVC_CTRL_FLAG_GET_MIN
+				| UVC_CTRL_FLAG_GET_RES
+				| UVC_CTRL_FLAG_SET_CUR,
+	},
+	/*
+	 * Reset the pan/tilt motors to their original position for camera
+	 * models that support mechanical pan/tilt.
+	 *
+	 * Setting bit 0 resets the pan position.
+	 * Setting bit 1 resets the tilt position.
+	 */
+	{
+		.entity         = UVC_GUID_LOGITECH_PERIPHERAL,
+		.selector       = 2,
+		.index          = 1,
+		.size           = 1,
+		.flags          = UVC_CTRL_FLAG_GET_DEF
+				| UVC_CTRL_FLAG_GET_MAX
+				| UVC_CTRL_FLAG_GET_MIN
+				| UVC_CTRL_FLAG_GET_RES
+				| UVC_CTRL_FLAG_SET_CUR,
+	},
 };
 
 static const u32 uvc_control_classes[] = {
@@ -1008,6 +1101,87 @@ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
 		.menu_mapping	= cros_colorfx_mapping,
 		.menu_mask	= BIT(V4L2_COLORFX_VIVID) |
 				  BIT(V4L2_COLORFX_NONE),
+	},
+	{
+		.id             = V4L2_CID_PAN_RELATIVE,
+		.entity         = UVC_GUID_LOGITECH_MOTOR_CONTROL_V1,
+		.selector       = 1,
+		.size           = 16,
+		.offset         = 0,
+		.v4l2_type      = V4L2_CTRL_TYPE_INTEGER,
+		.data_type      = UVC_CTRL_DATA_TYPE_SIGNED,
+	},
+	{
+		.id             = V4L2_CID_TILT_RELATIVE,
+		.entity         = UVC_GUID_LOGITECH_MOTOR_CONTROL_V1,
+		.selector       = 1,
+		.size           = 16,
+		.offset         = 16,
+		.v4l2_type      = V4L2_CTRL_TYPE_INTEGER,
+		.data_type      = UVC_CTRL_DATA_TYPE_SIGNED,
+	},
+	{
+		.id             = V4L2_CID_PAN_RESET,
+		.entity         = UVC_GUID_LOGITECH_MOTOR_CONTROL_V1,
+		.selector       = 2,
+		.size           = 1,
+		.offset         = 0,
+		.v4l2_type      = V4L2_CTRL_TYPE_BUTTON,
+		.data_type      = UVC_CTRL_DATA_TYPE_UNSIGNED,
+	},
+	{
+		.id             = V4L2_CID_TILT_RESET,
+		.entity         = UVC_GUID_LOGITECH_MOTOR_CONTROL_V1,
+		.selector       = 2,
+		.size           = 1,
+		.offset         = 1,
+		.v4l2_type      = V4L2_CTRL_TYPE_BUTTON,
+		.data_type      = UVC_CTRL_DATA_TYPE_UNSIGNED,
+	},
+	{
+		.id             = V4L2_CID_PAN_RELATIVE,
+		.entity         = UVC_GUID_LOGITECH_PERIPHERAL,
+		.selector       = 1,
+		.size           = 16,
+		.offset         = 0,
+		.v4l2_type      = V4L2_CTRL_TYPE_INTEGER,
+		.data_type      = UVC_CTRL_DATA_TYPE_SIGNED,
+	},
+	{
+		.id             = V4L2_CID_TILT_RELATIVE,
+		.entity         = UVC_GUID_LOGITECH_PERIPHERAL,
+		.selector       = 1,
+		.size           = 16,
+		.offset         = 16,
+		.v4l2_type      = V4L2_CTRL_TYPE_INTEGER,
+		.data_type      = UVC_CTRL_DATA_TYPE_SIGNED,
+	},
+	{
+		.id             = V4L2_CID_PAN_RESET,
+		.entity         = UVC_GUID_LOGITECH_PERIPHERAL,
+		.selector       = 2,
+		.size           = 1,
+		.offset         = 0,
+		.v4l2_type      = V4L2_CTRL_TYPE_BUTTON,
+		.data_type      = UVC_CTRL_DATA_TYPE_UNSIGNED,
+	},
+	{
+		.id             = V4L2_CID_TILT_RESET,
+		.entity         = UVC_GUID_LOGITECH_PERIPHERAL,
+		.selector       = 2,
+		.size           = 1,
+		.offset         = 1,
+		.v4l2_type      = V4L2_CTRL_TYPE_BUTTON,
+		.data_type      = UVC_CTRL_DATA_TYPE_UNSIGNED,
+	},
+	{
+		.id             = V4L2_CID_FOCUS_ABSOLUTE,
+		.entity         = UVC_GUID_LOGITECH_MOTOR_CONTROL_V1,
+		.selector       = 3,
+		.size           = 8,
+		.offset         = 0,
+		.v4l2_type      = V4L2_CTRL_TYPE_INTEGER,
+		.data_type      = UVC_CTRL_DATA_TYPE_UNSIGNED,
 	},
 };
 
@@ -2035,7 +2209,7 @@ bool uvc_ctrl_status_event_async(struct urb *urb, struct uvc_video_chain *chain,
 	struct uvc_device *dev = chain->dev;
 	struct uvc_ctrl_work *w = &dev->async_ctrl;
 
-	if (list_empty(&ctrl->info.mappings))
+	if (!ctrl->initialized || list_empty(&ctrl->info.mappings))
 		return false;
 
 	w->data = data;
@@ -2667,6 +2841,72 @@ int uvc_ctrl_set(struct uvc_fh *handle, struct v4l2_ext_control *xctrl)
  * Dynamic controls
  */
 
+static bool uvc_ctrl_fixup_flags(struct uvc_device *dev,
+				 const struct uvc_control *ctrl,
+				 struct uvc_control_info *info)
+{
+	struct uvc_ctrl_fixup {
+		struct usb_device_id id;
+		u8 entity;
+		u8 selector;
+		u8 flags;
+	};
+
+	static const struct uvc_ctrl_fixup fixups[] = {
+		{ { USB_DEVICE(0x046d, 0x08c2) }, 9, 1,
+			UVC_CTRL_FLAG_GET_MIN | UVC_CTRL_FLAG_GET_MAX |
+			UVC_CTRL_FLAG_GET_DEF | UVC_CTRL_FLAG_SET_CUR |
+			UVC_CTRL_FLAG_AUTO_UPDATE },
+		{ { USB_DEVICE(0x046d, 0x08cc) }, 9, 1,
+			UVC_CTRL_FLAG_GET_MIN | UVC_CTRL_FLAG_GET_MAX |
+			UVC_CTRL_FLAG_GET_DEF | UVC_CTRL_FLAG_SET_CUR |
+			UVC_CTRL_FLAG_AUTO_UPDATE },
+		{ { USB_DEVICE(0x046d, 0x0994) }, 9, 1,
+			UVC_CTRL_FLAG_GET_MIN | UVC_CTRL_FLAG_GET_MAX |
+			UVC_CTRL_FLAG_GET_DEF | UVC_CTRL_FLAG_SET_CUR |
+			UVC_CTRL_FLAG_AUTO_UPDATE },
+		{ { USB_DEVICE(0x3564, 0xfef8) }, 1,
+			UVC_CT_PANTILT_ABSOLUTE_CONTROL,
+			UVC_CTRL_FLAG_SET_CUR | UVC_CTRL_FLAG_GET_RANGE |
+			UVC_CTRL_FLAG_RESTORE | UVC_CTRL_FLAG_AUTO_UPDATE },
+		{ { USB_DEVICE(0x3564, 0xfef8) }, 1,
+			UVC_CT_PANTILT_RELATIVE_CONTROL,
+			UVC_CTRL_FLAG_SET_CUR | UVC_CTRL_FLAG_GET_RANGE |
+			UVC_CTRL_FLAG_AUTO_UPDATE },
+		{ { USB_DEVICE(0x3564, 0xfef8) }, 1,
+			UVC_CT_ZOOM_ABSOLUTE_CONTROL,
+			UVC_CTRL_FLAG_SET_CUR | UVC_CTRL_FLAG_GET_RANGE |
+			UVC_CTRL_FLAG_RESTORE | UVC_CTRL_FLAG_AUTO_UPDATE },
+		{ { USB_DEVICE(0x3564, 0xfefc) }, 1,
+			UVC_CT_PANTILT_ABSOLUTE_CONTROL,
+			UVC_CTRL_FLAG_SET_CUR | UVC_CTRL_FLAG_GET_RANGE |
+			UVC_CTRL_FLAG_RESTORE | UVC_CTRL_FLAG_AUTO_UPDATE },
+		{ { USB_DEVICE(0x3564, 0xfefc) }, 1,
+			UVC_CT_PANTILT_RELATIVE_CONTROL,
+			UVC_CTRL_FLAG_SET_CUR | UVC_CTRL_FLAG_GET_RANGE |
+			UVC_CTRL_FLAG_AUTO_UPDATE },
+		{ { USB_DEVICE(0x3564, 0xfefc) }, 1,
+			UVC_CT_ZOOM_ABSOLUTE_CONTROL,
+			UVC_CTRL_FLAG_SET_CUR | UVC_CTRL_FLAG_GET_RANGE |
+			UVC_CTRL_FLAG_RESTORE | UVC_CTRL_FLAG_AUTO_UPDATE },
+	};
+
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(fixups); ++i) {
+		if (!usb_match_one_id(dev->intf, &fixups[i].id))
+			continue;
+
+		if (fixups[i].entity == ctrl->entity->id &&
+		    fixups[i].selector == info->selector) {
+			info->flags = fixups[i].flags;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 /*
  * Retrieve flags for a given control
  */
@@ -2676,6 +2916,14 @@ static int uvc_ctrl_get_flags(struct uvc_device *dev,
 {
 	u8 *data;
 	int ret;
+
+	/*
+	 * Some devices report bogus capabilities through GET_INFO. If the
+	 * fixup table covers this control, take the flags from the table and
+	 * skip the query altogether.
+	 */
+	if (uvc_ctrl_fixup_flags(dev, ctrl, info))
+		return 0;
 
 	data = kmalloc(1, GFP_KERNEL);
 	if (data == NULL)
@@ -2706,45 +2954,6 @@ static int uvc_ctrl_get_flags(struct uvc_device *dev,
 
 	kfree(data);
 	return ret;
-}
-
-static void uvc_ctrl_fixup_xu_info(struct uvc_device *dev,
-	const struct uvc_control *ctrl, struct uvc_control_info *info)
-{
-	struct uvc_ctrl_fixup {
-		struct usb_device_id id;
-		u8 entity;
-		u8 selector;
-		u8 flags;
-	};
-
-	static const struct uvc_ctrl_fixup fixups[] = {
-		{ { USB_DEVICE(0x046d, 0x08c2) }, 9, 1,
-			UVC_CTRL_FLAG_GET_MIN | UVC_CTRL_FLAG_GET_MAX |
-			UVC_CTRL_FLAG_GET_DEF | UVC_CTRL_FLAG_SET_CUR |
-			UVC_CTRL_FLAG_AUTO_UPDATE },
-		{ { USB_DEVICE(0x046d, 0x08cc) }, 9, 1,
-			UVC_CTRL_FLAG_GET_MIN | UVC_CTRL_FLAG_GET_MAX |
-			UVC_CTRL_FLAG_GET_DEF | UVC_CTRL_FLAG_SET_CUR |
-			UVC_CTRL_FLAG_AUTO_UPDATE },
-		{ { USB_DEVICE(0x046d, 0x0994) }, 9, 1,
-			UVC_CTRL_FLAG_GET_MIN | UVC_CTRL_FLAG_GET_MAX |
-			UVC_CTRL_FLAG_GET_DEF | UVC_CTRL_FLAG_SET_CUR |
-			UVC_CTRL_FLAG_AUTO_UPDATE },
-	};
-
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(fixups); ++i) {
-		if (!usb_match_one_id(dev->intf, &fixups[i].id))
-			continue;
-
-		if (fixups[i].entity == ctrl->entity->id &&
-		    fixups[i].selector == info->selector) {
-			info->flags = fixups[i].flags;
-			return;
-		}
-	}
 }
 
 /*
@@ -2787,8 +2996,6 @@ static int uvc_ctrl_fill_xu_info(struct uvc_device *dev,
 		goto done;
 	}
 
-	uvc_ctrl_fixup_xu_info(dev, ctrl, info);
-
 	uvc_dbg(dev, CONTROL,
 		"XU control %pUl/%u queried: len %u, flags { get %u set %u auto %u }\n",
 		info->entity, info->selector, info->size,
@@ -2825,6 +3032,35 @@ static int uvc_ctrl_init_xu_ctrl(struct uvc_device *dev,
 			ctrl->entity->id);
 
 	return ret;
+}
+
+bool uvc_ctrl_is_privacy_control(u8 entity[16], u8 selector)
+{
+	/*
+	 * This list is not exhaustive, it is a best effort to block access to
+	 * non documented controls that can affect user's privacy.
+	 */
+	struct privacy_control {
+		u8 entity[16];
+		u8 selector;
+	} privacy_control[] = {
+		{
+			.entity = UVC_GUID_LOGITECH_USER_HW_CONTROL_V1,
+			.selector = 1,
+		},
+		{
+			.entity = UVC_GUID_LOGITECH_PERIPHERAL,
+			.selector = 9,
+		},
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(privacy_control); i++)
+		if (!memcmp(entity, privacy_control[i].entity, 16) &&
+		    selector == privacy_control[i].selector)
+			return true;
+
+	return false;
 }
 
 int uvc_xu_ctrl_query(struct uvc_video_chain *chain,
@@ -2869,6 +3105,15 @@ int uvc_xu_ctrl_query(struct uvc_video_chain *chain,
 		uvc_dbg(chain->dev, CONTROL, "Control %pUl/%u not found\n",
 			entity->guid, xqry->selector);
 		return -ENOENT;
+	}
+
+	if (uvc_ctrl_is_privacy_control(entity->guid, xqry->selector) &&
+	    !uvc_allow_privacy_override_param) {
+		dev_warn_once(&chain->dev->intf->dev,
+			      "Privacy related controls can only be accessed if module parameter allow_privacy_override is true\n");
+		uvc_dbg(chain->dev, CONTROL, "Blocking access to privacy related Control %pUl/%u\n",
+			entity->guid, xqry->selector);
+		return -EACCES;
 	}
 
 	if (mutex_lock_interruptible(&chain->ctrl_mutex))

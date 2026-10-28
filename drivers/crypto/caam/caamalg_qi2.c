@@ -26,7 +26,7 @@
 #include <crypto/xts.h>
 #include <linux/unaligned.h>
 
-#define CAAM_CRA_PRIORITY	2000
+#define CAAM_CRA_PRIORITY	100
 
 /* max key is sum of AES_MAX_KEY_SIZE, max split key size */
 #define CAAM_MAX_KEY_SIZE	(AES_MAX_KEY_SIZE + CTR_RFC3686_NONCE_SIZE + \
@@ -301,7 +301,7 @@ static int aead_setkey(struct crypto_aead *aead, const u8 *key,
 	dev_dbg(dev, "keylen %d enckeylen %d authkeylen %d\n",
 		keys.authkeylen + keys.enckeylen, keys.enckeylen,
 		keys.authkeylen);
-	print_hex_dump_debug("key in @" __stringify(__LINE__)": ",
+	print_hex_dump_devel("key in @" __stringify(__LINE__)": ",
 			     DUMP_PREFIX_ADDRESS, 16, 4, key, keylen, 1);
 
 	ctx->adata.keylen = keys.authkeylen;
@@ -315,7 +315,7 @@ static int aead_setkey(struct crypto_aead *aead, const u8 *key,
 	memcpy(ctx->key + ctx->adata.keylen_pad, keys.enckey, keys.enckeylen);
 	dma_sync_single_for_device(dev, ctx->key_dma, ctx->adata.keylen_pad +
 				   keys.enckeylen, ctx->dir);
-	print_hex_dump_debug("ctx.key@" __stringify(__LINE__)": ",
+	print_hex_dump_devel("ctx.key@" __stringify(__LINE__)": ",
 			     DUMP_PREFIX_ADDRESS, 16, 4, ctx->key,
 			     ctx->adata.keylen_pad + keys.enckeylen, 1);
 
@@ -732,7 +732,7 @@ static int gcm_setkey(struct crypto_aead *aead,
 	ret = aes_check_keylen(keylen);
 	if (ret)
 		return ret;
-	print_hex_dump_debug("key in @" __stringify(__LINE__)": ",
+	print_hex_dump_devel("key in @" __stringify(__LINE__)": ",
 			     DUMP_PREFIX_ADDRESS, 16, 4, key, keylen, 1);
 
 	memcpy(ctx->key, key, keylen);
@@ -828,7 +828,7 @@ static int rfc4106_setkey(struct crypto_aead *aead,
 	if (ret)
 		return ret;
 
-	print_hex_dump_debug("key in @" __stringify(__LINE__)": ",
+	print_hex_dump_devel("key in @" __stringify(__LINE__)": ",
 			     DUMP_PREFIX_ADDRESS, 16, 4, key, keylen, 1);
 
 	memcpy(ctx->key, key, keylen);
@@ -927,7 +927,7 @@ static int rfc4543_setkey(struct crypto_aead *aead,
 	if (ret)
 		return ret;
 
-	print_hex_dump_debug("key in @" __stringify(__LINE__)": ",
+	print_hex_dump_devel("key in @" __stringify(__LINE__)": ",
 			     DUMP_PREFIX_ADDRESS, 16, 4, key, keylen, 1);
 
 	memcpy(ctx->key, key, keylen);
@@ -955,12 +955,14 @@ static int skcipher_setkey(struct crypto_skcipher *skcipher, const u8 *key,
 	u32 *desc;
 	const bool is_rfc3686 = alg->caam.rfc3686;
 
-	print_hex_dump_debug("key in @" __stringify(__LINE__)": ",
+	print_hex_dump_devel("key in @" __stringify(__LINE__)": ",
 			     DUMP_PREFIX_ADDRESS, 16, 4, key, keylen, 1);
 
 	ctx->cdata.keylen = keylen;
 	ctx->cdata.key_virt = key;
 	ctx->cdata.key_inline = true;
+	ctx->cdata.plain_keylen = keylen;
+	ctx->cdata.key_cmd_opt = 0;
 
 	/* skcipher_encrypt shared descriptor */
 	flc = &ctx->flc[ENCRYPT];
@@ -5041,10 +5043,21 @@ static int __cold dpaa2_dpseci_setup(struct fsl_mc_device *ls_dev)
 	dev_info(dev, "dpseci v%d.%d\n", priv->major_ver, priv->minor_ver);
 
 	if (DPSECI_VER(priv->major_ver, priv->minor_ver) > DPSECI_VER(5, 3)) {
-		err = dpseci_reset(priv->mc_io, 0, ls_dev->mc_handle);
+		int enabled;
+
+		err = dpseci_is_enabled(priv->mc_io, 0, ls_dev->mc_handle,
+					&enabled);
 		if (err) {
-			dev_err(dev, "dpseci_reset() failed\n");
+			dev_err(dev, "dpseci_is_enabled() failed\n");
 			goto err_get_vers;
+		}
+
+		if (enabled) {
+			err = dpseci_reset(priv->mc_io, 0, ls_dev->mc_handle);
+			if (err) {
+				dev_err(dev, "dpseci_reset() failed\n");
+				goto err_get_vers;
+			}
 		}
 	}
 

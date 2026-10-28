@@ -18,7 +18,7 @@
  * firmware) are managed in this drivers context. Each driver instance
  * is responsible for tearing down the driver context of immediate
  * descendant ports. The locking for this is validated by
- * CONFIG_PROVE_CXL_LOCKING.
+ * CONFIG_PROVE_LOCKING.
  *
  * The primary service this driver provides is presenting APIs to other
  * drivers to utilize the decoders, and indicating to userspace (via bind
@@ -44,6 +44,9 @@ static int discover_region(struct device *dev, void *unused)
 		return 0;
 
 	if (cxled->state != CXL_DECODER_STATE_AUTO)
+		return 0;
+
+	if (cxled_empty(cxled))
 		return 0;
 
 	/*
