@@ -56,6 +56,8 @@ struct run_out {
 	uint32_t lookup_max_cmp;
 	uint64_t lookup_cmp_sum;
 	uint64_t hist[HIST_MAX];
+	uint64_t main_depth_hist[DEPTH_MAIN + 1];
+	uint64_t col_depth_hist[DEPTH_COL + 1];
 	double seconds;
 	double theory_over;
 	double theory_fail;
@@ -366,10 +368,24 @@ static int run_one(const struct run_cfg *cfg, struct zipf *zip,
 
 	for (i = 0; i < rows; i++) {
 		uint32_t c = arrival[i];
+		uint32_t stored = c > (uint32_t)depth ? (uint32_t)depth : c;
 
 		if (c >= HIST_MAX)
 			c = HIST_MAX - 1;
 		o->hist[c]++;
+		o->main_depth_hist[stored]++;
+	}
+	if (col_rows && col_slot) {
+		for (i = 0; i < col_rows; i++) {
+			uint64_t base = i * (uint64_t)cdepth;
+			int s, occ = 0;
+
+			for (s = 0; s < cdepth; s++) {
+				if (col_slot[base + s])
+					occ++;
+			}
+			o->col_depth_hist[occ]++;
+		}
 	}
 
 	/* Lookup every inserted key. Failed inserts must miss. */
@@ -508,7 +524,24 @@ static void write_hist(FILE *f, const struct run_cfg *cfg, const struct run_out 
 	}
 }
 
-static int emit(const struct run_cfg *cfg, struct zipf *zip, FILE *sum, FILE *hist)
+static void write_depth(FILE *f, const struct run_cfg *cfg, const struct run_out *o)
+{
+	int k;
+
+	for (k = 0; k <= DEPTH_MAIN; k++) {
+		fprintf(f, "%s,%s,main,%d,%" PRIu64 ",%.8f\n", cfg->exp, cfg->data_name,
+			k, o->main_depth_hist[k],
+			o->rows ? (double)o->main_depth_hist[k] / (double)o->rows : 0.0);
+	}
+	for (k = 0; k <= DEPTH_COL; k++) {
+		fprintf(f, "%s,%s,collision,%d,%" PRIu64 ",%.8f\n", cfg->exp,
+			cfg->data_name, k, o->col_depth_hist[k],
+			o->col_rows ? (double)o->col_depth_hist[k] / (double)o->col_rows : 0.0);
+	}
+}
+
+static int emit(const struct run_cfg *cfg, struct zipf *zip, FILE *sum, FILE *hist,
+		FILE *depth)
 {
 	struct run_out o;
 	int rc = run_one(cfg, zip, &o);
@@ -519,6 +552,8 @@ static int emit(const struct run_cfg *cfg, struct zipf *zip, FILE *sum, FILE *hi
 	fflush(sum);
 	write_hist(hist, cfg, &o);
 	fflush(hist);
+	write_depth(depth, cfg, &o);
+	fflush(depth);
 	if (o.step1 + o.step2 + o.fail != o.n) {
 		fprintf(stderr, "accounting mismatch\n");
 		return -1;
@@ -538,11 +573,11 @@ int main(int argc, char **argv)
 	const char *out_dir = "out";
 	const char *trace_path = NULL;
 	const char *resample_path = NULL;
-	char sum_path[512], hist_path[512];
-	FILE *sum, *hist;
+	char sum_path[512], hist_path[512], depth_path[512];
+	FILE *sum, *hist, *depth;
 	struct zipf zip;
 	struct trace_keys trace, resample;
-	struct run_cfg cfgs[16];
+	struct run_cfg cfgs[32];
 	int ncfg = 0;
 	int i, rc;
 	int trace_only = 0;
@@ -579,9 +614,11 @@ int main(int argc, char **argv)
 
 	snprintf(sum_path, sizeof(sum_path), "%s/summary.csv", out_dir);
 	snprintf(hist_path, sizeof(hist_path), "%s/hist.csv", out_dir);
+	snprintf(depth_path, sizeof(depth_path), "%s/depth.csv", out_dir);
 	sum = fopen(sum_path, trace_only ? "a" : "w");
 	hist = fopen(hist_path, trace_only ? "a" : "w");
-	if (!sum || !hist) {
+	depth = fopen(depth_path, trace_only ? "a" : "w");
+	if (!sum || !hist || !depth) {
 		perror("fopen");
 		return 1;
 	}
@@ -591,6 +628,7 @@ int main(int argc, char **argv)
 			"over_frac,theory_over,fail_frac,theory_fail,u_main,u_col,"
 			"lookup_max_cmp,lookup_bad,lookup_cmp_sum,seconds\n");
 		fprintf(hist, "exp,data,k,count,poisson_expect\n");
+		fprintf(depth, "exp,data,table,depth,rows,fraction\n");
 	}
 
 #define ADD(e, dname, knd, nn, rlog, col)                                      \
@@ -617,6 +655,12 @@ int main(int argc, char **argv)
 	ADD("A", "zipf_mixed", DATA_ZIPF_MIXED, 10000000ULL, 24, 1);
 	ADD("Dtight", "uniform", DATA_UNIFORM, 16777216ULL, 22, 1);
 	ADD("Ablation", "uniform", DATA_UNIFORM, 10000000ULL, 24, 0);
+	/* Load is n / 2^24, the row count the driver sizes for. */
+	ADD("L25", "uniform", DATA_UNIFORM, (1ULL << 24) * 25 / 100, 24, 1);
+	ADD("L50", "uniform", DATA_UNIFORM, (1ULL << 24) * 50 / 100, 24, 1);
+	ADD("L70", "uniform", DATA_UNIFORM, (1ULL << 24) * 70 / 100, 24, 1);
+	ADD("L90", "uniform", DATA_UNIFORM, (1ULL << 24) * 90 / 100, 24, 1);
+	ADD("L100", "uniform", DATA_UNIFORM, (1ULL << 24), 24, 1);
 	}
 	if (trace.n) {
 		ADD("TraceFull", "ctu", DATA_TRACE, trace.n, 24, 1);
@@ -632,7 +676,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "run %s %s n=%" PRIu64 " row_log=%d col=%d\n",
 			cfgs[i].exp, cfgs[i].data_name, cfgs[i].n,
 			cfgs[i].row_log, cfgs[i].use_col);
-		rc = emit(&cfgs[i], &zip, sum, hist);
+		rc = emit(&cfgs[i], &zip, sum, hist, depth);
 		if (rc) {
 			fprintf(stderr, "run failed %d\n", rc);
 			return 1;
@@ -640,6 +684,7 @@ int main(int argc, char **argv)
 	}
 	fclose(sum);
 	fclose(hist);
+	fclose(depth);
 	free(zip.cdf);
 	free(trace.key);
 	free(resample.key);
